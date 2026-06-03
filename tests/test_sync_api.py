@@ -1,0 +1,210 @@
+from __future__ import annotations
+
+import json
+import tempfile
+import time
+import unittest
+from pathlib import Path
+from urllib.request import Request, urlopen
+
+from tele_mess_core.archive import ArchiveStore
+from tele_mess_core.models import MessageRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.server import SyncApiServer
+
+
+class SyncApiTest(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        self.store = ArchiveStore(Path(self.tmp.name) / "archive.db")
+        self.store.initialize()
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=1,
+                sent_at=now,
+                ingested_at=now,
+                text="api payload",
+            ),
+            event_type="new",
+        )
+        self.api = SyncApiServer(self.store, "127.0.0.1", 0, token="secret")
+        self.api.start_background()
+        deadline = time.time() + 2
+        while self.api._httpd is None and time.time() < deadline:
+            time.sleep(0.01)
+        assert self.api._httpd is not None
+        self.port = self.api._httpd.server_address[1]
+
+    def tearDown(self) -> None:
+        self.api.stop()
+        self.store.close()
+        self.tmp.cleanup()
+
+    def request_json(self, path: str, method: str = "GET", payload: dict | None = None) -> dict:
+        data = None
+        if payload is not None:
+            data = json.dumps(payload).encode("utf-8")
+        req = Request(f"http://127.0.0.1:{self.port}{path}", data=data, method=method)
+        req.add_header("Authorization", "Bearer secret")
+        if payload is not None:
+            req.add_header("Content-Type", "application/json")
+        with urlopen(req, timeout=3) as resp:
+            return json.loads(resp.read().decode("utf-8"))
+
+    def request_text(self, path: str) -> str:
+        req = Request(f"http://127.0.0.1:{self.port}{path}")
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            return resp.read().decode("utf-8")
+
+    def request_text_no_auth(self, path: str) -> str:
+        req = Request(f"http://127.0.0.1:{self.port}{path}")
+        with urlopen(req, timeout=3) as resp:
+            return resp.read().decode("utf-8")
+
+    def test_state_requires_token_and_returns_json(self) -> None:
+        req = Request(f"http://127.0.0.1:{self.port}/sync/state")
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(payload["last_event_seq"], 1)
+
+    def test_messages_endpoint(self) -> None:
+        req = Request(f"http://127.0.0.1:{self.port}/sync/messages?after=0")
+        req.add_header("X-Api-Token", "secret")
+        with urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(payload["items"][0]["text"], "api payload")
+
+    def test_accounts_endpoint(self) -> None:
+        req = Request(f"http://127.0.0.1:{self.port}/sync/accounts")
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        self.assertEqual(payload["items"], [])
+
+    def test_console_endpoint(self) -> None:
+        html = self.request_text_no_auth("/console")
+        self.assertIn("tele-mess-core", html)
+        self.assertIn("teleMessToken", html)
+        self.assertIn('data-view="accounts"', html)
+        self.assertIn("/manage/accounts/auth/request-code", html)
+        self.assertIn("/manage/accounts/auth/submit-code", html)
+        self.assertIn("/manage/discover-origins", html)
+        self.assertIn("/manage/backup-policies", html)
+        self.assertIn("/manage/participants/refresh", html)
+        self.assertIn("/sync/media-files", html)
+        self.assertIn("Save policy", html)
+        self.assertIn("escapeHtml", html)
+
+    def test_root_serves_console_without_token(self) -> None:
+        html = self.request_text_no_auth("/")
+        self.assertIn("tele-mess-core console", html)
+        self.assertIn("API token", html)
+
+    def test_media_files_endpoint(self) -> None:
+        payload = self.request_json("/sync/media-files")
+        self.assertEqual(payload["items"], [])
+
+    def test_start_background_reports_bind_failure(self) -> None:
+        second = SyncApiServer(self.store, "127.0.0.1", self.port, token="secret")
+        with self.assertRaises(RuntimeError):
+            second.start_background(startup_timeout=1)
+        second.stop()
+
+    def test_management_endpoints_cover_goal_objects(self) -> None:
+        account = self.request_json(
+            "/manage/accounts",
+            method="POST",
+            payload={
+                "account_id": "main",
+                "display_name": "Main Account",
+                "phone": "+10000000000",
+                "session_name": "main",
+                "auth_state": "pending_auth",
+                "api_hash": "should-not-be-returned",
+            },
+        )["item"]
+        self.assertEqual(account["auth_state"], "pending_auth")
+        self.assertNotIn("api_hash", account["raw_json"])
+
+        auth = self.request_json(
+            "/manage/accounts/auth",
+            method="PATCH",
+            payload={"account_id": "main", "auth_state": "code_sent", "session_name": "main"},
+        )["item"]
+        self.assertEqual(auth["auth_state"], "code_sent")
+
+        self.request_json(
+            "/manage/origins",
+            method="POST",
+            payload={
+                "account_id": "main",
+                "origin_id": -1001,
+                "origin_type": "group",
+                "title": "Source Group",
+                "is_forum": True,
+            },
+        )
+        topic = self.request_json(
+            "/manage/origins",
+            method="POST",
+            payload={
+                "account_id": "main",
+                "origin_id": -1001,
+                "topic_id": 123,
+                "origin_type": "topic",
+                "parent_origin_id": -1001,
+                "title": "Announcements",
+            },
+        )["item"]
+        self.assertEqual(topic["origin_type"], "topic")
+
+        policy = self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={
+                "account_id": "main",
+                "origin_id": -1001,
+                "topic_id": 123,
+                "enabled": True,
+                "capture_text": True,
+                "capture_media_metadata": True,
+                "download_media": False,
+            },
+        )["item"]
+        self.assertTrue(policy["enabled"])
+        self.assertFalse(policy["download_media"])
+
+        participant = self.request_json(
+            "/manage/participants",
+            method="POST",
+            payload={
+                "account_id": "main",
+                "origin_id": -1001,
+                "user_id": 42,
+                "username": "alice",
+                "display_name": "Alice",
+                "role": "member",
+            },
+        )["item"]
+        self.assertEqual(participant["username"], "alice")
+
+        origins = self.request_json("/manage/origins?account_id=main")["items"]
+        saved_topic = next(item for item in origins if item["topic_id"] == 123)
+        self.assertTrue(saved_topic["backup_policy"]["enabled"])
+        participants = self.request_json("/manage/participants?account_id=main&origin_id=-1001")["items"]
+        self.assertEqual(participants[0]["display_name"], "Alice")
+
+        cursors = self.request_json("/manage/capture-cursors?account_id=main")["items"]
+        self.assertEqual(cursors, [])
+
+        capabilities = self.request_json("/manage/capabilities")
+        self.assertIn("origin_registry", capabilities["management"])
+        self.assertIn("capture_cursors", capabilities["management"])
+
+
+if __name__ == "__main__":
+    unittest.main()

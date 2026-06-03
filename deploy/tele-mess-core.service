@@ -1,0 +1,19 @@
+[Unit]
+Description=tele-mess-core Telegram archive server
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=dreaife
+WorkingDirectory=/home/dreaife/dev/tele-mess-core
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core run-server --config /home/dreaife/dev/tele-mess-core/config.yml
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+

@@ -1,0 +1,35 @@
+storage:
+  data_dir: "./data"
+  database: "./data/archive.db"
+
+telegram:
+  backfill:
+    enabled: true
+    initial_limit: 1000
+    catch_up_limit: 1000
+  accounts:
+    - account_id: "main"
+      api_id: 123456
+      api_hash: "your_api_hash_here"
+      session_name: "main"
+      session_dir: "./data/sessions"
+      timezone: "Asia/Tokyo"
+      chats:
+        - id: -1001234567890
+          name: "Example Source Group"
+    - account_id: "alt"
+      api_id: 654321
+      api_hash: "another_api_hash_here"
+      session_name: "alt"
+      session_dir: "./data/sessions"
+      timezone: "Asia/Tokyo"
+      chats: []
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  token: ""
+
+logging:
+  level: "INFO"
+  file: "./logs/tele-mess-core.log"
