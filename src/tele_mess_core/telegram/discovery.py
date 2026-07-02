@@ -243,7 +243,11 @@ class TelegramDiscoveryService:
                     )
                 )
             except Exception as exc:
-                error = classify_telegram_exception(exc, default_code="topic_discovery_failed")
+                error = classify_telegram_exception(
+                    exc,
+                    default_code="topic_discovery_failed",
+                    default_auth_state="authorized",
+                )
                 payload = error.to_public_dict()
                 errors.append(payload)
                 self._record_operation("discover_topics", "failed", subject_type="origin", subject_id=str(origin_id), error=payload)
@@ -290,14 +294,25 @@ class TelegramDiscoveryService:
         offset_topic: int,
         limit: int,
     ) -> Any:
-        return functions.channels.GetForumTopicsRequest(
-            channel=entity,
-            q="",
-            offset_date=None,
-            offset_id=offset_id,
-            offset_topic=offset_topic,
-            limit=limit,
-        )
+        if hasattr(functions, "messages") and hasattr(functions.messages, "GetForumTopicsRequest"):
+            return functions.messages.GetForumTopicsRequest(
+                peer=entity,
+                q="",
+                offset_date=None,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=limit,
+            )
+        if hasattr(functions, "channels") and hasattr(functions.channels, "GetForumTopicsRequest"):
+            return functions.channels.GetForumTopicsRequest(
+                channel=entity,
+                q="",
+                offset_date=None,
+                offset_id=offset_id,
+                offset_topic=offset_topic,
+                limit=limit,
+            )
+        raise RuntimeError("Telethon does not expose GetForumTopicsRequest")
 
     def _set_auth_state(self, state: str) -> None:
         self.store.upsert_account_auth(

@@ -140,6 +140,27 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["operation"], "refresh_participants")
         self.assertEqual(events[0]["error_code"], "access_denied")
 
+    async def test_forum_topics_request_uses_messages_namespace(self) -> None:
+        class Request:
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+
+        functions = SimpleNamespace(messages=SimpleNamespace(GetForumTopicsRequest=Request))
+        entity = FakeEntity(id=-1001)
+
+        request = TelegramDiscoveryService(self.config, self.store)._forum_topics_request(
+            functions,
+            entity,
+            offset_id=12,
+            offset_topic=34,
+            limit=56,
+        )
+
+        self.assertIs(request.kwargs["peer"], entity)
+        self.assertEqual(request.kwargs["offset_id"], 12)
+        self.assertEqual(request.kwargs["offset_topic"], 34)
+        self.assertEqual(request.kwargs["limit"], 56)
+
 
 if __name__ == "__main__":
     unittest.main()
