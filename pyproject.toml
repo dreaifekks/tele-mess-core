@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Telegram message archive core with SQLite storage and sync API"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "MIT" }
+license = { text = "Apache-2.0" }
 dependencies = [
   "Telethon>=1.38,<2",
   "PyYAML>=6,<7",
@@ -22,4 +22,3 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 tele_mess_core = ["archive/schema.sql"]
-

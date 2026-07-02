@@ -110,3 +110,7 @@ directory next to the SQLite database.
 The server is responsible for durable collection, sync, and capture-management
 state. Client-side features such as search UI, summaries, labels, AI workflows,
 and higher-level processing should live in the Mac app.
+
+## License
+
+Apache-2.0. See [LICENSE](LICENSE).
