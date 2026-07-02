@@ -758,11 +758,15 @@ def _console_html() -> str:
     th { color: var(--muted); font-weight: 650; background: #fafbfc; }
     td.actions { width: 1%; white-space: nowrap; }
     td.actions button + button { margin-left: 6px; }
-    tr.archived-row { color: var(--muted); }
+    tr.removed-row { color: var(--muted); }
     .tree-cell { display: flex; align-items: center; gap: 7px; }
-    .tree-toggle, .tree-spacer { width: 28px; min-width: 28px; text-align: center; padding-left: 0; padding-right: 0; }
+    .tree-toggle { width: 22px; min-width: 22px; height: 22px; min-height: 22px; line-height: 20px; padding: 0; border-radius: 4px; font-size: 13px; font-weight: 650; text-align: center; }
+    .tree-spacer { width: 22px; min-width: 22px; height: 22px; }
     .topic-row .tree-cell { padding-left: 28px; }
     .tag-list { color: var(--muted); font-size: 12px; }
+    .origin-select { min-height: 16px; }
+    .bulk-toolbar { border-left: 1px solid var(--line); padding-left: 8px; }
+    .policy-row td { background: #fbfcfe; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
     .status.error { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
@@ -776,6 +780,8 @@ def _console_html() -> str:
     .table-wrap table { min-width: 680px; }
     .table-wrap thead th { position: sticky; top: 0; z-index: 2; box-shadow: 0 1px 0 var(--line); }
     pre { margin: 0; overflow: auto; background: #101828; color: #e5e7eb; border-radius: 6px; padding: 10px; max-height: 280px; font-size: 12px; }
+    .raw-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: calc(100vh - 170px); }
+    #raw { max-height: none; min-height: calc(100vh - 240px); }
     @media (max-width: 920px) { .topbar, .grid, .two { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } th { position: static; } }
   </style>
 </head>
@@ -860,8 +866,8 @@ def _console_html() -> str:
       </form>
     </details>
     <div class=\"panel\">
-      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Archived</label><button data-action=\"reload-origins\">Reload</button><button data-action=\"refresh-origins\">Refresh Telegram</button></div></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Tags</th><th>Backup</th><th>Actions</th></tr></thead><tbody id=\"origins-body\"></tbody></table></div>
+      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Removed</label><button data-action=\"reload-origins\">Reload</button><button data-action=\"refresh-origins\">Refresh Telegram</button><button data-action=\"toggle-origin-manage\">Manage</button><span id=\"origin-bulk\" class=\"toolbar bulk-toolbar hidden\"><button data-action=\"select-visible-origins\">Select visible</button><button data-action=\"clear-origin-selection\">Clear</button><button data-action=\"bulk-remove-origins\">Remove selected</button><button data-action=\"bulk-restore-origins\">Restore selected</button><button data-action=\"bulk-clear-policies\">Clear policies</button><span id=\"origin-selection\" class=\"muted\">0 selected</span></span></div></div>
+      <div class=\"table-wrap\"><table><thead id=\"origins-head\"></thead><tbody id=\"origins-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -902,7 +908,7 @@ def _console_html() -> str:
   </section>
 
   <section id=\"view-raw\" class=\"view hidden\">
-    <div class=\"panel\"><div class=\"panel-head\"><h2>Raw Snapshot</h2><button data-action=\"load-raw\">Refresh</button></div><pre id=\"raw\"></pre></div>
+    <div class=\"panel raw-panel\"><div class=\"panel-head\"><h2>Raw Snapshot</h2><button data-action=\"load-raw\">Refresh</button></div><pre id=\"raw\"></pre></div>
   </section>
 </main>
 
@@ -921,7 +927,7 @@ def _console_html() -> str:
 </template>
 
 <script>
-const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], service: null, messages: [], expandedOrigins: {} };
+const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
 tokenInput.value = localStorage.getItem('teleMessToken') || '';
@@ -973,6 +979,12 @@ function pill(value) {
 function fillTable(id, rows, emptyCols) {
   $(id).innerHTML = rows.length ? rows.join('') : `<tr><td colspan=\"${emptyCols}\" class=\"muted\">No rows</td></tr>`;
 }
+function originKey(accountId, originId, topicId=0) {
+  return `${accountId}:${originId}:${topicId || 0}`;
+}
+function originPayload(accountId, originId, topicId=0) {
+  return { account_id: accountId, origin_id: Number(originId), topic_id: Number(topicId || 0) };
+}
 function originPath() {
   const params = new URLSearchParams();
   const q = $('origin-filter')?.value.trim();
@@ -984,6 +996,7 @@ function originPath() {
 async function loadOrigins() {
   const data = await api(originPath());
   state.origins = data.items || [];
+  state.selectedOrigins = {};
   renderOrigins();
   renderSummary();
   renderRaw();
@@ -998,6 +1011,7 @@ async function loadAll() {
     state.service = service;
     state.accounts = accounts.items || [];
     state.origins = origins.items || [];
+    state.selectedOrigins = {};
     state.policies = policies.items || [];
     state.participants = participants.items || [];
     state.cursors = cursors.items || [];
@@ -1032,6 +1046,7 @@ function renderAccounts() {
   </tr>`), 5);
 }
 function renderOrigins() {
+  renderOriginHead();
   const topicsByParent = {};
   const parentKeys = new Set();
   const parents = [];
@@ -1054,27 +1069,48 @@ function renderOrigins() {
   }
   const rows = [];
   for (const item of parents) {
-    const key = `${item.account_id}:${item.origin_id}:0`;
+    const key = originKey(item.account_id, item.origin_id, 0);
     const children = topicsByParent[key] || [];
     rows.push(originRow(item, children.length, false));
     if (children.length && state.expandedOrigins[key]) {
       for (const child of children) rows.push(originRow(child, 0, true));
     }
   }
-  fillTable('origins-body', rows, 7);
+  fillTable('origins-body', rows, state.manageOrigins ? 8 : 7);
+  updateOriginBulk();
+}
+function renderOriginHead() {
+  $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
 }
 function originRow(item, childCount, isTopic) {
   const policy = item.backup_policy;
   const topicId = item.topic_id ?? 0;
-  const key = `${item.account_id}:${item.origin_id}:0`;
-  const expanded = Boolean(state.expandedOrigins[key]);
-  const toggle = childCount ? `<button class=\"tree-toggle\" data-action=\"toggle-origin\" data-key=\"${attr(key)}\">${expanded ? '-' : '+'}</button>` : '<span class=\"tree-spacer\"></span>';
+  const parentKey = originKey(item.account_id, item.origin_id, 0);
+  const rowKey = originKey(item.account_id, item.origin_id, topicId);
+  const expanded = Boolean(state.expandedOrigins[parentKey]);
+  const toggle = childCount ? `<button class=\"tree-toggle\" data-action=\"toggle-origin\" data-key=\"${attr(parentKey)}\">${expanded ? '-' : '+'}</button>` : '<span class=\"tree-spacer\"></span>';
   const policyTags = policy?.tags || '';
-  const backup = item.archived_at ? pill('archived') : policy ? pill(policy.enabled ? 'on' : 'off') : pill('off');
-  const archiveLabel = item.archived_at ? 'Restore' : 'Archive';
-  const archiveAction = item.archived_at ? 'restore-origin' : 'archive-origin';
-  const rowClass = `${item.archived_at ? 'archived-row ' : ''}${isTopic ? 'topic-row' : ''}`.trim();
-  return `<tr class=\"${attr(rowClass)}\"><td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${archiveAction}\">${archiveLabel}</button></td></tr>`;
+  const backup = item.archived_at ? pill('removed') : policy ? pill(policy.enabled ? 'on' : 'off') : pill('off');
+  const removeLabel = item.archived_at ? 'Restore' : 'Remove';
+  const removeAction = item.archived_at ? 'restore-origin' : 'remove-origin';
+  const rowClass = `${item.archived_at ? 'removed-row ' : ''}${isTopic ? 'topic-row' : ''}`.trim();
+  const selectCell = state.manageOrigins ? `<td><input class=\"origin-select\" type=\"checkbox\" data-action=\"select-origin-row\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" ${state.selectedOrigins[rowKey] ? 'checked' : ''}></td>` : '';
+  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
+}
+function updateOriginBulk() {
+  const bulk = $('origin-bulk');
+  if (!bulk) return;
+  bulk.classList.toggle('hidden', !state.manageOrigins);
+  const manageButton = document.querySelector('[data-action=\"toggle-origin-manage\"]');
+  if (manageButton) manageButton.textContent = state.manageOrigins ? 'Done' : 'Manage';
+  const count = Object.keys(state.selectedOrigins).length;
+  $('origin-selection').textContent = `${count} selected`;
+}
+function visibleOriginPayloads() {
+  return [...document.querySelectorAll('.origin-select')].map(input => originPayload(input.dataset.account, input.dataset.origin, input.dataset.topic));
+}
+function selectedOriginPayloads() {
+  return Object.values(state.selectedOrigins);
 }
 function renderParticipants() {
   fillTable('participants-body', state.participants.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.username || item.user_id)}</td><td>${text(item.display_name)}</td><td>${text(item.role)}</td><td class=\"actions\"><button class=\"danger\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-user=\"${attr(item.user_id)}\" data-action=\"delete-participant\">Delete</button></td></tr>`), 6);
@@ -1103,6 +1139,37 @@ async function removeRecord(path, data) {
   setStatus('Deleted', 'ok');
   return result;
 }
+async function setOriginRemoved(data, removed) {
+  setStatus(removed ? 'Removing' : 'Restoring');
+  const result = await api('/manage/origins/archive', { method: 'PATCH', body: JSON.stringify({ ...data, archived: removed }) });
+  await loadAll();
+  setStatus(removed ? 'Removed' : 'Restored', 'ok');
+  return result;
+}
+async function bulkSetOriginsRemoved(removed) {
+  const items = selectedOriginPayloads();
+  if (!items.length) throw new Error('Select at least one origin first');
+  if (!confirm(`${removed ? 'Remove' : 'Restore'} ${items.length} selected origins?`)) return;
+  setStatus(removed ? 'Removing selected origins' : 'Restoring selected origins');
+  for (const item of items) {
+    await api('/manage/origins/archive', { method: 'PATCH', body: JSON.stringify({ ...item, archived: removed }) });
+  }
+  state.selectedOrigins = {};
+  await loadAll();
+  setStatus(removed ? 'Selected origins removed' : 'Selected origins restored', 'ok');
+}
+async function bulkClearPolicies() {
+  const items = selectedOriginPayloads();
+  if (!items.length) throw new Error('Select at least one origin first');
+  if (!confirm(`Clear backup policies for ${items.length} selected origins?`)) return;
+  setStatus('Clearing selected policies');
+  for (const item of items) {
+    await api('/manage/backup-policies', { method: 'DELETE', body: JSON.stringify(item) });
+  }
+  state.selectedOrigins = {};
+  await loadAll();
+  setStatus('Selected policies cleared', 'ok');
+}
 function selectedAccount() { return document.querySelector('#account-form [name=account_id]').value.trim(); }
 function selectedOriginAccount() {
   const filtered = $('origin-filter').value.trim() || selectedAccount();
@@ -1128,7 +1195,7 @@ document.addEventListener('click', async (event) => {
     else if (action === 'select-account') { document.querySelector('#account-form [name=account_id]').value = target.dataset.account; document.querySelector('#origin-filter').value = target.dataset.account; await loadOrigins(); }
     else if (action === 'select-origin') { document.querySelector('#participant-refresh-form [name=account_id]').value = target.dataset.account; document.querySelector('#participant-refresh-form [name=origin_id]').value = target.dataset.origin; }
     else if (action === 'delete-account') { if (confirm(`Delete account ${target.dataset.account}? Archived messages are kept.`)) await removeRecord('/manage/accounts', { account_id: target.dataset.account }); }
-    else if (action === 'archive-origin' || action === 'restore-origin') { const archived = action === 'archive-origin'; if (confirm(`${archived ? 'Archive' : 'Restore'} origin ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await post('/manage/origins/archive', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0), archived }, 'PATCH'); }
+    else if (action === 'remove-origin' || action === 'restore-origin') { const removed = action === 'remove-origin'; if (confirm(`${removed ? 'Remove' : 'Restore'} origin ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await setOriginRemoved(originPayload(target.dataset.account, target.dataset.origin, target.dataset.topic), removed); }
     else if (action === 'delete-policy') { if (confirm(`Clear backup policy for ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await removeRecord('/manage/backup-policies', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
     else if (action === 'delete-participant') { if (confirm(`Delete participant ${target.dataset.user}?`)) await removeRecord('/manage/participants', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), user_id: Number(target.dataset.user) }); }
     else if (action === 'auth-status') await post('/manage/accounts/auth/status', { account_id: selectedAccount() });
@@ -1138,8 +1205,23 @@ document.addEventListener('click', async (event) => {
     else if (action === 'filter-origins' || action === 'reload-origins') { await loadOrigins(); setStatus('Origins loaded', 'ok'); }
     else if (action === 'refresh-origins') { const accountId = selectedOriginAccount(); if (!accountId) throw new Error('Select or enter an account first'); await post('/manage/discover-origins', { account_id: accountId, include_topics: true, topic_limit: 500 }); }
     else if (action === 'toggle-origin') { state.expandedOrigins[target.dataset.key] = !state.expandedOrigins[target.dataset.key]; renderOrigins(); }
-    else if (action === 'edit-policy') openPolicy(target.dataset.account, Number(target.dataset.origin), Number(target.dataset.topic || 0));
+    else if (action === 'toggle-origin-manage') { state.manageOrigins = !state.manageOrigins; state.selectedOrigins = {}; renderOrigins(); }
+    else if (action === 'select-visible-origins') { for (const item of visibleOriginPayloads()) state.selectedOrigins[originKey(item.account_id, item.origin_id, item.topic_id)] = item; renderOrigins(); }
+    else if (action === 'clear-origin-selection') { state.selectedOrigins = {}; renderOrigins(); }
+    else if (action === 'bulk-remove-origins') await bulkSetOriginsRemoved(true);
+    else if (action === 'bulk-restore-origins') await bulkSetOriginsRemoved(false);
+    else if (action === 'bulk-clear-policies') await bulkClearPolicies();
+    else if (action === 'edit-policy') openPolicy(target);
   } catch (error) { setStatus(String(error), 'error'); }
+});
+document.addEventListener('change', (event) => {
+  const target = event.target.closest('[data-action=\"select-origin-row\"]');
+  if (!target) return;
+  const payload = originPayload(target.dataset.account, target.dataset.origin, target.dataset.topic);
+  const key = originKey(payload.account_id, payload.origin_id, payload.topic_id);
+  if (target.checked) state.selectedOrigins[key] = payload;
+  else delete state.selectedOrigins[key];
+  updateOriginBulk();
 });
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
@@ -1152,12 +1234,17 @@ $('origin-form').addEventListener('submit', async (event) => { event.preventDefa
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('show-archived').addEventListener('change', async () => { try { await loadOrigins(); setStatus('Origins loaded', 'ok'); } catch (error) { setStatus(String(error), 'error'); } });
-function openPolicy(accountId, originId, topicId) {
+function openPolicy(button) {
+  const accountId = button.dataset.account;
+  const originId = Number(button.dataset.origin);
+  const topicId = Number(button.dataset.topic || 0);
+  document.querySelectorAll('.policy-row').forEach(row => row.remove());
   const policy = state.policies.find(item => item.account_id === accountId && item.origin_id === originId && item.topic_id === topicId) || {};
   const origin = state.origins.find(item => item.account_id === accountId && item.origin_id === originId && item.topic_id === topicId);
   const row = document.createElement('tr');
+  row.className = 'policy-row';
   const cell = document.createElement('td');
-  cell.colSpan = 7;
+  cell.colSpan = state.manageOrigins ? 8 : 7;
   const form = $('policy-template').content.firstElementChild.cloneNode(true);
   form.account_id.value = accountId; form.origin_id.value = originId; form.topic_id.value = topicId;
   form.enabled.checked = policy.enabled ?? origin?.backup_policy?.enabled ?? false;
@@ -1166,7 +1253,7 @@ function openPolicy(accountId, originId, topicId) {
   form.download_media.checked = policy.download_media ?? origin?.backup_policy?.download_media ?? false;
   form.tags.value = policy.tags ?? origin?.backup_policy?.tags ?? '';
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/backup-policies', numberFields(formData(form), ['origin_id','topic_id']), 'PATCH'); row.remove(); } catch (error) { setStatus(String(error), 'error'); } });
-  cell.appendChild(form); row.appendChild(cell); $('origins-body').prepend(row);
+  cell.appendChild(form); row.appendChild(cell); button.closest('tr').after(row);
 }
 if (tokenValue()) loadAll();
 else setStatus('Enter server.token from config.yml, then click Save', 'warn');
