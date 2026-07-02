@@ -170,7 +170,14 @@ class SyncApiServer:
                 elif path == "/manage/accounts":
                     self._json({"items": store.list_management_accounts()})
                 elif path == "/manage/origins":
-                    self._json({"items": store.list_origins(account_id=_optional_str_param(params, "account_id"))})
+                    self._json(
+                        {
+                            "items": store.list_origins(
+                                account_id=_optional_str_param(params, "account_id"),
+                                include_archived=_bool_param(params, "include_archived", False),
+                            )
+                        }
+                    )
                 elif path == "/manage/backup-policies":
                     self._json({"items": store.list_backup_policies(account_id=_optional_str_param(params, "account_id"))})
                 elif path == "/manage/participants":
@@ -220,6 +227,9 @@ class SyncApiServer:
                 elif path == "/manage/origins" and method == "POST":
                     item = _create_origin(store, payload)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/origins/archive" and method == "PATCH":
+                    item = _archive_origin(store, payload)
+                    self._json({"item": item})
                 elif path == "/manage/backup-policies" and method in {"POST", "PATCH"}:
                     item = _set_backup_policy(store, payload)
                     self._json({"item": item})
@@ -399,6 +409,23 @@ def _delete_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, An
     }
 
 
+def _archive_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    origin_id = _required_int(payload, "origin_id")
+    topic_id = _payload_int(payload, "topic_id", 0)
+    archived = _payload_bool(payload, "archived", True)
+    changed_rows = store.archive_origin(source, account_id, origin_id, topic_id, archived)
+    return {
+        "source": source,
+        "account_id": account_id,
+        "origin_id": origin_id,
+        "topic_id": topic_id,
+        "archived": archived,
+        "changed_rows": changed_rows,
+    }
+
+
 def _set_backup_policy(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
@@ -414,6 +441,7 @@ def _set_backup_policy(store: ArchiveStore, payload: dict[str, Any]) -> dict[str
             capture_text=_payload_bool(payload, "capture_text", True),
             capture_media_metadata=_payload_bool(payload, "capture_media_metadata", True),
             download_media=_payload_bool(payload, "download_media", False),
+            tags=_optional_payload_str(payload, "tags"),
             updated_at=utc_now_iso(),
         )
     )
@@ -651,6 +679,15 @@ def _optional_int_param(params: dict[str, list[str]], key: str) -> int | None:
         return None
 
 
+def _bool_param(params: dict[str, list[str]], key: str, default: bool) -> bool:
+    if key not in params:
+        return default
+    value = params[key][0]
+    if isinstance(value, str):
+        return value.strip().lower() in {"1", "true", "yes", "on"}
+    return bool(value)
+
+
 def _str_param(params: dict[str, list[str]], key: str, default: str) -> str:
     return params.get(key, [default])[0]
 
@@ -699,6 +736,9 @@ def _console_html() -> str:
     .tab.active { background: #dbeafe; color: #0f3f8f; border-color: #bfdbfe; }
     .grid { display: grid; grid-template-columns: minmax(280px, 380px) minmax(0, 1fr); gap: 16px; align-items: start; }
     .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+    summary { cursor: pointer; }
+    summary h2 { display: inline; }
+    details .form-grid { margin-top: 12px; }
     .panel-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
     .form-grid { display: grid; gap: 10px; }
@@ -718,6 +758,11 @@ def _console_html() -> str:
     th { color: var(--muted); font-weight: 650; background: #fafbfc; }
     td.actions { width: 1%; white-space: nowrap; }
     td.actions button + button { margin-left: 6px; }
+    tr.archived-row { color: var(--muted); }
+    .tree-cell { display: flex; align-items: center; gap: 7px; }
+    .tree-toggle, .tree-spacer { width: 28px; min-width: 28px; text-align: center; padding-left: 0; padding-right: 0; }
+    .topic-row .tree-cell { padding-left: 28px; }
+    .tag-list { color: var(--muted); font-size: 12px; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
     .status.error { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
@@ -796,8 +841,8 @@ def _console_html() -> str:
   </section>
 
   <section id=\"view-origins\" class=\"view grid hidden\">
-    <div class=\"panel\">
-      <div class=\"panel-head\"><h2>Origin</h2></div>
+    <details class=\"panel\">
+      <summary><h2>Manual Origin</h2></summary>
       <form id=\"origin-form\" class=\"form-grid\">
         <label>Account ID<input name=\"account_id\" required></label>
         <div class=\"two form-grid\">
@@ -813,10 +858,10 @@ def _console_html() -> str:
         <label class=\"check\"><input type=\"checkbox\" name=\"is_forum\"> Forum</label>
         <button class=\"primary\" type=\"submit\">Save origin</button>
       </form>
-    </div>
+    </details>
     <div class=\"panel\">
-      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><button data-action=\"filter-origins\">Apply</button></div></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Policy</th><th>Actions</th></tr></thead><tbody id=\"origins-body\"></tbody></table></div>
+      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Archived</label><button data-action=\"reload-origins\">Reload</button><button data-action=\"refresh-origins\">Refresh Telegram</button></div></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Tags</th><th>Backup</th><th>Actions</th></tr></thead><tbody id=\"origins-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -870,12 +915,13 @@ def _console_html() -> str:
     <label class=\"check\"><input type=\"checkbox\" name=\"capture_text\"> Text</label>
     <label class=\"check\"><input type=\"checkbox\" name=\"capture_media_metadata\"> Media metadata</label>
     <label class=\"check\"><input type=\"checkbox\" name=\"download_media\"> Download media</label>
+    <label>Tags<input name=\"tags\" placeholder=\"tag1, tag2\"></label>
     <button type=\"submit\">Save policy</button>
   </form>
 </template>
 
 <script>
-const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], service: null, messages: [] };
+const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], service: null, messages: [], expandedOrigins: {} };
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
 tokenInput.value = localStorage.getItem('teleMessToken') || '';
@@ -927,11 +973,26 @@ function pill(value) {
 function fillTable(id, rows, emptyCols) {
   $(id).innerHTML = rows.length ? rows.join('') : `<tr><td colspan=\"${emptyCols}\" class=\"muted\">No rows</td></tr>`;
 }
+function originPath() {
+  const params = new URLSearchParams();
+  const q = $('origin-filter')?.value.trim();
+  if (q) params.set('account_id', q);
+  if ($('show-archived')?.checked) params.set('include_archived', 'true');
+  const suffix = params.toString();
+  return suffix ? `/manage/origins?${suffix}` : '/manage/origins';
+}
+async function loadOrigins() {
+  const data = await api(originPath());
+  state.origins = data.items || [];
+  renderOrigins();
+  renderSummary();
+  renderRaw();
+}
 async function loadAll() {
   try {
     setStatus('Loading');
     const [service, accounts, origins, policies, participants, cursors, media] = await Promise.all([
-      api('/sync/state'), api('/manage/accounts'), api('/manage/origins'), api('/manage/backup-policies'),
+      api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files')
     ]);
     state.service = service;
@@ -971,11 +1032,49 @@ function renderAccounts() {
   </tr>`), 5);
 }
 function renderOrigins() {
-  fillTable('origins-body', state.origins.map(item => {
-    const policy = item.backup_policy;
+  const topicsByParent = {};
+  const parentKeys = new Set();
+  const parents = [];
+  for (const item of state.origins) {
     const topicId = item.topic_id ?? 0;
-    return `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</td><td>${text(item.origin_type)}</td><td>${text(item.title)}</td><td>${policy ? pill(policy.enabled) : pill('unset')}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Delete policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-origin\">Delete</button></td></tr>`;
-  }), 6);
+    const key = `${item.account_id}:${item.origin_id}:0`;
+    if (!topicId) {
+      parents.push(item);
+      parentKeys.add(key);
+    } else {
+      (topicsByParent[key] ||= []).push(item);
+    }
+  }
+  for (const item of state.origins) {
+    const topicId = item.topic_id ?? 0;
+    const key = `${item.account_id}:${item.origin_id}:0`;
+    if (topicId && !parentKeys.has(key)) {
+      parents.push(item);
+    }
+  }
+  const rows = [];
+  for (const item of parents) {
+    const key = `${item.account_id}:${item.origin_id}:0`;
+    const children = topicsByParent[key] || [];
+    rows.push(originRow(item, children.length, false));
+    if (children.length && state.expandedOrigins[key]) {
+      for (const child of children) rows.push(originRow(child, 0, true));
+    }
+  }
+  fillTable('origins-body', rows, 7);
+}
+function originRow(item, childCount, isTopic) {
+  const policy = item.backup_policy;
+  const topicId = item.topic_id ?? 0;
+  const key = `${item.account_id}:${item.origin_id}:0`;
+  const expanded = Boolean(state.expandedOrigins[key]);
+  const toggle = childCount ? `<button class=\"tree-toggle\" data-action=\"toggle-origin\" data-key=\"${attr(key)}\">${expanded ? '-' : '+'}</button>` : '<span class=\"tree-spacer\"></span>';
+  const policyTags = policy?.tags || '';
+  const backup = item.archived_at ? pill('archived') : policy ? pill(policy.enabled ? 'on' : 'off') : pill('off');
+  const archiveLabel = item.archived_at ? 'Restore' : 'Archive';
+  const archiveAction = item.archived_at ? 'restore-origin' : 'archive-origin';
+  const rowClass = `${item.archived_at ? 'archived-row ' : ''}${isTopic ? 'topic-row' : ''}`.trim();
+  return `<tr class=\"${attr(rowClass)}\"><td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${archiveAction}\">${archiveLabel}</button></td></tr>`;
 }
 function renderParticipants() {
   fillTable('participants-body', state.participants.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.username || item.user_id)}</td><td>${text(item.display_name)}</td><td>${text(item.role)}</td><td class=\"actions\"><button class=\"danger\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-user=\"${attr(item.user_id)}\" data-action=\"delete-participant\">Delete</button></td></tr>`), 6);
@@ -1005,6 +1104,11 @@ async function removeRecord(path, data) {
   return result;
 }
 function selectedAccount() { return document.querySelector('#account-form [name=account_id]').value.trim(); }
+function selectedOriginAccount() {
+  const filtered = $('origin-filter').value.trim() || selectedAccount();
+  if (filtered) return filtered;
+  return state.accounts.length === 1 ? state.accounts[0].account_id : '';
+}
 document.addEventListener('click', async (event) => {
   const target = event.target.closest('button');
   if (!target) return;
@@ -1021,17 +1125,19 @@ document.addEventListener('click', async (event) => {
     else if (action === 'load-cursors') { const data = await api('/manage/capture-cursors'); state.cursors = data.items || []; renderCursors(); }
     else if (action === 'load-media') { const data = await api('/sync/media-files'); state.media = data.items || []; renderMedia(); }
     else if (action === 'load-raw') renderRaw();
-    else if (action === 'select-account') { document.querySelector('#account-form [name=account_id]').value = target.dataset.account; document.querySelector('#origin-filter').value = target.dataset.account; }
+    else if (action === 'select-account') { document.querySelector('#account-form [name=account_id]').value = target.dataset.account; document.querySelector('#origin-filter').value = target.dataset.account; await loadOrigins(); }
     else if (action === 'select-origin') { document.querySelector('#participant-refresh-form [name=account_id]').value = target.dataset.account; document.querySelector('#participant-refresh-form [name=origin_id]').value = target.dataset.origin; }
     else if (action === 'delete-account') { if (confirm(`Delete account ${target.dataset.account}? Archived messages are kept.`)) await removeRecord('/manage/accounts', { account_id: target.dataset.account }); }
-    else if (action === 'delete-origin') { if (confirm(`Delete origin ${target.dataset.origin}/${target.dataset.topic || 0}? Archived messages are kept.`)) await removeRecord('/manage/origins', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
-    else if (action === 'delete-policy') { if (confirm(`Delete policy for ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await removeRecord('/manage/backup-policies', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
+    else if (action === 'archive-origin' || action === 'restore-origin') { const archived = action === 'archive-origin'; if (confirm(`${archived ? 'Archive' : 'Restore'} origin ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await post('/manage/origins/archive', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0), archived }, 'PATCH'); }
+    else if (action === 'delete-policy') { if (confirm(`Clear backup policy for ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await removeRecord('/manage/backup-policies', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
     else if (action === 'delete-participant') { if (confirm(`Delete participant ${target.dataset.user}?`)) await removeRecord('/manage/participants', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), user_id: Number(target.dataset.user) }); }
     else if (action === 'auth-status') await post('/manage/accounts/auth/status', { account_id: selectedAccount() });
     else if (action === 'request-code') { const f = $('account-form'); await post('/manage/accounts/auth/request-code', { account_id: f.account_id.value, phone: f.phone.value }); }
     else if (action === 'submit-code') { const f = $('account-form'); await post('/manage/accounts/auth/submit-code', { account_id: f.account_id.value, phone: f.phone.value, code: f.code.value, password: f.password.value }); }
     else if (action === 'discover-selected') await post('/manage/discover-origins', { account_id: selectedAccount(), include_topics: true, topic_limit: 500 });
-    else if (action === 'filter-origins') { const q = $('origin-filter').value.trim(); const data = await api(q ? `/manage/origins?account_id=${encodeURIComponent(q)}` : '/manage/origins'); state.origins = data.items || []; renderOrigins(); }
+    else if (action === 'filter-origins' || action === 'reload-origins') { await loadOrigins(); setStatus('Origins loaded', 'ok'); }
+    else if (action === 'refresh-origins') { const accountId = selectedOriginAccount(); if (!accountId) throw new Error('Select or enter an account first'); await post('/manage/discover-origins', { account_id: accountId, include_topics: true, topic_limit: 500 }); }
+    else if (action === 'toggle-origin') { state.expandedOrigins[target.dataset.key] = !state.expandedOrigins[target.dataset.key]; renderOrigins(); }
     else if (action === 'edit-policy') openPolicy(target.dataset.account, Number(target.dataset.origin), Number(target.dataset.topic || 0));
   } catch (error) { setStatus(String(error), 'error'); }
 });
@@ -1045,18 +1151,20 @@ $('account-form').addEventListener('submit', async (event) => { event.preventDef
 $('origin-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/origins', numberFields(formData(event.target), ['origin_id','topic_id','parent_origin_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
+$('show-archived').addEventListener('change', async () => { try { await loadOrigins(); setStatus('Origins loaded', 'ok'); } catch (error) { setStatus(String(error), 'error'); } });
 function openPolicy(accountId, originId, topicId) {
   const policy = state.policies.find(item => item.account_id === accountId && item.origin_id === originId && item.topic_id === topicId) || {};
   const origin = state.origins.find(item => item.account_id === accountId && item.origin_id === originId && item.topic_id === topicId);
   const row = document.createElement('tr');
   const cell = document.createElement('td');
-  cell.colSpan = 6;
+  cell.colSpan = 7;
   const form = $('policy-template').content.firstElementChild.cloneNode(true);
   form.account_id.value = accountId; form.origin_id.value = originId; form.topic_id.value = topicId;
-  form.enabled.checked = policy.enabled ?? origin?.backup_policy?.enabled ?? true;
+  form.enabled.checked = policy.enabled ?? origin?.backup_policy?.enabled ?? false;
   form.capture_text.checked = policy.capture_text ?? origin?.backup_policy?.capture_text ?? true;
   form.capture_media_metadata.checked = policy.capture_media_metadata ?? origin?.backup_policy?.capture_media_metadata ?? true;
   form.download_media.checked = policy.download_media ?? origin?.backup_policy?.download_media ?? false;
+  form.tags.value = policy.tags ?? origin?.backup_policy?.tags ?? '';
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/backup-policies', numberFields(formData(form), ['origin_id','topic_id']), 'PATCH'); row.remove(); } catch (error) { setStatus(String(error), 'error'); } });
   cell.appendChild(form); row.appendChild(cell); $('origins-body').prepend(row);
 }

@@ -24,6 +24,9 @@ from tele_mess_core.models import (
 )
 
 
+SCHEMA_VERSION = "7"
+
+
 class ArchiveStore:
     """SQLite-backed message archive."""
 
@@ -44,9 +47,10 @@ class ArchiveStore:
                 self._migrate_v1_to_v2()
             else:
                 self._conn.executescript(_schema_sql())
+            self._ensure_current_schema()
             if self.get_meta("database_id") is None:
                 self.set_meta("database_id", str(uuid.uuid4()))
-            self.set_meta("schema_version", "6")
+            self.set_meta("schema_version", SCHEMA_VERSION)
             self._conn.commit()
 
     def get_meta(self, key: str) -> str | None:
@@ -242,9 +246,9 @@ class ArchiveStore:
                 """
                 INSERT INTO origins(
                   source, account_id, origin_id, topic_id, origin_type, parent_origin_id,
-                  title, username, is_forum, discovered_at, updated_at, raw_json
+                  title, username, is_forum, archived_at, discovered_at, updated_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
                   origin_type = excluded.origin_type,
                   parent_origin_id = excluded.parent_origin_id,
@@ -264,12 +268,67 @@ class ArchiveStore:
                     origin.title,
                     origin.username,
                     int(origin.is_forum),
+                    origin.archived_at,
                     discovered_at,
                     now,
                     origin.raw_json,
                 ),
             )
             self._conn.commit()
+
+    def archive_origin(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+        archived: bool = True,
+    ) -> int:
+        at = utc_now_iso() if archived else None
+        changed = 0
+        with self._lock:
+            if topic_id == 0:
+                cur = self._conn.execute(
+                    """
+                    UPDATE origins
+                    SET archived_at = ?, updated_at = ?
+                    WHERE source = ? AND account_id = ? AND origin_id = ?
+                    """,
+                    (at, utc_now_iso(), source, account_id, origin_id),
+                )
+                changed += max(cur.rowcount, 0)
+                if archived:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE backup_policies
+                        SET enabled = 0, updated_at = ?
+                        WHERE source = ? AND account_id = ? AND origin_id = ?
+                        """,
+                        (utc_now_iso(), source, account_id, origin_id),
+                    )
+                    changed += max(cur.rowcount, 0)
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE origins
+                    SET archived_at = ?, updated_at = ?
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                    """,
+                    (at, utc_now_iso(), source, account_id, origin_id, topic_id),
+                )
+                changed += max(cur.rowcount, 0)
+                if archived:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE backup_policies
+                        SET enabled = 0, updated_at = ?
+                        WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                        """,
+                        (utc_now_iso(), source, account_id, origin_id, topic_id),
+                    )
+                    changed += max(cur.rowcount, 0)
+            self._conn.commit()
+        return changed
 
     def delete_origin(self, source: str, account_id: str, origin_id: int, topic_id: int = 0) -> int:
         deleted = 0
@@ -299,16 +358,17 @@ class ArchiveStore:
             self._conn.commit()
         return deleted
 
-    def list_origins(self, account_id: str | None = None) -> list[dict[str, Any]]:
+    def list_origins(self, account_id: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
         sql = """
             SELECT
               o.source, o.account_id, o.origin_id, o.topic_id, o.origin_type,
               o.parent_origin_id, o.title, o.username, o.is_forum,
-              o.discovered_at, o.updated_at, o.raw_json,
+              o.archived_at, o.discovered_at, o.updated_at, o.raw_json,
               p.enabled AS backup_enabled,
               p.capture_text,
               p.capture_media_metadata,
               p.download_media,
+              p.tags,
               p.updated_at AS policy_updated_at
             FROM origins o
             LEFT JOIN backup_policies p
@@ -317,13 +377,18 @@ class ArchiveStore:
              AND p.origin_id = o.origin_id
              AND p.topic_id = o.topic_id
         """
-        params: tuple[Any, ...] = ()
+        clauses: list[str] = []
+        params: list[Any] = []
         if account_id is not None:
-            sql += " WHERE o.account_id = ?"
-            params = (account_id,)
+            clauses.append("o.account_id = ?")
+            params.append(account_id)
+        if not include_archived:
+            clauses.append("o.archived_at IS NULL")
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY o.account_id, o.origin_type, o.title, o.origin_id, o.topic_id"
         with self._lock:
-            rows = self._conn.execute(sql, params).fetchall()
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
         items = []
         for row in rows:
             data = _row_to_dict(
@@ -337,6 +402,7 @@ class ArchiveStore:
                 data.pop("capture_text", None)
                 data.pop("capture_media_metadata", None)
                 data.pop("download_media", None)
+                data.pop("tags", None)
                 data.pop("policy_updated_at", None)
             else:
                 data["backup_policy"] = {
@@ -344,6 +410,7 @@ class ArchiveStore:
                     "capture_text": data.pop("capture_text"),
                     "capture_media_metadata": data.pop("capture_media_metadata"),
                     "download_media": data.pop("download_media"),
+                    "tags": data.pop("tags"),
                     "updated_at": data.pop("policy_updated_at"),
                 }
             items.append(data)
@@ -356,14 +423,15 @@ class ArchiveStore:
                 """
                 INSERT INTO backup_policies(
                   source, account_id, origin_id, topic_id, enabled,
-                  capture_text, capture_media_metadata, download_media, updated_at
+                  capture_text, capture_media_metadata, download_media, tags, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
                   enabled = excluded.enabled,
                   capture_text = excluded.capture_text,
                   capture_media_metadata = excluded.capture_media_metadata,
                   download_media = excluded.download_media,
+                  tags = excluded.tags,
                   updated_at = excluded.updated_at
                 """,
                 (
@@ -375,6 +443,7 @@ class ArchiveStore:
                     int(policy.capture_text),
                     int(policy.capture_media_metadata),
                     int(policy.download_media),
+                    policy.tags,
                     now,
                 ),
             )
@@ -395,7 +464,7 @@ class ArchiveStore:
     def list_backup_policies(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
             SELECT source, account_id, origin_id, topic_id, enabled,
-                   capture_text, capture_media_metadata, download_media, updated_at
+                   capture_text, capture_media_metadata, download_media, tags, updated_at
             FROM backup_policies
         """
         params: tuple[Any, ...] = ()
@@ -425,7 +494,7 @@ class ArchiveStore:
             row = self._conn.execute(
                 """
                 SELECT source, account_id, origin_id, topic_id, enabled,
-                       capture_text, capture_media_metadata, download_media, updated_at
+                       capture_text, capture_media_metadata, download_media, tags, updated_at
                 FROM backup_policies
                 WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
                 """,
@@ -986,6 +1055,12 @@ class ArchiveStore:
             return False
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(row["name"] == column for row in rows)
+
+    def _ensure_current_schema(self) -> None:
+        if self._has_table("origins") and not self._has_column("origins", "archived_at"):
+            self._conn.execute("ALTER TABLE origins ADD COLUMN archived_at TEXT")
+        if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
+            self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
 
     def _migrate_v1_to_v2(self) -> None:
         self._conn.executescript(

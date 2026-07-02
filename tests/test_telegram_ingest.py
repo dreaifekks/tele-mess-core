@@ -125,6 +125,12 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(stored)
         self.assertEqual(self.store.state()["message_count"], 0)
 
+    async def test_missing_policy_skips_message_by_default(self) -> None:
+        stored = await self.service._store_message(FakeMessage(15, -1006), event_type="new")
+
+        self.assertFalse(stored)
+        self.assertEqual(self.store.state()["message_count"], 0)
+
     async def test_download_media_policy_writes_media_file(self) -> None:
         self.store.set_backup_policy(
             BackupPolicyRecord(

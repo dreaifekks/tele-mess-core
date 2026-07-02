@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS origins (
   title TEXT,
   username TEXT,
   is_forum INTEGER NOT NULL DEFAULT 0,
+  archived_at TEXT,
   discovered_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   raw_json TEXT,
@@ -80,6 +81,7 @@ CREATE TABLE IF NOT EXISTS backup_policies (
   capture_text INTEGER NOT NULL DEFAULT 1,
   capture_media_metadata INTEGER NOT NULL DEFAULT 1,
   download_media INTEGER NOT NULL DEFAULT 0,
+  tags TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (source, account_id, origin_id, topic_id)
 );

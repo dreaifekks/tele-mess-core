@@ -165,6 +165,7 @@ class ArchiveStoreTest(unittest.TestCase):
                 capture_text=True,
                 capture_media_metadata=True,
                 download_media=False,
+                tags="ops,important",
             )
         )
         self.store.upsert_participant(
@@ -189,6 +190,19 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertTrue(topic["backup_policy"]["enabled"])
         self.assertTrue(topic["backup_policy"]["capture_media_metadata"])
         self.assertFalse(topic["backup_policy"]["download_media"])
+        self.assertEqual(topic["backup_policy"]["tags"], "ops,important")
+
+        changed = self.store.archive_origin(SOURCE_TELEGRAM, "main", -1001, archived=True)
+        self.assertGreaterEqual(changed, 2)
+        self.assertEqual(self.store.list_origins(account_id="main"), [])
+        archived_origins = self.store.list_origins(account_id="main", include_archived=True)
+        self.assertEqual(len(archived_origins), 2)
+        self.assertTrue(all(origin["archived_at"] for origin in archived_origins))
+        archived_topic = next(origin for origin in archived_origins if origin["topic_id"] == 42)
+        self.assertFalse(archived_topic["backup_policy"]["enabled"])
+
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -1001, archived=False)
+        self.assertEqual(len(self.store.list_origins(account_id="main")), 2)
 
         participants = self.store.list_participants(account_id="main", origin_id=-1001)
         self.assertEqual(participants[0]["username"], "alice")
@@ -205,6 +219,7 @@ class ArchiveStoreTest(unittest.TestCase):
                 capture_text=False,
                 capture_media_metadata=False,
                 download_media=False,
+                tags="alpha,beta",
             )
         )
         policy = self.store.get_backup_policy(SOURCE_TELEGRAM, "main", -1001)
@@ -212,6 +227,7 @@ class ArchiveStoreTest(unittest.TestCase):
         assert policy is not None
         self.assertFalse(policy["capture_text"])
         self.assertFalse(policy["capture_media_metadata"])
+        self.assertEqual(policy["tags"], "alpha,beta")
 
         self.store.upsert_capture_cursor(
             CaptureCursorRecord(
@@ -303,7 +319,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "6")
+                self.assertEqual(store.state()["schema_version"], "7")
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")

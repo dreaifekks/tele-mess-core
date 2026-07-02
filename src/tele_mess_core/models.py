@@ -80,6 +80,7 @@ class OriginRecord:
     title: str | None = None
     username: str | None = None
     is_forum: bool = False
+    archived_at: str | None = None
     discovered_at: str | None = None
     updated_at: str | None = None
     raw_json: str | None = None
@@ -95,6 +96,7 @@ class BackupPolicyRecord:
     capture_text: bool = True
     capture_media_metadata: bool = True
     download_media: bool = False
+    tags: str | None = None
     updated_at: str | None = None
 
 

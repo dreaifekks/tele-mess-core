@@ -125,7 +125,7 @@ class TelegramArchiveService:
         @self.client.on(events.MessageDeleted(chats=chat_ids))
         async def on_delete(event: Any) -> None:
             chat_id = getattr(event, "chat_id", None)
-            if chat_id is None or not self._policy_for(int(chat_id)).get("enabled", True):
+            if chat_id is None or not self._policy_for(int(chat_id)).get("enabled", False):
                 return
             self.store.mark_deleted(
                 source=SOURCE_TELEGRAM,
@@ -142,7 +142,7 @@ class TelegramArchiveService:
                 return
             peer_id = utils.get_peer_id(event.peer)
             chat_id = self._match_chat_id(peer_id, chat_ids)
-            if chat_id is None or not self._policy_for(chat_id).get("enabled", True):
+            if chat_id is None or not self._policy_for(chat_id).get("enabled", False):
                 return
             self.store.update_reactions(
                 source=SOURCE_TELEGRAM,
@@ -170,7 +170,7 @@ class TelegramArchiveService:
         chat_id = int(message.chat_id)
         topic_id = _topic_id(message)
         policy = self._policy_for(chat_id, topic_id)
-        if not policy.get("enabled", True):
+        if not policy.get("enabled", False):
             return False
 
         sender = None
@@ -304,7 +304,7 @@ class TelegramArchiveService:
 
         for chat_id in chat_ids:
             policy = self._policy_for(chat_id)
-            if not policy.get("enabled", True):
+            if not policy.get("enabled", False):
                 self.logger.info("Skipping backfill for disabled origin %s/%s", self.account_id, chat_id)
                 continue
             cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, self.account_id, chat_id)
@@ -352,7 +352,7 @@ class TelegramArchiveService:
         if origin_policy is not None:
             return origin_policy
         return {
-            "enabled": True,
+            "enabled": False,
             "capture_text": True,
             "capture_media_metadata": True,
             "download_media": False,

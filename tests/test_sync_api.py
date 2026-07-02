@@ -111,9 +111,14 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("API token required", html)
         self.assertIn("Enter server.token", html)
         self.assertIn('data-action="delete-account"', html)
-        self.assertIn('data-action="delete-origin"', html)
+        self.assertIn("archive-origin", html)
+        self.assertIn("restore-origin", html)
+        self.assertIn('data-action="refresh-origins"', html)
+        self.assertIn('data-action="reload-origins"', html)
         self.assertIn('data-action="delete-policy"', html)
         self.assertIn('data-action="delete-participant"', html)
+        self.assertIn("Manual Origin", html)
+        self.assertIn("Tags", html)
         self.assertIn("<th>Actions</th>", html)
         self.assertIn(".table-wrap thead th", html)
         self.assertIn("top: 0", html)
@@ -211,10 +216,12 @@ class SyncApiTest(unittest.TestCase):
                 "capture_text": True,
                 "capture_media_metadata": True,
                 "download_media": False,
+                "tags": "alpha,beta",
             },
         )["item"]
         self.assertTrue(policy["enabled"])
         self.assertFalse(policy["download_media"])
+        self.assertEqual(policy["tags"], "alpha,beta")
 
         participant = self.request_json(
             "/manage/participants",
@@ -233,6 +240,7 @@ class SyncApiTest(unittest.TestCase):
         origins = self.request_json("/manage/origins?account_id=main")["items"]
         saved_topic = next(item for item in origins if item["topic_id"] == 123)
         self.assertTrue(saved_topic["backup_policy"]["enabled"])
+        self.assertEqual(saved_topic["backup_policy"]["tags"], "alpha,beta")
         participants = self.request_json("/manage/participants?account_id=main&origin_id=-1001")["items"]
         self.assertEqual(participants[0]["display_name"], "Alice")
 
@@ -243,6 +251,27 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("origin_registry", capabilities["management"])
         self.assertIn("capture_cursors", capabilities["management"])
         self.assertIn("operation_events", capabilities["management"])
+
+        archive = self.request_json(
+            "/manage/origins/archive",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -1001, "archived": True},
+        )["item"]
+        self.assertTrue(archive["archived"])
+        self.assertEqual(self.request_json("/manage/origins?account_id=main")["items"], [])
+        archived = self.request_json("/manage/origins?account_id=main&include_archived=true")["items"]
+        self.assertEqual(len(archived), 2)
+        self.assertTrue(all(item["archived_at"] for item in archived))
+        archived_topic = next(item for item in archived if item["topic_id"] == 123)
+        self.assertFalse(archived_topic["backup_policy"]["enabled"])
+
+        restore = self.request_json(
+            "/manage/origins/archive",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -1001, "archived": False},
+        )["item"]
+        self.assertFalse(restore["archived"])
+        self.assertEqual(len(self.request_json("/manage/origins?account_id=main")["items"]), 2)
 
     def test_management_delete_endpoints_remove_console_records(self) -> None:
         self.request_json(
