@@ -780,9 +780,16 @@ const state = { accounts: [], origins: [], policies: [], participants: [], curso
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
 tokenInput.value = localStorage.getItem('teleMessToken') || '';
+function tokenValue() {
+  return tokenInput.value.trim();
+}
 function headers() {
-  const token = tokenInput.value.trim();
+  const token = tokenValue();
   return token ? { 'Authorization': `Bearer ${token}` } : {};
+}
+function requireToken() {
+  if (tokenValue()) return;
+  throw new Error('API token required: enter server.token from config.yml, then click Save');
 }
 function setStatus(text, kind='') {
   const node = $('status');
@@ -790,6 +797,7 @@ function setStatus(text, kind='') {
   node.textContent = text;
 }
 async function api(path, options={}) {
+  requireToken();
   const opts = { ...options, headers: { ...headers(), ...(options.headers || {}) } };
   if (opts.body && !opts.headers['Content-Type']) opts.headers['Content-Type'] = 'application/json';
   const response = await fetch(path, opts);
@@ -896,7 +904,11 @@ document.addEventListener('click', async (event) => {
   if (!target) return;
   const action = target.dataset.action;
   try {
-    if (target.id === 'save-token') { localStorage.setItem('teleMessToken', tokenInput.value.trim()); setStatus('Token saved', 'ok'); }
+    if (target.id === 'save-token') {
+      localStorage.setItem('teleMessToken', tokenValue());
+      setStatus(tokenValue() ? 'Token saved' : 'Token cleared', tokenValue() ? 'ok' : 'warn');
+      if (tokenValue()) await loadAll();
+    }
     else if (target.id === 'refresh' || action === 'load') await loadAll();
     else if (action === 'load-messages') await loadMessages();
     else if (action === 'load-participants') { const data = await api('/manage/participants'); state.participants = data.items || []; renderParticipants(); }
@@ -938,7 +950,8 @@ function openPolicy(accountId, originId, topicId) {
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/backup-policies', numberFields(formData(form), ['origin_id','topic_id']), 'PATCH'); row.remove(); } catch (error) { setStatus(String(error), 'error'); } });
   cell.appendChild(form); row.appendChild(cell); $('origins-body').prepend(row);
 }
-loadAll();
+if (tokenValue()) loadAll();
+else setStatus('Enter server.token from config.yml, then click Save', 'warn');
 </script>
 </body>
 </html>"""

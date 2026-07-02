@@ -99,6 +99,8 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("/sync/media-files", html)
         self.assertIn("Save policy", html)
         self.assertIn("escapeHtml", html)
+        self.assertIn("API token required", html)
+        self.assertIn("Enter server.token", html)
 
     def test_root_serves_console_without_token(self) -> None:
         html = self.request_text_no_auth("/")
