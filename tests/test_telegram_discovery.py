@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -34,6 +35,7 @@ class FakeClient:
         yield SimpleNamespace(
             id=-1001,
             title="Source Group",
+            date=datetime(2026, 1, 2, 3, 4, 5, tzinfo=timezone.utc),
             is_user=False,
             is_group=True,
             is_channel=False,
@@ -42,10 +44,19 @@ class FakeClient:
         yield SimpleNamespace(
             id=-1002,
             title="News Channel",
+            message=SimpleNamespace(date=datetime(2026, 1, 3, 3, 4, 5, tzinfo=timezone.utc)),
             is_user=False,
             is_group=False,
             is_channel=True,
             entity=FakeEntity(id=-1002, title="News Channel", username="news", broadcast=True),
+        )
+        yield SimpleNamespace(
+            id=1003,
+            title="Alice",
+            is_user=True,
+            is_group=False,
+            is_channel=False,
+            entity=FakeEntity(id=1003, first_name="Alice", username="alice"),
         )
 
     async def iter_participants(self, origin_id, limit=None):
@@ -57,7 +68,7 @@ class FakeClient:
             return SimpleNamespace(
                 count=2,
                 topics=[
-                    FakeEntity(id=10, title="Topic One", top_message=100),
+                    FakeEntity(id=10, title="Topic One", top_message=100, date=datetime(2026, 1, 4, 3, 4, 5, tzinfo=timezone.utc)),
                     FakeEntity(id=11, title="Topic Two", top_message=101),
                 ],
             )
@@ -109,10 +120,16 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["origins"], 2)
         self.assertEqual(result["topics"], 2)
+        self.assertEqual(result["private_skipped"], 1)
         origins = self.store.list_origins(account_id="main")
         self.assertEqual({item["origin_type"] for item in origins}, {"group", "channel", "topic"})
-        self.assertTrue(next(item for item in origins if item["origin_id"] == -1001 and item["topic_id"] == 0)["is_forum"])
-        self.assertEqual(len([item for item in origins if item["origin_type"] == "topic"]), 2)
+        group = next(item for item in origins if item["origin_id"] == -1001 and item["topic_id"] == 0)
+        self.assertTrue(group["is_forum"])
+        self.assertEqual(group["last_message_at"], "2026-01-02T03:04:05+00:00")
+        self.assertEqual(next(item for item in origins if item["origin_id"] == -1002)["last_message_at"], "2026-01-03T03:04:05+00:00")
+        topics = [item for item in origins if item["origin_type"] == "topic"]
+        self.assertEqual(len(topics), 2)
+        self.assertEqual(next(item for item in topics if item["topic_id"] == 10)["last_message_at"], "2026-01-04T03:04:05+00:00")
 
         refresh = await self.service.refresh_participants(-1001)
         self.assertEqual(refresh["participants"], 1)
@@ -127,6 +144,14 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["topics_truncated"])
         topics = [item for item in self.store.list_origins(account_id="main") if item["origin_type"] == "topic"]
         self.assertEqual(len(topics), 1)
+
+    async def test_discover_origins_can_include_private_when_explicit(self) -> None:
+        result = await self.service.discover_origins(include_topics=False, include_private=True)
+
+        self.assertEqual(result["origins"], 3)
+        self.assertEqual(result["private_skipped"], 0)
+        origins = self.store.list_origins(account_id="main")
+        self.assertIn("private", {item["origin_type"] for item in origins})
 
     async def test_refresh_participants_records_access_error(self) -> None:
         self.service.fake_client = FailingParticipantClient()

@@ -81,6 +81,7 @@ class OriginRecord:
     username: str | None = None
     is_forum: bool = False
     archived_at: str | None = None
+    last_message_at: str | None = None
     discovered_at: str | None = None
     updated_at: str | None = None
     raw_json: str | None = None

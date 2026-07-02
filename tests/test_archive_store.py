@@ -142,6 +142,7 @@ class ArchiveStoreTest(unittest.TestCase):
                 origin_type="group",
                 title="Source Group",
                 is_forum=True,
+                last_message_at="2026-01-01T00:00:00+00:00",
             )
         )
         self.store.upsert_origin(
@@ -186,11 +187,26 @@ class ArchiveStoreTest(unittest.TestCase):
 
         origins = self.store.list_origins(account_id="main")
         self.assertEqual({origin["origin_type"] for origin in origins}, {"group", "topic"})
+        group = next(origin for origin in origins if origin["topic_id"] == 0)
+        self.assertEqual(group["last_message_at"], "2026-01-01T00:00:00+00:00")
         topic = next(origin for origin in origins if origin["topic_id"] == 42)
         self.assertTrue(topic["backup_policy"]["enabled"])
         self.assertTrue(topic["backup_policy"]["capture_media_metadata"])
         self.assertFalse(topic["backup_policy"]["download_media"])
         self.assertEqual(topic["backup_policy"]["tags"], "ops,important")
+
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                last_message_id=20,
+                last_message_at="2026-01-02T00:00:00+00:00",
+            )
+        )
+        origins = self.store.list_origins(account_id="main")
+        group = next(origin for origin in origins if origin["topic_id"] == 0)
+        self.assertEqual(group["last_message_at"], "2026-01-02T00:00:00+00:00")
 
         changed = self.store.archive_origin(SOURCE_TELEGRAM, "main", -1001, archived=True)
         self.assertGreaterEqual(changed, 2)
@@ -319,7 +335,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "7")
+                self.assertEqual(store.state()["schema_version"], "8")
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")

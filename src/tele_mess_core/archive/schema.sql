@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS origins (
   username TEXT,
   is_forum INTEGER NOT NULL DEFAULT 0,
   archived_at TEXT,
+  last_message_at TEXT,
   discovered_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   raw_json TEXT,

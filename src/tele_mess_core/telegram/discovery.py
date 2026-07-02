@@ -13,6 +13,7 @@ from tele_mess_core.models import (
     OriginRecord,
     ParticipantRecord,
     SOURCE_TELEGRAM,
+    to_iso,
     utc_now_iso,
 )
 from tele_mess_core.telegram.runtime import classify_telegram_exception
@@ -29,7 +30,12 @@ class TelegramDiscoveryService:
         self.store = store
         self.logger = logging.getLogger(__name__)
 
-    async def discover_origins(self, include_topics: bool = True, topic_limit: int = 100) -> dict[str, Any]:
+    async def discover_origins(
+        self,
+        include_topics: bool = True,
+        topic_limit: int = 100,
+        include_private: bool = False,
+    ) -> dict[str, Any]:
         client = None
         try:
             client = await self._connected_client()
@@ -40,6 +46,7 @@ class TelegramDiscoveryService:
             self._set_auth_state("authorized")
             origin_count = 0
             topic_count = 0
+            private_skipped = 0
             errors: list[dict[str, Any]] = []
             topics_truncated = False
             effective_topic_limit, requested_topic_limit = _bounded_discovery_limit(topic_limit, MAX_TOPIC_DISCOVERY_LIMIT)
@@ -49,6 +56,9 @@ class TelegramDiscoveryService:
                         entity = getattr(dialog, "entity", None)
                         origin_id = int(getattr(dialog, "id"))
                         origin_type = _dialog_origin_type(dialog, entity)
+                        if origin_type == "private" and not include_private:
+                            private_skipped += 1
+                            continue
                         is_forum = bool(getattr(entity, "forum", False))
                         self.store.upsert_origin(
                             OriginRecord(
@@ -59,6 +69,7 @@ class TelegramDiscoveryService:
                                 title=getattr(dialog, "title", None) or _display_name(entity),
                                 username=getattr(entity, "username", None),
                                 is_forum=is_forum,
+                                last_message_at=_dialog_last_message_at(dialog),
                                 updated_at=utc_now_iso(),
                                 raw_json=json.dumps(_safe_dict(entity), ensure_ascii=False, default=str),
                             )
@@ -94,9 +105,11 @@ class TelegramDiscoveryService:
                 "status": status,
                 "origins": origin_count,
                 "topics": topic_count,
+                "private_skipped": private_skipped,
                 "errors": errors,
                 "topics_truncated": topics_truncated,
                 "topic_limit": effective_topic_limit,
+                "include_private": include_private,
             }
         except Exception as exc:
             error = classify_telegram_exception(exc, default_code="discover_origins_failed")
@@ -267,6 +280,7 @@ class TelegramDiscoveryService:
                         origin_type="topic",
                         parent_origin_id=origin_id,
                         title=getattr(topic, "title", None),
+                        last_message_at=_topic_last_message_at(topic),
                         updated_at=utc_now_iso(),
                         raw_json=json.dumps(_safe_dict(topic), ensure_ascii=False, default=str),
                     )
@@ -359,6 +373,23 @@ def _dialog_origin_type(dialog: Any, entity: Any) -> str:
     if bool(getattr(entity, "broadcast", False)) or bool(getattr(dialog, "is_channel", False)):
         return "channel"
     return type(entity).__name__ if entity is not None else "unknown"
+
+
+def _dialog_last_message_at(dialog: Any) -> str | None:
+    message = getattr(dialog, "message", None)
+    return to_iso(
+        getattr(dialog, "date", None)
+        or getattr(message, "date", None)
+        or getattr(message, "created_at", None)
+    )
+
+
+def _topic_last_message_at(topic: Any) -> str | None:
+    return to_iso(
+        getattr(topic, "date", None)
+        or getattr(topic, "last_message_at", None)
+        or getattr(topic, "top_message_date", None)
+    )
 
 
 def _bounded_discovery_limit(value: int, max_limit: int) -> tuple[int, int]:

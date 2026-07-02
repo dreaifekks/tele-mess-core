@@ -24,7 +24,7 @@ from tele_mess_core.models import (
 )
 
 
-SCHEMA_VERSION = "7"
+SCHEMA_VERSION = "8"
 
 
 class ArchiveStore:
@@ -246,15 +246,16 @@ class ArchiveStore:
                 """
                 INSERT INTO origins(
                   source, account_id, origin_id, topic_id, origin_type, parent_origin_id,
-                  title, username, is_forum, archived_at, discovered_at, updated_at, raw_json
+                  title, username, is_forum, archived_at, last_message_at, discovered_at, updated_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
                   origin_type = excluded.origin_type,
                   parent_origin_id = excluded.parent_origin_id,
                   title = excluded.title,
                   username = excluded.username,
                   is_forum = excluded.is_forum,
+                  last_message_at = COALESCE(excluded.last_message_at, origins.last_message_at),
                   updated_at = excluded.updated_at,
                   raw_json = excluded.raw_json
                 """,
@@ -269,6 +270,7 @@ class ArchiveStore:
                     origin.username,
                     int(origin.is_forum),
                     origin.archived_at,
+                    origin.last_message_at,
                     discovered_at,
                     now,
                     origin.raw_json,
@@ -363,7 +365,7 @@ class ArchiveStore:
             SELECT
               o.source, o.account_id, o.origin_id, o.topic_id, o.origin_type,
               o.parent_origin_id, o.title, o.username, o.is_forum,
-              o.archived_at, o.discovered_at, o.updated_at, o.raw_json,
+              o.archived_at, o.last_message_at, o.discovered_at, o.updated_at, o.raw_json,
               p.enabled AS backup_enabled,
               p.capture_text,
               p.capture_media_metadata,
@@ -555,6 +557,27 @@ class ArchiveStore:
                     cursor.raw_json,
                 ),
             )
+            if cursor.last_message_at:
+                self._conn.execute(
+                    """
+                    UPDATE origins
+                    SET last_message_at = CASE
+                          WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
+                          ELSE last_message_at
+                        END,
+                        updated_at = ?
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                    """,
+                    (
+                        cursor.last_message_at,
+                        cursor.last_message_at,
+                        now,
+                        cursor.source,
+                        cursor.account_id,
+                        cursor.origin_id,
+                        cursor.topic_id,
+                    ),
+                )
             self._conn.commit()
 
     def list_capture_cursors(self, account_id: str | None = None) -> list[dict[str, Any]]:
@@ -1059,6 +1082,8 @@ class ArchiveStore:
     def _ensure_current_schema(self) -> None:
         if self._has_table("origins") and not self._has_column("origins", "archived_at"):
             self._conn.execute("ALTER TABLE origins ADD COLUMN archived_at TEXT")
+        if self._has_table("origins") and not self._has_column("origins", "last_message_at"):
+            self._conn.execute("ALTER TABLE origins ADD COLUMN last_message_at TEXT")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
 

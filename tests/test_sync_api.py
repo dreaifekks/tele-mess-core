@@ -121,13 +121,20 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn('data-action="bulk-clear-policies"', html)
         self.assertIn('data-action="delete-policy"', html)
         self.assertIn('data-action="delete-participant"', html)
-        self.assertIn("Manual Origin", html)
+        self.assertNotIn("Manual Origin", html)
+        self.assertIn('id="origin-search"', html)
+        self.assertIn('id="origin-type-filter"', html)
+        self.assertIn('id="origin-backup-filter"', html)
+        self.assertIn('id="origin-tag-filter"', html)
+        self.assertIn('id="origin-sort"', html)
+        self.assertIn("filteredOrigins", html)
+        self.assertIn("Last message", html)
         self.assertIn("Removed", html)
         self.assertIn("Tags", html)
         self.assertIn("policy-row", html)
         self.assertIn("button.closest('tr').after(row)", html)
         self.assertIn(".raw-panel", html)
-        self.assertIn("min-height: calc(100vh - 240px)", html)
+        self.assertIn("height: calc(100vh - 170px)", html)
         self.assertIn("<th>Actions</th>", html)
         self.assertIn(".table-wrap thead th", html)
         self.assertIn("top: 0", html)
@@ -198,6 +205,7 @@ class SyncApiTest(unittest.TestCase):
                 "origin_type": "group",
                 "title": "Source Group",
                 "is_forum": True,
+                "last_message_at": "2026-01-01T00:00:00+00:00",
             },
         )
         topic = self.request_json(
@@ -247,6 +255,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(participant["username"], "alice")
 
         origins = self.request_json("/manage/origins?account_id=main")["items"]
+        self.assertEqual(next(item for item in origins if item["topic_id"] == 0)["last_message_at"], "2026-01-01T00:00:00+00:00")
         saved_topic = next(item for item in origins if item["topic_id"] == 123)
         self.assertTrue(saved_topic["backup_policy"]["enabled"])
         self.assertEqual(saved_topic["backup_policy"]["tags"], "alpha,beta")

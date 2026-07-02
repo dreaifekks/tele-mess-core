@@ -387,6 +387,7 @@ def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, An
             title=_optional_payload_str(payload, "title"),
             username=_optional_payload_str(payload, "username"),
             is_forum=_payload_bool(payload, "is_forum", False),
+            last_message_at=_optional_payload_str(payload, "last_message_at"),
             updated_at=utc_now_iso(),
             raw_json=_public_raw_json(payload),
         )
@@ -529,10 +530,17 @@ def _submit_auth_code(config: "AppConfig | None", store: ArchiveStore, payload: 
 def _discover_origins(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
     account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     include_topics = _payload_bool(payload, "include_topics", True)
+    include_private = _payload_bool(payload, "include_private", False)
     topic_limit = _payload_int(payload, "topic_limit", 100)
     from tele_mess_core.telegram.discovery import TelegramDiscoveryService
 
-    return asyncio.run(TelegramDiscoveryService(account, store).discover_origins(include_topics, topic_limit))
+    return asyncio.run(
+        TelegramDiscoveryService(account, store).discover_origins(
+            include_topics=include_topics,
+            topic_limit=topic_limit,
+            include_private=include_private,
+        )
+    )
 
 
 def _refresh_participants(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -741,6 +749,8 @@ def _console_html() -> str:
     details .form-grid { margin-top: 12px; }
     .panel-head { display: flex; justify-content: space-between; gap: 12px; align-items: center; margin-bottom: 12px; }
     .toolbar { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+    .property-bar { display: grid; grid-template-columns: minmax(160px, 1.2fr) repeat(5, minmax(120px, .8fr)) auto; gap: 8px; align-items: end; margin-bottom: 12px; }
+    .property-bar label { min-width: 0; }
     .form-grid { display: grid; gap: 10px; }
     .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
@@ -778,11 +788,12 @@ def _console_html() -> str:
     .stack { display: grid; gap: 12px; }
     .table-wrap { overflow: auto; max-height: calc(100vh - 240px); border: 1px solid var(--line); border-radius: 6px; }
     .table-wrap table { min-width: 680px; }
+    .origin-table table { min-width: 1080px; }
     .table-wrap thead th { position: sticky; top: 0; z-index: 2; box-shadow: 0 1px 0 var(--line); }
     pre { margin: 0; overflow: auto; background: #101828; color: #e5e7eb; border-radius: 6px; padding: 10px; max-height: 280px; font-size: 12px; }
-    .raw-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); min-height: calc(100vh - 170px); }
-    #raw { max-height: none; min-height: calc(100vh - 240px); }
-    @media (max-width: 920px) { .topbar, .grid, .two { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } th { position: static; } }
+    .raw-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); height: calc(100vh - 170px); min-height: 360px; }
+    #raw { max-height: none; min-height: 0; height: 100%; }
+    @media (max-width: 920px) { .topbar, .grid, .two, .property-bar { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } th { position: static; } }
   </style>
 </head>
 <body>
@@ -846,28 +857,19 @@ def _console_html() -> str:
     </div>
   </section>
 
-  <section id=\"view-origins\" class=\"view grid hidden\">
-    <details class=\"panel\">
-      <summary><h2>Manual Origin</h2></summary>
-      <form id=\"origin-form\" class=\"form-grid\">
-        <label>Account ID<input name=\"account_id\" required></label>
-        <div class=\"two form-grid\">
-          <label>Origin ID<input name=\"origin_id\" required></label>
-          <label>Topic ID<input name=\"topic_id\" value=\"0\"></label>
-        </div>
-        <div class=\"two form-grid\">
-          <label>Type<select name=\"origin_type\"><option>group</option><option>channel</option><option>private</option><option>topic</option><option>configured_chat</option></select></label>
-          <label>Parent origin<input name=\"parent_origin_id\"></label>
-        </div>
-        <label>Title<input name=\"title\"></label>
-        <label>Username<input name=\"username\"></label>
-        <label class=\"check\"><input type=\"checkbox\" name=\"is_forum\"> Forum</label>
-        <button class=\"primary\" type=\"submit\">Save origin</button>
-      </form>
-    </details>
+  <section id=\"view-origins\" class=\"view hidden\">
     <div class=\"panel\">
-      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Removed</label><button data-action=\"reload-origins\">Reload</button><button data-action=\"refresh-origins\">Refresh Telegram</button><button data-action=\"toggle-origin-manage\">Manage</button><span id=\"origin-bulk\" class=\"toolbar bulk-toolbar hidden\"><button data-action=\"select-visible-origins\">Select visible</button><button data-action=\"clear-origin-selection\">Clear</button><button data-action=\"bulk-remove-origins\">Remove selected</button><button data-action=\"bulk-restore-origins\">Restore selected</button><button data-action=\"bulk-clear-policies\">Clear policies</button><span id=\"origin-selection\" class=\"muted\">0 selected</span></span></div></div>
-      <div class=\"table-wrap\"><table><thead id=\"origins-head\"></thead><tbody id=\"origins-body\"></tbody></table></div>
+      <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><button data-action=\"reload-origins\">Reload</button><button data-action=\"refresh-origins\">Refresh Telegram</button><button data-action=\"toggle-origin-manage\">Manage</button><span id=\"origin-bulk\" class=\"toolbar bulk-toolbar hidden\"><button data-action=\"select-visible-origins\">Select visible</button><button data-action=\"clear-origin-selection\">Clear</button><button data-action=\"bulk-remove-origins\">Remove selected</button><button data-action=\"bulk-restore-origins\">Restore selected</button><button data-action=\"bulk-clear-policies\">Clear policies</button><span id=\"origin-selection\" class=\"muted\">0 selected</span></span></div></div>
+      <div class=\"property-bar\">
+        <label>Search<input id=\"origin-search\" placeholder=\"Title, id, username\"></label>
+        <label>Account<input id=\"origin-filter\" placeholder=\"Account filter\"></label>
+        <label>Type<select id=\"origin-type-filter\"><option value=\"\">Any type</option><option value=\"group\">Group</option><option value=\"channel\">Channel</option><option value=\"topic\">Topic</option><option value=\"configured_chat\">Configured</option><option value=\"private\">Private</option><option value=\"unknown\">Unknown</option></select></label>
+        <label>Backup<select id=\"origin-backup-filter\"><option value=\"\">Any backup</option><option value=\"on\">On</option><option value=\"off\">Off</option></select></label>
+        <label>Tags<input id=\"origin-tag-filter\" placeholder=\"Tag filter\"></label>
+        <label>Sort<select id=\"origin-sort\"><option value=\"last_desc\">Last message desc</option><option value=\"last_asc\">Last message asc</option><option value=\"title_asc\">Title A-Z</option><option value=\"account_asc\">Account A-Z</option><option value=\"type_asc\">Type A-Z</option><option value=\"backup_desc\">Backup first</option></select></label>
+        <label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Removed</label>
+      </div>
+      <div class=\"table-wrap origin-table\"><table><thead id=\"origins-head\"></thead><tbody id=\"origins-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -985,6 +987,18 @@ function originKey(accountId, originId, topicId=0) {
 function originPayload(accountId, originId, topicId=0) {
   return { account_id: accountId, origin_id: Number(originId), topic_id: Number(topicId || 0) };
 }
+function normalized(value) {
+  return value === null || value === undefined ? '' : String(value).toLowerCase();
+}
+function originTags(item) {
+  return item.backup_policy?.tags || '';
+}
+function originBackupState(item) {
+  return item.backup_policy?.enabled ? 'on' : 'off';
+}
+function originLastMessageValue(item) {
+  return item.last_message_at || '';
+}
 function originPath() {
   const params = new URLSearchParams();
   const q = $('origin-filter')?.value.trim();
@@ -1047,10 +1061,11 @@ function renderAccounts() {
 }
 function renderOrigins() {
   renderOriginHead();
+  const visibleOrigins = filteredOrigins();
   const topicsByParent = {};
   const parentKeys = new Set();
   const parents = [];
-  for (const item of state.origins) {
+  for (const item of visibleOrigins) {
     const topicId = item.topic_id ?? 0;
     const key = `${item.account_id}:${item.origin_id}:0`;
     if (!topicId) {
@@ -1060,7 +1075,7 @@ function renderOrigins() {
       (topicsByParent[key] ||= []).push(item);
     }
   }
-  for (const item of state.origins) {
+  for (const item of visibleOrigins) {
     const topicId = item.topic_id ?? 0;
     const key = `${item.account_id}:${item.origin_id}:0`;
     if (topicId && !parentKeys.has(key)) {
@@ -1071,16 +1086,51 @@ function renderOrigins() {
   for (const item of parents) {
     const key = originKey(item.account_id, item.origin_id, 0);
     const children = topicsByParent[key] || [];
-    rows.push(originRow(item, children.length, false));
+    rows.push(originRow(item, children.length, Boolean(item.topic_id ?? 0)));
     if (children.length && state.expandedOrigins[key]) {
       for (const child of children) rows.push(originRow(child, 0, true));
     }
   }
-  fillTable('origins-body', rows, state.manageOrigins ? 8 : 7);
+  fillTable('origins-body', rows, state.manageOrigins ? 9 : 8);
   updateOriginBulk();
 }
+function filteredOrigins() {
+  const search = normalized($('origin-search')?.value);
+  const type = $('origin-type-filter')?.value || '';
+  const backup = $('origin-backup-filter')?.value || '';
+  const tag = normalized($('origin-tag-filter')?.value);
+  const sort = $('origin-sort')?.value || 'last_desc';
+  const items = state.origins.filter(item => {
+    if (type && item.origin_type !== type) return false;
+    if (backup && originBackupState(item) !== backup) return false;
+    if (tag && !normalized(originTags(item)).includes(tag)) return false;
+    if (search) {
+      const haystack = [
+        item.account_id,
+        item.origin_id,
+        item.topic_id,
+        item.title,
+        item.username,
+        item.origin_type,
+        originTags(item),
+      ].map(normalized).join(' ');
+      if (!haystack.includes(search)) return false;
+    }
+    return true;
+  });
+  return items.sort((a, b) => compareOrigins(a, b, sort));
+}
+function compareOrigins(a, b, sort) {
+  const textCompare = (left, right) => normalized(left).localeCompare(normalized(right));
+  if (sort === 'last_asc') return textCompare(originLastMessageValue(a), originLastMessageValue(b)) || textCompare(a.title, b.title);
+  if (sort === 'title_asc') return textCompare(a.title, b.title) || Number(a.origin_id) - Number(b.origin_id);
+  if (sort === 'account_asc') return textCompare(a.account_id, b.account_id) || textCompare(a.title, b.title);
+  if (sort === 'type_asc') return textCompare(a.origin_type, b.origin_type) || textCompare(a.title, b.title);
+  if (sort === 'backup_desc') return textCompare(originBackupState(b), originBackupState(a)) || textCompare(a.title, b.title);
+  return textCompare(originLastMessageValue(b), originLastMessageValue(a)) || textCompare(a.title, b.title);
+}
 function renderOriginHead() {
-  $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
+  $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Last message</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
 }
 function originRow(item, childCount, isTopic) {
   const policy = item.backup_policy;
@@ -1095,7 +1145,7 @@ function originRow(item, childCount, isTopic) {
   const removeAction = item.archived_at ? 'restore-origin' : 'remove-origin';
   const rowClass = `${item.archived_at ? 'removed-row ' : ''}${isTopic ? 'topic-row' : ''}`.trim();
   const selectCell = state.manageOrigins ? `<td><input class=\"origin-select\" type=\"checkbox\" data-action=\"select-origin-row\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" ${state.selectedOrigins[rowKey] ? 'checked' : ''}></td>` : '';
-  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
+  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td>${text(item.last_message_at)}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
 }
 function updateOriginBulk() {
   const bulk = $('origin-bulk');
@@ -1230,10 +1280,14 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
   $(`view-${button.dataset.view}`).classList.remove('hidden');
 }));
 $('account-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/accounts', formData(event.target)); } catch (error) { setStatus(String(error), 'error'); } });
-$('origin-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/origins', numberFields(formData(event.target), ['origin_id','topic_id','parent_origin_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('show-archived').addEventListener('change', async () => { try { await loadOrigins(); setStatus('Origins loaded', 'ok'); } catch (error) { setStatus(String(error), 'error'); } });
+['origin-search', 'origin-type-filter', 'origin-backup-filter', 'origin-tag-filter', 'origin-sort'].forEach(id => {
+  const input = $(id);
+  if (input) input.addEventListener('input', renderOrigins);
+  if (input) input.addEventListener('change', renderOrigins);
+});
 function openPolicy(button) {
   const accountId = button.dataset.account;
   const originId = Number(button.dataset.origin);
@@ -1244,7 +1298,7 @@ function openPolicy(button) {
   const row = document.createElement('tr');
   row.className = 'policy-row';
   const cell = document.createElement('td');
-  cell.colSpan = state.manageOrigins ? 8 : 7;
+  cell.colSpan = state.manageOrigins ? 9 : 8;
   const form = $('policy-template').content.firstElementChild.cloneNode(true);
   form.account_id.value = accountId; form.origin_id.value = originId; form.topic_id.value = topicId;
   form.enabled.checked = policy.enabled ?? origin?.backup_policy?.enabled ?? false;
