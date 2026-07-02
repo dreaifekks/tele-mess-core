@@ -715,7 +715,7 @@ def _console_html() -> str:
     button:disabled { opacity: .55; cursor: not-allowed; }
     table { width: 100%; border-collapse: collapse; font-size: 13px; }
     th, td { border-bottom: 1px solid var(--line); padding: 8px 7px; text-align: left; vertical-align: top; }
-    th { color: var(--muted); font-weight: 650; background: #fafbfc; position: sticky; top: 57px; }
+    th { color: var(--muted); font-weight: 650; background: #fafbfc; }
     td.actions { width: 1%; white-space: nowrap; }
     td.actions button + button { margin-left: 6px; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
@@ -728,6 +728,8 @@ def _console_html() -> str:
     .hidden { display: none; }
     .stack { display: grid; gap: 12px; }
     .table-wrap { overflow: auto; max-height: calc(100vh - 240px); border: 1px solid var(--line); border-radius: 6px; }
+    .table-wrap table { min-width: 680px; }
+    .table-wrap thead th { position: sticky; top: 0; z-index: 2; box-shadow: 0 1px 0 var(--line); }
     pre { margin: 0; overflow: auto; background: #101828; color: #e5e7eb; border-radius: 6px; padding: 10px; max-height: 280px; font-size: 12px; }
     @media (max-width: 920px) { .topbar, .grid, .two { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } th { position: static; } }
   </style>

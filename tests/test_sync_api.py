@@ -115,6 +115,9 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn('data-action="delete-policy"', html)
         self.assertIn('data-action="delete-participant"', html)
         self.assertIn("<th>Actions</th>", html)
+        self.assertIn(".table-wrap thead th", html)
+        self.assertIn("top: 0", html)
+        self.assertNotIn("top: 57px", html)
 
     def test_root_serves_console_without_token(self) -> None:
         html = self.request_text_no_auth("/")
