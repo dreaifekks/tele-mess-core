@@ -19,6 +19,7 @@ from tele_mess_core.models import (
     SOURCE_TELEGRAM,
     utc_now_iso,
 )
+from tele_mess_core.telegram.runtime import TelegramOperationError
 
 if TYPE_CHECKING:
     from tele_mess_core.config import AppConfig, TelegramAccountConfig
@@ -117,6 +118,8 @@ class SyncApiServer:
                         self._json({"error": "method_not_allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
                 except ValueError as exc:
                     self._json({"error": "bad_request", "detail": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                except TelegramOperationError as exc:
+                    self._json({"error": exc.code, "detail": exc.message, **exc.to_public_dict()}, status=exc.http_status)
                 except Exception as exc:
                     logging.getLogger("tele_mess_core.server").exception("API request failed")
                     self._json({"error": "internal_error", "detail": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
@@ -125,7 +128,7 @@ class SyncApiServer:
                 if path == "/" or path == "/console":
                     self._html(_console_html())
                 elif path == "/healthz":
-                    self._json({"ok": True})
+                    self._json({"ok": True, **store.state()})
                 elif path == "/sync/state":
                     self._json(store.state())
                 elif path == "/sync/events":
@@ -177,6 +180,16 @@ class SyncApiServer:
                     )
                 elif path == "/manage/capture-cursors":
                     self._json({"items": store.list_capture_cursors(account_id=_optional_str_param(params, "account_id"))})
+                elif path == "/manage/operation-events":
+                    self._json(
+                        {
+                            "items": store.list_operation_events(
+                                account_id=_optional_str_param(params, "account_id"),
+                                status=_optional_str_param(params, "status"),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -264,6 +277,7 @@ def _capabilities() -> dict[str, Any]:
             "live_origin_discovery",
             "live_participant_refresh",
             "live_account_auth",
+            "operation_events",
             "web_console",
         ],
         "auth_flow": {
@@ -811,7 +825,7 @@ async function loadAll() {
     setStatus('Loading');
     const [service, accounts, origins, policies, participants, cursors, media] = await Promise.all([
       api('/sync/state'), api('/manage/accounts'), api('/manage/origins'), api('/manage/backup-policies'),
-      api('/manage/participants'), api('/manage/capture-cursors'), api('/sync/media-files')
+      api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files')
     ]);
     state.service = service;
     state.accounts = accounts.items || [];

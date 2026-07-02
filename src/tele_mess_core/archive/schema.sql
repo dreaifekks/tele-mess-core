@@ -156,6 +156,21 @@ CREATE TABLE IF NOT EXISTS media_files (
   PRIMARY KEY (source, account_id, chat_id, message_id, file_index)
 );
 
+CREATE TABLE IF NOT EXISTS operation_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  source TEXT NOT NULL,
+  account_id TEXT NOT NULL,
+  operation TEXT NOT NULL,
+  status TEXT NOT NULL,
+  subject_type TEXT,
+  subject_id TEXT,
+  error_code TEXT,
+  message TEXT,
+  retry_after INTEGER,
+  occurred_at TEXT NOT NULL,
+  raw_json TEXT
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   source TEXT NOT NULL,
@@ -172,6 +187,8 @@ CREATE INDEX IF NOT EXISTS idx_origins_account_type ON origins(source, account_i
 CREATE INDEX IF NOT EXISTS idx_capture_cursors_account ON capture_cursors(source, account_id, origin_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_message ON media_files(source, account_id, chat_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_downloaded ON media_files(downloaded_at);
+CREATE INDEX IF NOT EXISTS idx_operation_events_account ON operation_events(source, account_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_operation_events_status ON operation_events(status, error_code);
 CREATE INDEX IF NOT EXISTS idx_backup_policies_enabled ON backup_policies(enabled);
 CREATE INDEX IF NOT EXISTS idx_participants_account_origin ON participants(source, account_id, origin_id);
 

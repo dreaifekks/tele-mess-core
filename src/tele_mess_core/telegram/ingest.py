@@ -2,11 +2,12 @@ from __future__ import annotations
 
 import json
 import logging
+import asyncio
 from pathlib import Path
 from typing import Any
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import BackfillConfig, TelegramAccountConfig
+from tele_mess_core.config import BackfillConfig, MediaDownloadConfig, TelegramAccountConfig
 from tele_mess_core.models import (
     AccountAuthRecord,
     AccountRecord,
@@ -15,18 +16,27 @@ from tele_mess_core.models import (
     ChatRecord,
     MediaFileRecord,
     MessageRecord,
+    OperationEventRecord,
     OriginRecord,
     SOURCE_TELEGRAM,
     UserRecord,
     to_iso,
     utc_now_iso,
 )
+from tele_mess_core.telegram.runtime import classify_telegram_exception
 
 
 class TelegramArchiveService:
-    def __init__(self, config: TelegramAccountConfig, store: ArchiveStore, backfill: BackfillConfig | None = None):
+    def __init__(
+        self,
+        config: TelegramAccountConfig,
+        store: ArchiveStore,
+        backfill: BackfillConfig | None = None,
+        media_download: MediaDownloadConfig | None = None,
+    ):
         self.config = config
         self.backfill = backfill or BackfillConfig()
+        self.media_download = media_download or MediaDownloadConfig()
         self.account_id = config.account_id
         self.store = store
         self.logger = logging.getLogger(__name__)
@@ -223,18 +233,44 @@ class TelegramArchiveService:
     async def _download_message_media(self, message: Any, record: MessageRecord) -> None:
         target_dir = self.store.database_path.parent / "media" / self.account_id / str(record.chat_id)
         target_dir.mkdir(parents=True, exist_ok=True)
-        try:
-            downloaded = await message.download_media(file=str(target_dir))
-        except Exception as exc:
-            self.logger.warning(
-                "Failed to download media for account=%s chat=%s message=%s: %s",
-                self.account_id,
-                record.chat_id,
-                record.message_id,
-                exc,
-            )
-            return
+        downloaded = None
+        attempts = max(1, self.media_download.retries + 1)
+        success_attempt = 0
+        for attempt in range(1, attempts + 1):
+            try:
+                downloaded = await message.download_media(file=str(target_dir))
+                success_attempt = attempt
+                break
+            except Exception as exc:
+                error = classify_telegram_exception(exc, default_code="media_download_failed")
+                self.logger.warning(
+                    "Failed to download media for account=%s chat=%s message=%s attempt=%s/%s: %s",
+                    self.account_id,
+                    record.chat_id,
+                    record.message_id,
+                    attempt,
+                    attempts,
+                    error.message,
+                )
+                if attempt >= attempts:
+                    self._record_operation(
+                        "media_download",
+                        "failed",
+                        subject_type="message",
+                        subject_id=f"{record.chat_id}/{record.message_id}",
+                        error=error.to_public_dict() | {"attempts": attempts},
+                    )
+                    return
+                if self.media_download.retry_delay_seconds > 0:
+                    await asyncio.sleep(self.media_download.retry_delay_seconds)
         if not downloaded:
+            self._record_operation(
+                "media_download",
+                "failed",
+                subject_type="message",
+                subject_id=f"{record.chat_id}/{record.message_id}",
+                error={"code": "media_download_empty", "message": "download_media returned no file path", "attempts": attempts},
+            )
             return
         path = Path(downloaded)
         file_size = path.stat().st_size if path.exists() else None
@@ -251,6 +287,14 @@ class TelegramArchiveService:
                 raw_json=json.dumps({"downloaded": str(path)}, ensure_ascii=False),
             )
         )
+        if success_attempt > 1:
+            self._record_operation(
+                "media_download",
+                "ok",
+                subject_type="message",
+                subject_id=f"{record.chat_id}/{record.message_id}",
+                error={"attempts": success_attempt},
+            )
 
 
     async def _backfill_configured_chats(self, chat_ids: list[int]) -> None:
@@ -323,6 +367,30 @@ class TelegramArchiveService:
                 last_message_id=message_id,
                 last_message_at=message_at,
                 updated_at=utc_now_iso(),
+            )
+        )
+
+    def _record_operation(
+        self,
+        operation: str,
+        status: str,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        self.store.add_operation_event(
+            OperationEventRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                operation=operation,
+                status=status,
+                subject_type=subject_type,
+                subject_id=subject_id,
+                error_code=error.get("code") if error else None,
+                message=error.get("message") if error else None,
+                retry_after=error.get("retry_after") if error else None,
+                occurred_at=utc_now_iso(),
+                raw_json=json.dumps(error, ensure_ascii=False, default=str) if error else None,
             )
         )
 

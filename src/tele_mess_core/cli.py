@@ -36,6 +36,11 @@ def main(argv: list[str] | None = None) -> int:
     add_config_arg(sub.add_parser("serve-api", help="Run only the read-only sync API"))
     add_config_arg(sub.add_parser("run-telegram", help="Run only Telegram ingestion"))
     add_config_arg(sub.add_parser("run-server", help="Run Telegram ingestion and sync API"))
+    smoke_parser = sub.add_parser("smoke-telegram", help="Check Telegram account auth and optional live discovery")
+    add_config_arg(smoke_parser)
+    smoke_parser.add_argument("--account-id", help="Configured Telegram account ID to check")
+    smoke_parser.add_argument("--discover-origins", action="store_true", help="Run live origin discovery after auth status")
+    smoke_parser.add_argument("--topic-limit", type=int, default=20, help="Max forum topics to inspect during discovery")
 
     import_parser = sub.add_parser("import-ndjson", help="Import legacy .bak NDJSON messages")
     add_config_arg(import_parser)
@@ -64,6 +69,8 @@ def main(argv: list[str] | None = None) -> int:
             return _run_async(_run_telegram(config, store))
         if args.command == "run-server":
             return _run_async(_run_server(config, store))
+        if args.command == "smoke-telegram":
+            return _run_async(_smoke_telegram(config, store, args.account_id, args.discover_origins, args.topic_limit))
         if args.command == "import-ndjson":
             _import_ndjson(store, Path(args.path), args.chat_id, args.account_id)
             logger.info("Imported %s", args.path)
@@ -98,12 +105,12 @@ def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
                 updated_at=now,
             )
         )
-        session_path = account.session_dir / account.session_name
+        session_present = _telethon_session_exists(account.session_dir, account.session_name)
         store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=account.account_id,
-                auth_state="session_present" if session_path.exists() else "needs_login",
+                auth_state="session_present" if session_present else "needs_login",
                 session_name=account.session_name,
                 session_dir=str(account.session_dir),
                 updated_at=now,
@@ -134,13 +141,56 @@ def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
             )
 
 
+def _telethon_session_exists(session_dir: Path, session_name: str) -> bool:
+    base = session_dir / session_name
+    return base.exists() or base.with_suffix(".session").exists()
+
+
 async def _run_telegram(config: AppConfig, store: ArchiveStore) -> None:
     from tele_mess_core.telegram import TelegramArchiveService
 
     if not config.telegram.accounts:
         raise RuntimeError("No telegram.accounts configured")
-    services = [TelegramArchiveService(account, store, config.telegram.backfill) for account in config.telegram.accounts]
+    services = [
+        TelegramArchiveService(account, store, config.telegram.backfill, config.telegram.media_download)
+        for account in config.telegram.accounts
+    ]
     await asyncio.gather(*(service.run() for service in services))
+
+
+async def _smoke_telegram(
+    config: AppConfig,
+    store: ArchiveStore,
+    account_id: str | None,
+    discover_origins: bool,
+    topic_limit: int,
+) -> int:
+    from tele_mess_core.telegram.auth import TelegramAuthService
+    from tele_mess_core.telegram.discovery import TelegramDiscoveryService
+
+    if not config.telegram.accounts:
+        raise RuntimeError("No telegram.accounts configured")
+    account = config.telegram.accounts[0]
+    if account_id:
+        matches = [item for item in config.telegram.accounts if item.account_id == account_id]
+        if not matches:
+            raise RuntimeError(f"Unknown account_id: {account_id}")
+        account = matches[0]
+
+    status = await TelegramAuthService(account, store).status()
+    result: dict[str, object] = {
+        "account_id": account.account_id,
+        "session_name": account.session_name,
+        "session_dir": str(account.session_dir),
+        "status": status,
+    }
+    if discover_origins and status.get("authorized"):
+        result["discovery"] = await TelegramDiscoveryService(account, store).discover_origins(
+            include_topics=True,
+            topic_limit=topic_limit,
+        )
+    print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
+    return 0 if status.get("authorized") else 1
 
 
 async def _run_server(config: AppConfig, store: ArchiveStore) -> None:
@@ -175,8 +225,8 @@ async def _run_server(config: AppConfig, store: ArchiveStore) -> None:
 
 def _run_async(coro: object) -> int:
     try:
-        asyncio.run(coro)  # type: ignore[arg-type]
-        return 0
+        result = asyncio.run(coro)  # type: ignore[arg-type]
+        return result if isinstance(result, int) else 0
     except KeyboardInterrupt:
         return 130
 

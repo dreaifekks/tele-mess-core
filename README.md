@@ -25,6 +25,7 @@ interface direction.
 - Policy-aware ingestion with bounded history backfill and reconnect catch-up.
 - Live origin discovery and participant refresh endpoints for authenticated
   Telegram sessions.
+- Runtime operation events for Telegram auth/discovery/media-download failures.
 - Server daemon mode for devNuc-style always-on deployment.
 
 ## Quick Start
@@ -35,6 +36,7 @@ python3 -m venv .venv
 pip install -e .
 cp config.example.yml config.yml
 tele-mess-core init-db --config config.yml
+tele-mess-core smoke-telegram --config config.yml
 tele-mess-core run-server --config config.yml
 ```
 
@@ -73,6 +75,7 @@ accepted and is mapped to `account_id: default`.
 - `GET /manage/participants?account_id=main&origin_id=-100123`
 - `POST /manage/participants`
 - `GET /manage/capture-cursors?account_id=main`
+- `GET /manage/operation-events?account_id=main&status=failed`
 - `POST /manage/discover-origins`
 - `POST /manage/participants/refresh`
 - `GET /console`
@@ -103,7 +106,9 @@ Backup policy separates three media modes:
 - `download_media`: download media files and expose them through `/sync/media-files`.
 
 Media files requested by `download_media: true` are stored under a `media/`
-directory next to the SQLite database.
+directory next to the SQLite database. Download failures are retried according
+to `telegram.media_download` and then recorded in `/manage/operation-events`
+if they still fail.
 
 ## Design Boundary
 

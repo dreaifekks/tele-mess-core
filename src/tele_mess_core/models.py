@@ -142,6 +142,21 @@ class MediaFileRecord:
 
 
 @dataclass(slots=True)
+class OperationEventRecord:
+    source: str
+    account_id: str
+    operation: str
+    status: str
+    subject_type: str | None = None
+    subject_id: str | None = None
+    error_code: str | None = None
+    message: str | None = None
+    retry_after: int | None = None
+    occurred_at: str | None = None
+    raw_json: str | None = None
+
+
+@dataclass(slots=True)
 class MessageRecord:
     source: str
     chat_id: int

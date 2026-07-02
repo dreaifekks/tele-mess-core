@@ -18,6 +18,10 @@ class FakeEntity:
         return dict(self.__dict__)
 
 
+class ChatAdminRequiredError(Exception):
+    pass
+
+
 class FakeClient:
     def __init__(self):
         self.disconnected = False
@@ -75,6 +79,12 @@ class FakeDiscoveryService(TelegramDiscoveryService):
         return SimpleNamespace(offset_id=offset_id, offset_topic=offset_topic, limit=limit)
 
 
+class FailingParticipantClient(FakeClient):
+    async def iter_participants(self, origin_id, limit=None):
+        raise ChatAdminRequiredError("admin required")
+        yield
+
+
 class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -96,6 +106,7 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
     async def test_discover_origins_and_refresh_participants(self) -> None:
         result = await self.service.discover_origins(include_topics=True, topic_limit=10)
         self.assertTrue(result["authorized"])
+        self.assertEqual(result["status"], "ok")
         self.assertEqual(result["origins"], 2)
         self.assertEqual(result["topics"], 2)
         origins = self.store.list_origins(account_id="main")
@@ -105,8 +116,29 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
 
         refresh = await self.service.refresh_participants(-1001)
         self.assertEqual(refresh["participants"], 1)
+        self.assertEqual(refresh["status"], "ok")
         participants = self.store.list_participants(account_id="main", origin_id=-1001)
         self.assertEqual(participants[0]["username"], "alice")
+
+    async def test_discover_topics_respects_limit_and_reports_truncation(self) -> None:
+        result = await self.service.discover_origins(include_topics=True, topic_limit=1)
+
+        self.assertEqual(result["topics"], 1)
+        self.assertTrue(result["topics_truncated"])
+        topics = [item for item in self.store.list_origins(account_id="main") if item["origin_type"] == "topic"]
+        self.assertEqual(len(topics), 1)
+
+    async def test_refresh_participants_records_access_error(self) -> None:
+        self.service.fake_client = FailingParticipantClient()
+
+        result = await self.service.refresh_participants(-1001)
+
+        self.assertEqual(result["status"], "failed")
+        self.assertEqual(result["participants"], 0)
+        self.assertEqual(result["errors"][0]["code"], "access_denied")
+        events = self.store.list_operation_events(account_id="main", status="failed")
+        self.assertEqual(events[0]["operation"], "refresh_participants")
+        self.assertEqual(events[0]["error_code"], "access_denied")
 
 
 if __name__ == "__main__":

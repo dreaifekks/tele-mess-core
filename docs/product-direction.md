@@ -24,10 +24,12 @@ The basic management model is implemented in SQLite and exposed through HTTP:
   Telegram sessions.
 - Token-protected management endpoints shared by future Mac and web clients.
 - Built-in web console using the same management endpoints.
+- Structured operation events for expected Telegram auth/discovery failures,
+  bounded topic/participant scans, and media-download retry failures.
 
-The remaining work is operational hardening against real Telegram edge cases,
-such as unusual login errors, very large forum-topic sets, and long-running media
-download failures.
+The remaining work is longer-duration real-world soak testing and client polish:
+watching how the core behaves across days of Telegram reconnects, very large
+archives, and future Mac/web client workflows.
 
 ## Product Boundary
 

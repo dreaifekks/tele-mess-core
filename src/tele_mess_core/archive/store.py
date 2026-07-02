@@ -16,6 +16,7 @@ from tele_mess_core.models import (
     ChatRecord,
     MediaFileRecord,
     MessageRecord,
+    OperationEventRecord,
     OriginRecord,
     ParticipantRecord,
     UserRecord,
@@ -45,7 +46,7 @@ class ArchiveStore:
                 self._conn.executescript(_schema_sql())
             if self.get_meta("database_id") is None:
                 self.set_meta("database_id", str(uuid.uuid4()))
-            self.set_meta("schema_version", "5")
+            self.set_meta("schema_version", "6")
             self._conn.commit()
 
     def get_meta(self, key: str) -> str | None:
@@ -730,15 +731,74 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [_row_to_dict(row, json_fields={"raw_json"}) for row in rows]
 
+    def add_operation_event(self, event: OperationEventRecord) -> int:
+        occurred_at = event.occurred_at or utc_now_iso()
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                INSERT INTO operation_events(
+                  source, account_id, operation, status, subject_type, subject_id,
+                  error_code, message, retry_after, occurred_at, raw_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    event.source,
+                    event.account_id,
+                    event.operation,
+                    event.status,
+                    event.subject_type,
+                    event.subject_id,
+                    event.error_code,
+                    event.message,
+                    event.retry_after,
+                    occurred_at,
+                    event.raw_json,
+                ),
+            )
+            self._conn.commit()
+            return int(cur.lastrowid)
+
+    def list_operation_events(
+        self,
+        account_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT id, source, account_id, operation, status, subject_type, subject_id,
+                   error_code, message, retry_after, occurred_at, raw_json
+            FROM operation_events
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY id DESC LIMIT ?"
+        params.append(_bounded_limit(limit, max_limit=500))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_row_to_dict(row, json_fields={"raw_json"}) for row in rows]
+
     def state(self) -> dict[str, Any]:
         with self._lock:
             row = self._conn.execute("SELECT COALESCE(MAX(seq), 0) AS seq FROM events").fetchone()
             message_count = self._conn.execute("SELECT COUNT(*) AS count FROM messages").fetchone()
+            operation_error_count = self._conn.execute(
+                "SELECT COUNT(*) AS count FROM operation_events WHERE status IN ('failed', 'partial', 'rate_limited')"
+            ).fetchone()
             return {
                 "database_id": self.get_meta("database_id"),
                 "schema_version": self.get_meta("schema_version"),
                 "last_event_seq": row["seq"],
                 "message_count": message_count["count"],
+                "operation_error_count": operation_error_count["count"],
                 "server_time": utc_now_iso(),
             }
 

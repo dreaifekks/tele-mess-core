@@ -27,9 +27,16 @@ class BackfillConfig:
 
 
 @dataclass(slots=True)
+class MediaDownloadConfig:
+    retries: int = 2
+    retry_delay_seconds: float = 1.0
+
+
+@dataclass(slots=True)
 class TelegramConfig:
     accounts: list["TelegramAccountConfig"] = field(default_factory=list)
     backfill: BackfillConfig = field(default_factory=BackfillConfig)
+    media_download: MediaDownloadConfig = field(default_factory=MediaDownloadConfig)
 
 
 @dataclass(slots=True)
@@ -78,6 +85,7 @@ def load_config(path: str | Path) -> AppConfig:
     telegram = TelegramConfig(
         accounts=_parse_accounts(base_dir, telegram_raw),
         backfill=_parse_backfill(telegram_raw.get("backfill", {})),
+        media_download=_parse_media_download(telegram_raw.get("media_download", {})),
     )
 
     storage = StorageConfig(
@@ -156,6 +164,17 @@ def _parse_backfill(raw: Any) -> BackfillConfig:
         enabled=_parse_bool(raw.get("enabled", True)),
         initial_limit=int(raw.get("initial_limit", 1000)),
         catch_up_limit=int(raw.get("catch_up_limit", 1000)),
+    )
+
+
+def _parse_media_download(raw: Any) -> MediaDownloadConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("telegram.media_download must be a mapping")
+    return MediaDownloadConfig(
+        retries=max(0, int(raw.get("retries", 2))),
+        retry_delay_seconds=max(0.0, float(raw.get("retry_delay_seconds", 1.0))),
     )
 
 

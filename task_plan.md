@@ -32,8 +32,9 @@ The core must also:
 | Telegram ingestion daemon | complete | Telethon adapter for new/edit/delete/reaction events, policy-aware storage, and bounded backfill/catch-up. |
 | Sync HTTP API and CLI | complete | Stdlib HTTP server to avoid unnecessary runtime dependencies. |
 | Management API foundation | complete | Account auth state, origin registry, backup policies, participant metadata, capture cursors, live discovery, and participant refresh are exposed over token-protected HTTP endpoints. |
+| Operational hardening | complete | Expected Telegram auth/discovery errors, bounded topic/participant scans, media-download retry/failure tracking, operation-event API, and Telegram smoke CLI are implemented. |
 | Docs/config/deploy template | complete | DevNuc server-mode config and systemd template added. |
-| Local verification | complete | 22 unit tests pass, compileall passes, CLI help works, and `/console` smoke test returns 200 while API endpoints keep token protection. |
+| Local verification | complete | Unit tests, compileall, CLI help, and Telegram smoke checks are used to verify the core; `/console` smoke test returns 200 while API endpoints keep token protection. |
 
 ## Decisions
 
@@ -56,6 +57,7 @@ The core must also:
 | Backup selection API | basic | Per-origin enable/disable and capture policy can be read and updated. |
 | Media capture policy | complete | Policy fields control text, media metadata, and media file downloading; downloaded files are stored and exposed via sync. |
 | Participant metadata API | basic | Participant profiles can be stored, queried, and refreshed from authenticated Telegram sessions. |
+| Runtime operation events | complete | Auth/discovery/media-download failures and partial operations are stored and exposed via `/manage/operation-events`. |
 | Core web console | complete | Built-in `/console` page provides tabs for overview, account login, origin/policy management, participant refresh, cursor/media inspection, and raw snapshots; it reuses the same token-protected management APIs. |
 
 ## Review Backlog
@@ -67,6 +69,7 @@ The core must also:
 | Single-user multi-account boundary | recorded | Product direction is one owner/user managing multiple Telegram accounts, not multi-tenant hosting. |
 | API startup health | complete | Background API startup waits for bind success and raises startup failures. |
 | Search API status | complete | `/sync/search` is now documented in README. |
+| Telegram runtime hardening | complete | Auth failures are classified, topic/participant scans are bounded, media downloads retry before recording failure, and `smoke-telegram` validates live sessions. |
 
 ## Errors Encountered
 

@@ -22,6 +22,8 @@ The server does:
 - Run bounded history backfill and reconnect catch-up using per-origin cursors.
 - Discover origins/topics and refresh participants from authenticated Telegram
   sessions on management request.
+- Record structured operation events for Telegram auth, discovery, participant
+  refresh, and media-download failures.
 
 The server does not:
 
@@ -50,6 +52,9 @@ telegram:
     enabled: true
     initial_limit: 1000
     catch_up_limit: 1000
+  media_download:
+    retries: 2
+    retry_delay_seconds: 1.0
   accounts:
     - account_id: "main"
       api_id: 123456
@@ -82,6 +87,7 @@ address or put a reverse proxy in front of the local server.
 
 ```bash
 tele-mess-core init-db --config config.yml
+tele-mess-core smoke-telegram --config config.yml
 tele-mess-core run-server --config config.yml
 ```
 
@@ -90,6 +96,7 @@ For debugging:
 ```bash
 tele-mess-core serve-api --config config.yml
 tele-mess-core run-telegram --config config.yml
+tele-mess-core smoke-telegram --config config.yml --discover-origins --topic-limit 20
 ```
 
 ## Sync Contract
@@ -127,11 +134,13 @@ basic control-plane model for future Mac and web clients:
    desired. Downloaded media files are stored under `media/` next to the SQLite
    database and exposed through `GET /sync/media-files`.
 6. Use `GET /manage/capture-cursors` to inspect backfill/catch-up progress.
-7. Use `POST /manage/discover-origins` to discover dialogs and best-effort forum
+7. Use `GET /manage/operation-events` to inspect recent structured runtime
+   failures and partial operations.
+8. Use `POST /manage/discover-origins` to discover dialogs and best-effort forum
    topics from an already authenticated Telegram session.
-8. Use `POST /manage/participants/refresh` to refresh participant profiles for a
+9. Use `POST /manage/participants/refresh` to refresh participant profiles for a
    specific origin.
-9. Use `GET /console` for the built-in web console. The console can be opened
+10. Use `GET /console` for the built-in web console. The console can be opened
    in a browser without a token header, then the operator enters `server.token`;
    all API calls still use the token-protected sync and management endpoints.
 

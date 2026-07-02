@@ -7,6 +7,9 @@ telegram:
     enabled: true
     initial_limit: 1000
     catch_up_limit: 1000
+  media_download:
+    retries: 2
+    retry_delay_seconds: 1.0
   accounts:
     - account_id: "main"
       api_id: 123456

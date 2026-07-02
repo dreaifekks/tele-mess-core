@@ -8,7 +8,7 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.models import MessageRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.models import MessageRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
 from tele_mess_core.server import SyncApiServer
 
 
@@ -95,6 +95,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("/manage/discover-origins", html)
         self.assertIn("/manage/backup-policies", html)
         self.assertIn("/manage/participants/refresh", html)
+        self.assertIn("/manage/operation-events", html)
         self.assertIn("/sync/media-files", html)
         self.assertIn("Save policy", html)
         self.assertIn("escapeHtml", html)
@@ -107,6 +108,24 @@ class SyncApiTest(unittest.TestCase):
     def test_media_files_endpoint(self) -> None:
         payload = self.request_json("/sync/media-files")
         self.assertEqual(payload["items"], [])
+
+    def test_operation_events_endpoint(self) -> None:
+        self.store.add_operation_event(
+            OperationEventRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                operation="media_download",
+                status="failed",
+                error_code="media_download_failed",
+                message="network down",
+            )
+        )
+
+        payload = self.request_json("/manage/operation-events?account_id=main&status=failed")
+
+        self.assertEqual(len(payload["items"]), 1)
+        self.assertEqual(payload["items"][0]["operation"], "media_download")
+        self.assertEqual(payload["items"][0]["error_code"], "media_download_failed")
 
     def test_start_background_reports_bind_failure(self) -> None:
         second = SyncApiServer(self.store, "127.0.0.1", self.port, token="secret")
@@ -204,6 +223,7 @@ class SyncApiTest(unittest.TestCase):
         capabilities = self.request_json("/manage/capabilities")
         self.assertIn("origin_registry", capabilities["management"])
         self.assertIn("capture_cursors", capabilities["management"])
+        self.assertIn("operation_events", capabilities["management"])
 
 
 if __name__ == "__main__":

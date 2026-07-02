@@ -13,6 +13,7 @@ from tele_mess_core.models import (
     CaptureCursorRecord,
     ChatRecord,
     MessageRecord,
+    OperationEventRecord,
     OriginRecord,
     ParticipantRecord,
     SOURCE_TELEGRAM,
@@ -236,6 +237,26 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(cursor["last_message_id"], 10)
         self.assertEqual(self.store.list_capture_cursors(account_id="main")[0]["origin_id"], -1001)
 
+    def test_operation_events_are_queryable_and_counted_in_state(self) -> None:
+        self.store.add_operation_event(
+            OperationEventRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                operation="media_download",
+                status="failed",
+                subject_type="message",
+                subject_id="-1001/10",
+                error_code="media_download_failed",
+                message="network down",
+            )
+        )
+
+        events = self.store.list_operation_events(account_id="main", status="failed")
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["operation"], "media_download")
+        self.assertEqual(events[0]["error_code"], "media_download_failed")
+        self.assertEqual(self.store.state()["operation_error_count"], 1)
+
 
 class ArchiveMigrationTest(unittest.TestCase):
     def test_v1_database_migrates_to_account_aware_schema(self) -> None:
@@ -282,7 +303,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "5")
+                self.assertEqual(store.state()["schema_version"], "6")
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")

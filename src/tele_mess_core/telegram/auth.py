@@ -6,7 +6,8 @@ from typing import Any
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import TelegramAccountConfig
-from tele_mess_core.models import AccountAuthRecord, AccountRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.models import AccountAuthRecord, AccountRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.telegram.runtime import classify_telegram_exception
 
 
 class TelegramAuthService:
@@ -17,18 +18,31 @@ class TelegramAuthService:
         self.logger = logging.getLogger(__name__)
 
     async def status(self) -> dict[str, Any]:
-        client = await self._connected_client()
+        client = None
         try:
+            client = await self._connected_client()
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
             self._record_state(state)
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
+        except Exception as exc:
+            error = classify_telegram_exception(exc, default_code="auth_status_failed")
+            self._record_state(error.auth_state, last_error=error.message)
+            self._record_operation("auth_status", "failed", error=error)
+            return {
+                "account_id": self.account_id,
+                "auth_state": error.auth_state,
+                "authorized": False,
+                "error": error.to_public_dict(),
+            }
         finally:
-            await client.disconnect()
+            if client is not None:
+                await client.disconnect()
 
     async def request_code(self, phone: str) -> dict[str, Any]:
-        client = await self._connected_client()
+        client = None
         try:
+            client = await self._connected_client()
             result = await client.send_code_request(phone)
             phone_code_hash = getattr(result, "phone_code_hash", None)
             if phone_code_hash:
@@ -40,14 +54,24 @@ class TelegramAuthService:
             )
             return {"account_id": self.account_id, "auth_state": "code_sent", "phone": phone}
         except Exception as exc:
-            self._record_state("auth_failed", phone=phone, last_error=str(exc))
-            raise
+            error = classify_telegram_exception(exc, default_code="request_code_failed")
+            self._record_state(error.auth_state, phone=phone, last_error=error.message)
+            self._record_operation("request_code", "rate_limited" if error.code == "flood_wait" else "failed", error=error)
+            return {
+                "account_id": self.account_id,
+                "auth_state": error.auth_state,
+                "phone": phone,
+                "sent": False,
+                "error": error.to_public_dict(),
+            }
         finally:
-            await client.disconnect()
+            if client is not None:
+                await client.disconnect()
 
     async def submit_code(self, phone: str, code: str, password: str | None = None) -> dict[str, Any]:
-        client = await self._connected_client()
+        client = None
         try:
+            client = await self._connected_client()
             phone_code_hash = self.store.get_meta(_phone_code_hash_key(self.account_id))
             try:
                 if phone_code_hash:
@@ -58,17 +82,45 @@ class TelegramAuthService:
                 if _is_password_needed(exc):
                     if not password:
                         self._record_state("password_needed", phone=phone)
+                        self._record_operation("submit_code", "password_needed")
                         return {"account_id": self.account_id, "auth_state": "password_needed", "authorized": False}
-                    await client.sign_in(password=password)
+                    try:
+                        await client.sign_in(password=password)
+                    except Exception as password_exc:
+                        error = classify_telegram_exception(password_exc, default_code="submit_code_failed")
+                        self._record_state(error.auth_state, phone=phone, last_error=error.message)
+                        self._record_operation(
+                            "submit_code",
+                            "rate_limited" if error.code == "flood_wait" else "failed",
+                            error=error,
+                        )
+                        return {
+                            "account_id": self.account_id,
+                            "auth_state": error.auth_state,
+                            "authorized": False,
+                            "error": error.to_public_dict(),
+                        }
                 else:
-                    self._record_state("auth_failed", phone=phone, last_error=str(exc))
-                    raise
+                    error = classify_telegram_exception(exc, default_code="submit_code_failed")
+                    self._record_state(error.auth_state, phone=phone, last_error=error.message)
+                    self._record_operation(
+                        "submit_code",
+                        "rate_limited" if error.code == "flood_wait" else "failed",
+                        error=error,
+                    )
+                    return {
+                        "account_id": self.account_id,
+                        "auth_state": error.auth_state,
+                        "authorized": False,
+                        "error": error.to_public_dict(),
+                    }
 
             self.store.set_meta(_phone_code_hash_key(self.account_id), "")
             self._record_state("authorized", phone=phone)
             return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
         finally:
-            await client.disconnect()
+            if client is not None:
+                await client.disconnect()
 
     async def _connected_client(self) -> Any:
         from telethon import TelegramClient
@@ -107,6 +159,21 @@ class TelegramAuthService:
                 last_error=last_error,
                 updated_at=now,
                 raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
+            )
+        )
+
+    def _record_operation(self, operation: str, status: str, error: Any | None = None) -> None:
+        self.store.add_operation_event(
+            OperationEventRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                operation=operation,
+                status=status,
+                error_code=getattr(error, "code", None),
+                message=getattr(error, "message", None),
+                retry_after=getattr(error, "retry_after", None),
+                occurred_at=utc_now_iso(),
+                raw_json=json.dumps(error.to_public_dict(), ensure_ascii=False) if error else None,
             )
         )
 

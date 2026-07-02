@@ -14,12 +14,18 @@ class PasswordNeeded(Exception):
     pass
 
 
+class PhoneNumberInvalidError(Exception):
+    pass
+
+
 class FakeClient:
     def __init__(self):
         self.authorized = False
         self.disconnected = False
         self.password_needed = False
         self.sign_in_calls = []
+        self.send_code_error = None
+        self.sign_in_error = None
 
     async def connect(self):
         return None
@@ -31,10 +37,14 @@ class FakeClient:
         return self.authorized
 
     async def send_code_request(self, phone):
+        if self.send_code_error:
+            raise self.send_code_error
         return SimpleNamespace(phone_code_hash="hash123")
 
     async def sign_in(self, **kwargs):
         self.sign_in_calls.append(kwargs)
+        if self.sign_in_error:
+            raise self.sign_in_error
         if "password" in kwargs:
             self.authorized = True
             return None
@@ -95,6 +105,20 @@ class TelegramAuthTest(unittest.IsolatedAsyncioTestCase):
         result = await self.service.submit_code("+10000000000", "12345", password="secret")
         self.assertTrue(result["authorized"])
         self.assertTrue(any("password" in call for call in self.client.sign_in_calls))
+
+    async def test_request_code_records_expected_telegram_error(self) -> None:
+        self.client.send_code_error = PhoneNumberInvalidError("bad phone")
+
+        result = await self.service.request_code("+10000000000")
+
+        self.assertEqual(result["auth_state"], "auth_failed")
+        self.assertEqual(result["error"]["code"], "invalid_phone")
+        accounts = self.store.list_management_accounts()
+        self.assertEqual(accounts[0]["auth_state"], "auth_failed")
+        self.assertEqual(accounts[0]["last_error"], "bad phone")
+        events = self.store.list_operation_events(account_id="main", status="failed")
+        self.assertEqual(events[0]["operation"], "request_code")
+        self.assertEqual(events[0]["error_code"], "invalid_phone")
 
 
 if __name__ == "__main__":
