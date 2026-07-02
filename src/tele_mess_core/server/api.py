@@ -6,6 +6,7 @@ import logging
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path
 from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qs, urlparse
 
@@ -102,6 +103,9 @@ class SyncApiServer:
             def do_PATCH(self) -> None:
                 self._handle("PATCH")
 
+            def do_DELETE(self) -> None:
+                self._handle("DELETE")
+
             def _handle(self, method: str) -> None:
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
@@ -112,7 +116,7 @@ class SyncApiServer:
                 try:
                     if method == "GET":
                         self._handle_get(parsed.path, params)
-                    elif method in {"POST", "PATCH"}:
+                    elif method in {"POST", "PATCH", "DELETE"}:
                         self._handle_write(method, parsed.path)
                     else:
                         self._json({"error": "method_not_allowed"}, status=HTTPStatus.METHOD_NOT_ALLOWED)
@@ -198,6 +202,9 @@ class SyncApiServer:
                 if path == "/manage/accounts" and method == "POST":
                     item = _create_management_account(store, payload)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/accounts" and method == "DELETE":
+                    item = _delete_management_account(store, payload)
+                    self._json({"item": item})
                 elif path == "/manage/accounts/auth" and method in {"POST", "PATCH"}:
                     item = _update_account_auth(store, payload)
                     self._json({"item": item})
@@ -216,9 +223,18 @@ class SyncApiServer:
                 elif path == "/manage/backup-policies" and method in {"POST", "PATCH"}:
                     item = _set_backup_policy(store, payload)
                     self._json({"item": item})
+                elif path == "/manage/backup-policies" and method == "DELETE":
+                    item = _delete_backup_policy(store, payload)
+                    self._json({"item": item})
                 elif path == "/manage/participants" and method == "POST":
                     item = _create_participant(store, payload)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/participants" and method == "DELETE":
+                    item = _delete_participant(store, payload)
+                    self._json({"item": item})
+                elif path == "/manage/origins" and method == "DELETE":
+                    item = _delete_origin(store, payload)
+                    self._json({"item": item})
                 elif path == "/manage/discover-origins" and method == "POST":
                     item = _discover_origins(config, store, payload)
                     self._json({"item": item})
@@ -338,6 +354,13 @@ def _update_account_auth(store: ArchiveStore, payload: dict[str, Any]) -> dict[s
     return _find_account(store, source, account_id)
 
 
+def _delete_management_account(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    deleted_rows = store.delete_management_account(source, account_id)
+    return {"source": source, "account_id": account_id, "deleted_rows": deleted_rows}
+
+
 def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
@@ -361,6 +384,21 @@ def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, An
     return _find_origin(store, account_id, origin_id, topic_id)
 
 
+def _delete_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    origin_id = _required_int(payload, "origin_id")
+    topic_id = _payload_int(payload, "topic_id", 0)
+    deleted_rows = store.delete_origin(source, account_id, origin_id, topic_id)
+    return {
+        "source": source,
+        "account_id": account_id,
+        "origin_id": origin_id,
+        "topic_id": topic_id,
+        "deleted_rows": deleted_rows,
+    }
+
+
 def _set_backup_policy(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
@@ -380,6 +418,21 @@ def _set_backup_policy(store: ArchiveStore, payload: dict[str, Any]) -> dict[str
         )
     )
     return _find_policy(store, account_id, origin_id, topic_id)
+
+
+def _delete_backup_policy(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    origin_id = _required_int(payload, "origin_id")
+    topic_id = _payload_int(payload, "topic_id", 0)
+    deleted_rows = store.delete_backup_policy(source, account_id, origin_id, topic_id)
+    return {
+        "source": source,
+        "account_id": account_id,
+        "origin_id": origin_id,
+        "topic_id": topic_id,
+        "deleted_rows": deleted_rows,
+    }
 
 
 def _create_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -405,15 +458,30 @@ def _create_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[st
     return _find_participant(store, account_id, origin_id, user_id)
 
 
+def _delete_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    origin_id = _required_int(payload, "origin_id")
+    user_id = _required_int(payload, "user_id")
+    deleted_rows = store.delete_participant(source, account_id, origin_id, user_id)
+    return {
+        "source": source,
+        "account_id": account_id,
+        "origin_id": origin_id,
+        "user_id": user_id,
+        "deleted_rows": deleted_rows,
+    }
+
+
 def _auth_status(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
-    account = _account_config(config, _required_str(payload, "account_id"))
+    account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     from tele_mess_core.telegram.auth import TelegramAuthService
 
     return asyncio.run(TelegramAuthService(account, store).status())
 
 
 def _request_auth_code(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
-    account = _account_config(config, _required_str(payload, "account_id"))
+    account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     phone = _required_str(payload, "phone")
     from tele_mess_core.telegram.auth import TelegramAuthService
 
@@ -421,7 +489,7 @@ def _request_auth_code(config: "AppConfig | None", store: ArchiveStore, payload:
 
 
 def _submit_auth_code(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
-    account = _account_config(config, _required_str(payload, "account_id"))
+    account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     phone = _required_str(payload, "phone")
     code = _required_str(payload, "code")
     password = _optional_payload_str(payload, "password")
@@ -431,7 +499,7 @@ def _submit_auth_code(config: "AppConfig | None", store: ArchiveStore, payload: 
 
 
 def _discover_origins(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
-    account = _account_config(config, _required_str(payload, "account_id"))
+    account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     include_topics = _payload_bool(payload, "include_topics", True)
     topic_limit = _payload_int(payload, "topic_limit", 100)
     from tele_mess_core.telegram.discovery import TelegramDiscoveryService
@@ -440,7 +508,7 @@ def _discover_origins(config: "AppConfig | None", store: ArchiveStore, payload: 
 
 
 def _refresh_participants(config: "AppConfig | None", store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
-    account = _account_config(config, _required_str(payload, "account_id"))
+    account = _account_config(config, store, _required_str(payload, "account_id"), _source(payload))
     origin_id = _required_int(payload, "origin_id")
     limit = _payload_int(payload, "limit", 500)
     from tele_mess_core.telegram.discovery import TelegramDiscoveryService
@@ -448,13 +516,41 @@ def _refresh_participants(config: "AppConfig | None", store: ArchiveStore, paylo
     return asyncio.run(TelegramDiscoveryService(account, store).refresh_participants(origin_id, limit))
 
 
-def _account_config(config: "AppConfig | None", account_id: str) -> "TelegramAccountConfig":
+def _account_config(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    account_id: str,
+    source: str = SOURCE_TELEGRAM,
+) -> "TelegramAccountConfig":
     if config is None:
         raise ValueError("Server config is required for live Telegram management actions")
     for account in config.telegram.accounts:
         if account.account_id == account_id:
             return account
-    raise ValueError(f"Unknown account_id: {account_id}")
+    if not config.telegram.accounts:
+        raise ValueError("At least one configured Telegram account is required to authenticate a new account")
+    stored = None
+    for item in store.list_management_accounts():
+        if item["source"] == source and item["account_id"] == account_id:
+            stored = item
+            break
+    if stored is None:
+        raise ValueError(f"Unknown account_id: {account_id}")
+
+    from tele_mess_core.config import TelegramAccountConfig
+
+    template = config.telegram.accounts[0]
+    session_dir_raw = stored.get("session_dir")
+    session_dir = Path(session_dir_raw).expanduser() if session_dir_raw else template.session_dir
+    return TelegramAccountConfig(
+        account_id=account_id,
+        api_id=template.api_id,
+        api_hash=template.api_hash,
+        session_name=str(stored.get("session_name") or account_id),
+        session_dir=session_dir,
+        timezone=template.timezone,
+        chats=[],
+    )
 
 
 def _find_account(store: ArchiveStore, source: str, account_id: str) -> dict[str, Any]:
@@ -621,6 +717,7 @@ def _console_html() -> str:
     th, td { border-bottom: 1px solid var(--line); padding: 8px 7px; text-align: left; vertical-align: top; }
     th { color: var(--muted); font-weight: 650; background: #fafbfc; position: sticky; top: 57px; }
     td.actions { width: 1%; white-space: nowrap; }
+    td.actions button + button { margin-left: 6px; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
     .status.error { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
@@ -692,7 +789,7 @@ def _console_html() -> str:
     </div>
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Accounts</h2><button data-action=\"discover-selected\">Discover origins</button></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>State</th><th>Session</th><th>Updated</th><th></th></tr></thead><tbody id=\"accounts-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>State</th><th>Session</th><th>Updated</th><th>Actions</th></tr></thead><tbody id=\"accounts-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -717,7 +814,7 @@ def _console_html() -> str:
     </div>
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Origins</h2><div class=\"toolbar\"><input id=\"origin-filter\" placeholder=\"Account filter\"><button data-action=\"filter-origins\">Apply</button></div></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Policy</th><th></th></tr></thead><tbody id=\"origins-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Policy</th><th>Actions</th></tr></thead><tbody id=\"origins-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -742,7 +839,7 @@ def _console_html() -> str:
     </div>
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Participants</h2><button data-action=\"load-participants\">Load</button></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>User</th><th>Name</th><th>Role</th></tr></thead><tbody id=\"participants-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Origin</th><th>User</th><th>Name</th><th>Role</th><th>Actions</th></tr></thead><tbody id=\"participants-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -868,18 +965,18 @@ function renderSummary() {
 function renderAccounts() {
   fillTable('accounts-body', state.accounts.map(item => `<tr>
     <td>${text(item.account_id)}</td><td>${pill(item.auth_state)}</td><td>${text(item.session_name)}</td><td>${text(item.auth_updated_at || item.updated_at)}</td>
-    <td class=\"actions\"><button data-account=\"${attr(item.account_id)}\" data-action=\"select-account\">Select</button></td>
+    <td class=\"actions\"><button data-account=\"${attr(item.account_id)}\" data-action=\"select-account\">Select</button><button class=\"danger\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-account\">Delete</button></td>
   </tr>`), 5);
 }
 function renderOrigins() {
   fillTable('origins-body', state.origins.map(item => {
     const policy = item.backup_policy;
     const topicId = item.topic_id ?? 0;
-    return `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</td><td>${text(item.origin_type)}</td><td>${text(item.title)}</td><td>${policy ? pill(policy.enabled) : pill('unset')}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button></td></tr>`;
+    return `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</td><td>${text(item.origin_type)}</td><td>${text(item.title)}</td><td>${policy ? pill(policy.enabled) : pill('unset')}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Delete policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-origin\">Delete</button></td></tr>`;
   }), 6);
 }
 function renderParticipants() {
-  fillTable('participants-body', state.participants.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.username || item.user_id)}</td><td>${text(item.display_name)}</td><td>${text(item.role)}</td></tr>`), 5);
+  fillTable('participants-body', state.participants.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.username || item.user_id)}</td><td>${text(item.display_name)}</td><td>${text(item.role)}</td><td class=\"actions\"><button class=\"danger\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-user=\"${attr(item.user_id)}\" data-action=\"delete-participant\">Delete</button></td></tr>`), 6);
 }
 function renderCursors() {
   fillTable('cursors-body', state.cursors.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.topic_id)}</td><td>${text(item.last_message_id)}</td><td>${text(item.last_backfill_at)}</td></tr>`), 5);
@@ -896,6 +993,13 @@ async function post(path, data, method='POST') {
   const result = await api(path, { method, body: JSON.stringify(data) });
   await loadAll();
   setStatus('Saved', 'ok');
+  return result;
+}
+async function removeRecord(path, data) {
+  setStatus('Deleting');
+  const result = await api(path, { method: 'DELETE', body: JSON.stringify(data) });
+  await loadAll();
+  setStatus('Deleted', 'ok');
   return result;
 }
 function selectedAccount() { return document.querySelector('#account-form [name=account_id]').value.trim(); }
@@ -917,6 +1021,10 @@ document.addEventListener('click', async (event) => {
     else if (action === 'load-raw') renderRaw();
     else if (action === 'select-account') { document.querySelector('#account-form [name=account_id]').value = target.dataset.account; document.querySelector('#origin-filter').value = target.dataset.account; }
     else if (action === 'select-origin') { document.querySelector('#participant-refresh-form [name=account_id]').value = target.dataset.account; document.querySelector('#participant-refresh-form [name=origin_id]').value = target.dataset.origin; }
+    else if (action === 'delete-account') { if (confirm(`Delete account ${target.dataset.account}? Archived messages are kept.`)) await removeRecord('/manage/accounts', { account_id: target.dataset.account }); }
+    else if (action === 'delete-origin') { if (confirm(`Delete origin ${target.dataset.origin}/${target.dataset.topic || 0}? Archived messages are kept.`)) await removeRecord('/manage/origins', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
+    else if (action === 'delete-policy') await removeRecord('/manage/backup-policies', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) });
+    else if (action === 'delete-participant') await removeRecord('/manage/participants', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), user_id: Number(target.dataset.user) });
     else if (action === 'auth-status') await post('/manage/accounts/auth/status', { account_id: selectedAccount() });
     else if (action === 'request-code') { const f = $('account-form'); await post('/manage/accounts/auth/request-code', { account_id: f.account_id.value, phone: f.phone.value }); }
     else if (action === 'submit-code') { const f = $('account-form'); await post('/manage/accounts/auth/submit-code', { account_id: f.account_id.value, phone: f.phone.value, code: f.code.value, password: f.password.value }); }

@@ -111,6 +111,23 @@ class ArchiveStore:
             )
             self._conn.commit()
 
+    def delete_management_account(self, source: str, account_id: str) -> int:
+        deleted = 0
+        with self._lock:
+            for sql in (
+                "DELETE FROM account_auth WHERE source = ? AND account_id = ?",
+                "DELETE FROM origins WHERE source = ? AND account_id = ?",
+                "DELETE FROM backup_policies WHERE source = ? AND account_id = ?",
+                "DELETE FROM participants WHERE source = ? AND account_id = ?",
+                "DELETE FROM capture_cursors WHERE source = ? AND account_id = ?",
+                "DELETE FROM operation_events WHERE source = ? AND account_id = ?",
+                "DELETE FROM accounts WHERE source = ? AND account_id = ?",
+            ):
+                cur = self._conn.execute(sql, (source, account_id))
+                deleted += max(cur.rowcount, 0)
+            self._conn.commit()
+        return deleted
+
     def list_management_accounts(self) -> list[dict[str, Any]]:
         with self._lock:
             account_rows = self._conn.execute(
@@ -254,6 +271,34 @@ class ArchiveStore:
             )
             self._conn.commit()
 
+    def delete_origin(self, source: str, account_id: str, origin_id: int, topic_id: int = 0) -> int:
+        deleted = 0
+        with self._lock:
+            for sql in (
+                """
+                DELETE FROM backup_policies
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+                """
+                DELETE FROM capture_cursors
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+                """
+                DELETE FROM origins
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+            ):
+                cur = self._conn.execute(sql, (source, account_id, origin_id, topic_id))
+                deleted += max(cur.rowcount, 0)
+            if topic_id == 0:
+                cur = self._conn.execute(
+                    "DELETE FROM participants WHERE source = ? AND account_id = ? AND origin_id = ?",
+                    (source, account_id, origin_id),
+                )
+                deleted += max(cur.rowcount, 0)
+            self._conn.commit()
+        return deleted
+
     def list_origins(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
             SELECT
@@ -334,6 +379,18 @@ class ArchiveStore:
                 ),
             )
             self._conn.commit()
+
+    def delete_backup_policy(self, source: str, account_id: str, origin_id: int, topic_id: int = 0) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                DELETE FROM backup_policies
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+                (source, account_id, origin_id, topic_id),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def list_backup_policies(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
@@ -480,6 +537,18 @@ class ArchiveStore:
                 ),
             )
             self._conn.commit()
+
+    def delete_participant(self, source: str, account_id: str, origin_id: int, user_id: int) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                DELETE FROM participants
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND user_id = ?
+                """,
+                (source, account_id, origin_id, user_id),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def list_participants(self, account_id: str | None = None, origin_id: int | None = None) -> list[dict[str, Any]]:
         sql = """

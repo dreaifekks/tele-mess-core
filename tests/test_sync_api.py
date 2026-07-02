@@ -8,8 +8,17 @@ from pathlib import Path
 from urllib.request import Request, urlopen
 
 from tele_mess_core.archive import ArchiveStore
+from tele_mess_core.config import (
+    AppConfig,
+    LoggingConfig,
+    ServerConfig,
+    StorageConfig,
+    TelegramAccountConfig,
+    TelegramConfig,
+)
 from tele_mess_core.models import MessageRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
 from tele_mess_core.server import SyncApiServer
+from tele_mess_core.server.api import _account_config
 
 
 class SyncApiTest(unittest.TestCase):
@@ -101,6 +110,11 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("escapeHtml", html)
         self.assertIn("API token required", html)
         self.assertIn("Enter server.token", html)
+        self.assertIn('data-action="delete-account"', html)
+        self.assertIn('data-action="delete-origin"', html)
+        self.assertIn('data-action="delete-policy"', html)
+        self.assertIn('data-action="delete-participant"', html)
+        self.assertIn("<th>Actions</th>", html)
 
     def test_root_serves_console_without_token(self) -> None:
         html = self.request_text_no_auth("/")
@@ -226,6 +240,94 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("origin_registry", capabilities["management"])
         self.assertIn("capture_cursors", capabilities["management"])
         self.assertIn("operation_events", capabilities["management"])
+
+    def test_management_delete_endpoints_remove_console_records(self) -> None:
+        self.request_json(
+            "/manage/accounts",
+            method="POST",
+            payload={"account_id": "main", "display_name": "Main", "session_name": "main"},
+        )
+        self.request_json(
+            "/manage/origins",
+            method="POST",
+            payload={"account_id": "main", "origin_id": -1001, "origin_type": "group", "title": "Source Group"},
+        )
+        self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -1001, "enabled": True},
+        )
+        self.request_json(
+            "/manage/participants",
+            method="POST",
+            payload={"account_id": "main", "origin_id": -1001, "user_id": 42, "display_name": "Alice"},
+        )
+
+        policy = self.request_json(
+            "/manage/backup-policies",
+            method="DELETE",
+            payload={"account_id": "main", "origin_id": -1001},
+        )["item"]
+        self.assertEqual(policy["deleted_rows"], 1)
+        self.assertEqual(self.request_json("/manage/backup-policies?account_id=main")["items"], [])
+
+        participant = self.request_json(
+            "/manage/participants",
+            method="DELETE",
+            payload={"account_id": "main", "origin_id": -1001, "user_id": 42},
+        )["item"]
+        self.assertEqual(participant["deleted_rows"], 1)
+        self.assertEqual(self.request_json("/manage/participants?account_id=main&origin_id=-1001")["items"], [])
+
+        origin = self.request_json(
+            "/manage/origins",
+            method="DELETE",
+            payload={"account_id": "main", "origin_id": -1001},
+        )["item"]
+        self.assertEqual(origin["deleted_rows"], 1)
+        self.assertEqual(self.request_json("/manage/origins?account_id=main")["items"], [])
+
+        account = self.request_json(
+            "/manage/accounts",
+            method="DELETE",
+            payload={"account_id": "main"},
+        )["item"]
+        self.assertEqual(account["deleted_rows"], 2)
+        self.assertEqual(self.request_json("/manage/accounts")["items"], [])
+
+    def test_saved_management_account_can_supply_live_runtime_config(self) -> None:
+        session_dir = Path(self.tmp.name) / "sessions"
+        config = AppConfig(
+            storage=StorageConfig(data_dir=Path(self.tmp.name), database=Path(self.tmp.name) / "archive.db"),
+            telegram=TelegramConfig(
+                accounts=[
+                    TelegramAccountConfig(
+                        account_id="default",
+                        api_id=12345,
+                        api_hash="hash",
+                        session_name="tele_mess_core",
+                        session_dir=session_dir,
+                        timezone="UTC",
+                    )
+                ]
+            ),
+            server=ServerConfig(),
+            logging=LoggingConfig(),
+        )
+        self.request_json(
+            "/manage/accounts",
+            method="POST",
+            payload={"account_id": "second", "display_name": "Second", "session_name": "second-main"},
+        )
+
+        account = _account_config(config, self.store, "second")
+
+        self.assertEqual(account.account_id, "second")
+        self.assertEqual(account.api_id, 12345)
+        self.assertEqual(account.api_hash, "hash")
+        self.assertEqual(account.session_name, "second-main")
+        self.assertEqual(account.session_dir, session_dir)
+        self.assertEqual(account.chats, [])
 
 
 if __name__ == "__main__":
