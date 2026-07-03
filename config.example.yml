@@ -1,6 +1,7 @@
 storage:
   data_dir: "./data"
   database: "./data/archive.db"
+  raw_json_retention_days: 7
 
 telegram:
   backfill:

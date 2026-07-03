@@ -94,6 +94,44 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["message_id"], 11)
 
+    def test_clear_old_message_raw_json_keeps_structured_message_data(self) -> None:
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=1,
+                sent_at="2026-01-01T00:00:00+00:00",
+                ingested_at="2026-01-01T00:00:00+00:00",
+                text="old searchable payload",
+                raw_json='{"message":"old searchable payload","media":{"_":"MessageMediaPhoto"}}',
+            ),
+            event_type="new",
+        )
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=2,
+                sent_at="2026-01-10T00:00:00+00:00",
+                ingested_at="2026-01-10T00:00:00+00:00",
+                text="new searchable payload",
+                raw_json='{"message":"new searchable payload"}',
+            ),
+            event_type="new",
+        )
+
+        stats = self.store.message_raw_json_stats(cutoff_sent_at="2026-01-07T00:00:00+00:00")
+        removed = self.store.clear_message_raw_json_before("2026-01-07T00:00:00+00:00")
+        messages = self.store.list_latest_messages(limit=2)["items"]
+
+        self.assertEqual(stats["message_count"], 1)
+        self.assertEqual(removed["message_count"], 1)
+        by_id = {item["message_id"]: item for item in messages}
+        self.assertIsNone(by_id[1]["raw_json"])
+        self.assertEqual(by_id[1]["text"], "old searchable payload")
+        self.assertIsNotNone(by_id[2]["raw_json"])
+        self.assertEqual(self.store.search_messages("old")[0]["message_id"], 1)
+
     def test_reaction_creates_minimal_message_if_missing(self) -> None:
         self.store.update_reactions(
             SOURCE_TELEGRAM,

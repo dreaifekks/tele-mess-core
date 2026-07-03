@@ -32,6 +32,8 @@ daily package and AI analysis details.
 - Daily package generation by origin, tag group, timezone, and local date.
 - Local Codex-backed daily summary runs with configurable AI command templates.
 - System-managed daily package scheduling through user-level systemd timer files.
+- Optional raw Telegram JSON retention cleanup for keeping the SQLite archive
+  compact while preserving structured message rows.
 
 ## Quick Start
 
@@ -53,6 +55,23 @@ for the daily packaging, scheduling, and staged AI analysis workflow.
 Use `telegram.accounts[]` for multi-account auth/runtime configuration. Message
 capture sources are managed in SQLite through origin discovery plus backup
 policies; `telegram.chats` in config is no longer used.
+
+## Raw JSON Cleanup
+
+Message rows keep structured fields plus a raw Telethon JSON payload for recent
+forensics. The raw payload can be cleared after a retention window without
+removing message text, timestamps, senders, search data, or sync cursors.
+
+```bash
+tele-mess-core cleanup-raw-json --config config.yml --retention-days 7
+tele-mess-core cleanup-raw-json --config config.yml --retention-days 7 --dry-run
+tele-mess-core raw-json-cleanup-schedule --config config.yml install --activate-systemd
+```
+
+The cleanup timer defaults to `OnCalendar=weekly` and reads
+`storage.raw_json_retention_days`, which defaults to `7`. Add `--vacuum` only
+when you want the SQLite file to shrink immediately; without it, SQLite reuses
+the freed pages for later messages.
 
 ## Sync API
 

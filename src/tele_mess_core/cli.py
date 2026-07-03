@@ -70,6 +70,25 @@ def main(argv: list[str] | None = None) -> int:
     daily_schedule_remove = daily_schedule_sub.add_parser("remove", help="Disable the saved daily schedule and rewrite timer files")
     daily_schedule_remove.add_argument("--activate-systemd", action="store_true", help="Run systemctl --user disable after writing timer files")
 
+    cleanup_parser = sub.add_parser("cleanup-raw-json", help="Clear old raw Telegram JSON payloads from message rows")
+    add_config_arg(cleanup_parser)
+    cleanup_parser.add_argument("--retention-days", type=int, help="Days of messages.raw_json to keep. Defaults to storage.raw_json_retention_days.")
+    cleanup_parser.add_argument("--cutoff-sent-at", help="Explicit sent_at cutoff; raw_json older than this value is cleared.")
+    cleanup_parser.add_argument("--dry-run", action="store_true", help="Report eligible rows without modifying the database")
+    cleanup_parser.add_argument("--vacuum", action="store_true", help="Run VACUUM after cleanup so the database file shrinks immediately")
+
+    cleanup_schedule_parser = sub.add_parser("raw-json-cleanup-schedule", help="Install or remove the system raw JSON cleanup timer")
+    add_config_arg(cleanup_schedule_parser)
+    cleanup_schedule_sub = cleanup_schedule_parser.add_subparsers(dest="raw_json_cleanup_schedule_command", required=True)
+    cleanup_schedule_install = cleanup_schedule_sub.add_parser("install", help="Write and optionally activate the systemd user timer")
+    cleanup_schedule_install.add_argument("--retention-days", type=int, help="Days of messages.raw_json to keep. Defaults to storage.raw_json_retention_days.")
+    cleanup_schedule_install.add_argument("--on-calendar", default="weekly", help="systemd OnCalendar expression. Defaults to weekly.")
+    cleanup_schedule_install.add_argument("--cli-path", help="Executable path to write into the systemd service. Defaults to daily.cli_path.")
+    cleanup_schedule_install.add_argument("--vacuum", action="store_true", help="Run VACUUM after scheduled cleanup")
+    cleanup_schedule_install.add_argument("--activate-systemd", action="store_true", help="Run systemctl --user enable --now after writing timer files")
+    cleanup_schedule_remove = cleanup_schedule_sub.add_parser("remove", help="Remove the systemd user timer files")
+    cleanup_schedule_remove.add_argument("--activate-systemd", action="store_true", help="Run systemctl --user disable --now before removing timer files")
+
     import_parser = sub.add_parser("import-ndjson", help="Import legacy .bak NDJSON messages")
     add_config_arg(import_parser)
     import_parser.add_argument("path", help="NDJSON backup file")
@@ -114,6 +133,12 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "daily-schedule":
             _daily_schedule(config, store, args)
+            return 0
+        if args.command == "cleanup-raw-json":
+            _cleanup_raw_json(config, store, args)
+            return 0
+        if args.command == "raw-json-cleanup-schedule":
+            _raw_json_cleanup_schedule(config, args)
             return 0
         if args.command == "import-ndjson":
             _import_ndjson(store, Path(args.path), args.chat_id, args.account_id)
@@ -319,6 +344,37 @@ def _daily_schedule(config: AppConfig, store: ArchiveStore, args: argparse.Names
     payload["enabled"] = args.daily_schedule_command == "install"
     payload["activate_systemd"] = bool(args.activate_systemd)
     item = update_daily_package_schedule(store, config, payload)
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _cleanup_raw_json(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
+    from tele_mess_core.maintenance import cleanup_message_raw_json
+
+    retention_days = args.retention_days or config.storage.raw_json_retention_days
+    item = cleanup_message_raw_json(
+        store,
+        retention_days=retention_days,
+        cutoff_sent_at=args.cutoff_sent_at,
+        dry_run=bool(args.dry_run),
+        vacuum=bool(args.vacuum),
+    )
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _raw_json_cleanup_schedule(config: AppConfig, args: argparse.Namespace) -> None:
+    from tele_mess_core.maintenance import install_raw_json_cleanup_timer, remove_raw_json_cleanup_timer
+
+    if args.raw_json_cleanup_schedule_command == "install":
+        item = install_raw_json_cleanup_timer(
+            config,
+            retention_days=args.retention_days,
+            on_calendar=args.on_calendar,
+            cli_path=args.cli_path,
+            vacuum=bool(args.vacuum),
+            activate=bool(args.activate_systemd),
+        )
+    else:
+        item = remove_raw_json_cleanup_timer(config, activate=bool(args.activate_systemd))
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
 
 

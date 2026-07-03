@@ -15,6 +15,7 @@ class ConfigTest(unittest.TestCase):
                 """
 storage:
   database: ./archive.db
+  raw_json_retention_days: 10
 telegram:
   accounts:
     - account_id: main
@@ -33,6 +34,7 @@ server:
             config = load_config(config_path)
 
         account = config.telegram.accounts[0]
+        self.assertEqual(config.storage.raw_json_retention_days, 10)
         self.assertEqual(account.account_id, "main")
         self.assertFalse(hasattr(account, "chats"))
 

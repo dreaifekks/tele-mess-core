@@ -295,7 +295,9 @@ CREATE TRIGGER IF NOT EXISTS messages_ad AFTER DELETE ON messages BEGIN
   VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
 END;
 
-CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages BEGIN
+CREATE TRIGGER IF NOT EXISTS messages_au AFTER UPDATE ON messages
+WHEN old.text IS NOT new.text OR old.sender_name IS NOT new.sender_name
+BEGIN
   INSERT INTO message_fts(message_fts, rowid, text, sender_name)
   VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
   INSERT INTO message_fts(rowid, text, sender_name)

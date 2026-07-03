@@ -11,6 +11,7 @@ import yaml
 class StorageConfig:
     data_dir: Path = Path("./data")
     database: Path = Path("./data/archive.db")
+    raw_json_retention_days: int = 7
 
 
 @dataclass(slots=True)
@@ -114,6 +115,7 @@ def load_config(path: str | Path) -> AppConfig:
     storage = StorageConfig(
         data_dir=_resolve_path(base_dir, storage_raw.get("data_dir", "./data")),
         database=_resolve_path(base_dir, storage_raw.get("database", "./data/archive.db")),
+        raw_json_retention_days=max(1, int(storage_raw.get("raw_json_retention_days", 7))),
     )
     server = ServerConfig(
         host=str(server_raw.get("host", "127.0.0.1")),

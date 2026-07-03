@@ -1629,6 +1629,60 @@ class ArchiveStore:
                 "server_time": utc_now_iso(),
             }
 
+    def message_raw_json_stats(self, cutoff_sent_at: str | None = None) -> dict[str, int]:
+        clauses = ["raw_json IS NOT NULL"]
+        params: list[Any] = []
+        if cutoff_sent_at is not None:
+            clauses.append("sent_at < ?")
+            params.append(cutoff_sent_at)
+        with self._lock:
+            row = self._conn.execute(
+                f"""
+                SELECT
+                  COUNT(*) AS message_count,
+                  COALESCE(SUM(LENGTH(CAST(raw_json AS BLOB))), 0) AS raw_json_bytes
+                FROM messages
+                WHERE {" AND ".join(clauses)}
+                """,
+                tuple(params),
+            ).fetchone()
+        return {
+            "message_count": int(row["message_count"] if row else 0),
+            "raw_json_bytes": int(row["raw_json_bytes"] if row else 0),
+        }
+
+    def clear_message_raw_json_before(self, cutoff_sent_at: str) -> dict[str, int]:
+        before = self.message_raw_json_stats(cutoff_sent_at=cutoff_sent_at)
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE messages
+                SET raw_json = NULL
+                WHERE raw_json IS NOT NULL
+                  AND sent_at < ?
+                """,
+                (cutoff_sent_at,),
+            )
+            self._conn.commit()
+        return {
+            "message_count": int(max(cur.rowcount, 0)),
+            "raw_json_bytes": before["raw_json_bytes"],
+        }
+
+    def vacuum(self) -> None:
+        with self._lock:
+            self._conn.commit()
+            self._conn.execute("VACUUM")
+
+    def wal_checkpoint_truncate(self) -> dict[str, int]:
+        with self._lock:
+            row = self._conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+        return {
+            "busy": int(row[0]) if row else 0,
+            "log": int(row[1]) if row else 0,
+            "checkpointed": int(row[2]) if row else 0,
+        }
+
     def list_events(self, after: int = 0, limit: int = 500) -> dict[str, Any]:
         limit = _bounded_limit(limit)
         with self._lock:
@@ -1809,6 +1863,39 @@ class ArchiveStore:
             self._conn.execute("ALTER TABLE origins ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
+        if self._has_table("messages"):
+            self._ensure_message_fts_triggers()
+
+    def _ensure_message_fts_triggers(self) -> None:
+        self._conn.executescript(
+            """
+            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
+              text,
+              sender_name,
+              content='messages',
+              content_rowid='rowid'
+            );
+            DROP TRIGGER IF EXISTS messages_ai;
+            DROP TRIGGER IF EXISTS messages_ad;
+            DROP TRIGGER IF EXISTS messages_au;
+            CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
+              INSERT INTO message_fts(rowid, text, sender_name)
+              VALUES (new.rowid, COALESCE(new.text, ''), COALESCE(new.sender_name, ''));
+            END;
+            CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
+              INSERT INTO message_fts(message_fts, rowid, text, sender_name)
+              VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
+            END;
+            CREATE TRIGGER messages_au AFTER UPDATE ON messages
+            WHEN old.text IS NOT new.text OR old.sender_name IS NOT new.sender_name
+            BEGIN
+              INSERT INTO message_fts(message_fts, rowid, text, sender_name)
+              VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
+              INSERT INTO message_fts(rowid, text, sender_name)
+              VALUES (new.rowid, COALESCE(new.text, ''), COALESCE(new.sender_name, ''));
+            END;
+            """
+        )
 
     def _migrate_v1_to_v2(self) -> None:
         self._conn.executescript(

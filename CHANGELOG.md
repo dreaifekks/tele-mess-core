@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 - 2026-07-03
+
+- Added raw Telegram JSON retention cleanup for message rows.
+- Added a weekly systemd user timer installer for raw JSON cleanup.
+- Added WAL checkpoint support after cleanup and documented optional VACUUM usage.
+
 ## 0.2.0 - 2026-07-03
 
 - Added daily origin packaging by group, tag, tag intersections, timezone, and daily window.
