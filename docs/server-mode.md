@@ -6,6 +6,9 @@ The server owns Telegram collection, durable storage, and capture-management
 state. A Mac client connects over LAN or Tailscale and uses the HTTP API for
 sync plus management.
 
+Daily packaging and staged AI analysis details live in
+[daily-packaging.md](daily-packaging.md).
+
 ## Responsibilities
 
 The server does:
@@ -24,11 +27,16 @@ The server does:
   sessions on management request.
 - Record structured operation events for Telegram auth, discovery, participant
   refresh, and media-download failures.
+- Generate daily packages from archived messages by local date, timezone,
+  origin, and tag group.
+- Run local Codex-backed daily analysis on demand: image OCR/visual analysis,
+  normal-origin key extraction, tag-group analysis, important-origin analysis,
+  final rollup, and stored summary content for direct API lookup/filtering.
+- Manage a daily package system timer through user-level systemd timer files.
 
 The server does not:
 
 - Forward messages to backup Telegram groups.
-- Generate summaries.
 - Manage Mac UI state, labels, or client-specific processing.
 
 ## Data Flow
@@ -36,6 +44,8 @@ The server does not:
 ```text
 Telegram account(s) -> Telethon adapter(s) -> SQLite archive -> Sync API -> Mac client
 Mac/web client -> Management API -> account/origin/policy/participant tables
+Systemd user timer -> CLI daily-package -> SQLite archive -> package files
+Manual/API trigger -> daily-summary -> staged local Codex CLI tasks -> summary files + SQLite summary records
 ```
 
 ## Config
@@ -74,6 +84,15 @@ server:
 
 logging:
   file: "/home/dreaife/.local/state/tele-mess-core/tele-mess-core.log"
+
+daily:
+  output_dir: "/home/dreaife/.local/share/tele-mess-core/daily-packages"
+  systemd_user_dir: "/home/dreaife/.config/systemd/user"
+  cli_path: "/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core"
+  ai:
+    provider: "codex-cli"
+    # command can use {output}, {images}, and {task}
+    timeout_seconds: 900
 ```
 
 For Mac access from another machine, bind `server.host` to a LAN/Tailscale
@@ -89,6 +108,9 @@ the running ingestion process reads enabled policies from SQLite.
 tele-mess-core init-db --config config.yml
 tele-mess-core smoke-telegram --config config.yml
 tele-mess-core run-server --config config.yml
+tele-mess-core daily-package --config config.yml --date 2026-07-03 --timezone Asia/Tokyo
+tele-mess-core daily-summary --config config.yml --package-run-id <run-id>
+tele-mess-core daily-schedule --config config.yml install --activate-systemd
 ```
 
 For debugging:
@@ -143,7 +165,14 @@ basic control-plane model for future Mac and web clients:
    topics from an already authenticated Telegram session.
 9. Use `POST /manage/participants/refresh` to refresh participant profiles for a
    specific origin.
-10. Use `GET /console` for the built-in web console. The console can be opened
+10. Use `GET`/`PATCH /manage/daily-package-schedule` to inspect or update the
+   daily package system timer settings.
+11. Use `POST /manage/daily-packages` to generate one package immediately, and
+   `GET /manage/daily-package-runs` to inspect package run state.
+12. Use `POST /manage/daily-summaries` to run one summary immediately,
+   `GET /manage/daily-summary-runs` to inspect run state, and
+   `GET /manage/daily-summary-records` to list/filter stored summary content.
+13. Use `GET /console` for the built-in web console. The console can be opened
    in a browser without a token header, then the operator enters `server.token`;
    all API calls still use the token-protected sync and management endpoints.
 

@@ -18,7 +18,8 @@ The primary product surface is the client/core management interface:
 The core must also:
 - Keep the original devNuc `group-backup-bot` repo untouched.
 - Drop backup-group forwarding from the product center.
-- Drop server-side summary generation from the first version.
+- Keep backup-group forwarding out of scope, while supporting local daily
+  package generation and local Codex-backed daily summary jobs.
 - Store Telegram messages/events in a local SQLite archive.
 - Expose sync and management endpoints for future Tauri/Svelte Mac and web
   clients.
@@ -40,7 +41,9 @@ The core must also:
 
 - SQLite is the source of truth for server mode.
 - Telegram backup-group forwarding is not implemented in this repo.
-- Summary/AI processing is client-side future work.
+- Daily package and summary processing is a local core job: package generation
+  reads the archive, summary runs use a configurable local Codex CLI command,
+  and completed summary Markdown is stored for direct API lookup/filtering.
 - Sync API is read-only and designed for LAN/Tailscale access; management API supports token-protected writes for control-plane state.
 - Use stdlib HTTP server for sync API to keep deployment small; Telethon and PyYAML remain runtime dependencies for ingestion/config.
 - Telegram ingestion is account-aware; `telegram.accounts[]` is the formal config shape, while the old single-account shape maps to `account_id: default`.

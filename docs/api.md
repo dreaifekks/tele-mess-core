@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-03.1`
-- Contract hash: `56d36c6eac0a0f95`
+- Contract version: `2026-07-03.3`
+- Contract hash: `1975e0cadf569537`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -41,6 +41,7 @@ The built-in console and generated documentation endpoints are public on the loc
 - `POST /manage/origins` (management, token) - Create or update origin metadata.
 - `DELETE /manage/origins` (management, token) - Delete an origin and related management metadata.
 - `PATCH /manage/origins/archive` (management, token) - Archive or restore an origin.
+- `PATCH /manage/origins/important` (management, token) - Mark or unmark an origin as important.
 - `GET /manage/backup-policies` (management, token) - List origin backup policies.
 - `POST /manage/backup-policies` (management, token) - Create or update an origin backup policy.
 - `PATCH /manage/backup-policies` (management, token) - Patch an origin backup policy.
@@ -51,6 +52,16 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /manage/capture-cursors` (management, token) - List capture cursors.
 - `GET /manage/operation-events` (management, token) - List structured operation events.
 - `DELETE /manage/operation-events` (management, token) - Delete one or more operation events.
+- `GET /manage/daily-package-schedule` (management, token) - Return the daily package system schedule.
+- `PATCH /manage/daily-package-schedule` (management, token) - Update the daily package system schedule.
+- `POST /manage/daily-packages` (management, token) - Generate a daily package immediately.
+- `GET /manage/daily-package-runs` (management, token) - List daily package runs.
+- `GET /manage/daily-package-runs/content` (management, token) - Return daily package run content.
+- `POST /manage/daily-summaries` (management, token) - Run a daily summary immediately.
+- `GET /manage/daily-summary-runs` (management, token) - List daily summary runs.
+- `GET /manage/daily-summary-runs/content` (management, token) - Return daily summary run content.
+- `GET /manage/daily-summary-records` (management, token) - List stored daily summary contents.
+- `GET /manage/daily-summary-records/item` (management, token) - Return one stored daily summary content record.
 - `POST /manage/discover-origins` (management, token) - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` (management, token) - Refresh participants for a Telegram origin.
 
@@ -418,6 +429,18 @@ Request body: `OriginArchiveInput`
 
 Response: `OriginArchiveResponse`
 
+### PATCH /manage/origins/important
+
+Mark or unmark an origin as important.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `OriginImportantInput`
+
+Response: `OriginItemResponse`
+
 ### GET /manage/backup-policies
 
 List origin backup policies.
@@ -556,6 +579,167 @@ Delete one or more operation events.
 Request body: `OperationEventDeleteInput`
 
 Response: `OperationEventDeleteResponse`
+
+### GET /manage/daily-package-schedule
+
+Return the daily package system schedule.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: none
+
+Response: `DailyPackageScheduleResponse`
+
+### PATCH /manage/daily-package-schedule
+
+Update the daily package system schedule.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `DailyPackageScheduleInput`
+
+Response: `DailyPackageScheduleResponse`
+
+### POST /manage/daily-packages
+
+Generate a daily package immediately.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `201`
+
+Request body: `DailyPackageRunInput`
+
+Response: `DailyPackageRunResponse`
+
+### GET /manage/daily-package-runs
+
+List daily package runs.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `status` (`string`, optional) - Filter by run status.
+- `limit` (`integer`, optional, default `500`) - Maximum rows to return.
+
+Request body: none
+
+Response: `DailyPackageRunListResponse`
+
+### GET /manage/daily-package-runs/content
+
+Return daily package run content.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `run_id` (`string`, required) - Daily package run ID.
+- `format` (`string`, optional, default `md`) - Content format: md or json.
+
+Request body: none
+
+Response: `text/markdown`
+
+### POST /manage/daily-summaries
+
+Run a daily summary immediately.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `201`
+
+Request body: `DailySummaryRunInput`
+
+Response: `DailySummaryRunResponse`
+
+### GET /manage/daily-summary-runs
+
+List daily summary runs.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `package_run_id` (`string`, optional) - Filter by package run ID.
+- `status` (`string`, optional) - Filter by run status.
+- `limit` (`integer`, optional, default `500`) - Maximum rows to return.
+
+Request body: none
+
+Response: `DailySummaryRunListResponse`
+
+### GET /manage/daily-summary-runs/content
+
+Return daily summary run content.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `run_id` (`string`, required) - Daily summary run ID.
+
+Request body: none
+
+Response: `text/markdown`
+
+### GET /manage/daily-summary-records
+
+List stored daily summary contents.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `summary_id` (`string`, optional) - Filter by summary content ID.
+- `run_id` (`string`, optional) - Filter by summary run ID.
+- `package_run_id` (`string`, optional) - Filter by package run ID.
+- `date` (`string`, optional) - Filter by local summary date.
+- `date_from` (`string`, optional) - Filter summaries on or after this local date.
+- `date_to` (`string`, optional) - Filter summaries on or before this local date.
+- `provider` (`string`, optional) - Filter by AI provider.
+- `important` (`boolean`, optional) - Filter summaries that include important origins.
+- `tag` (`string`, optional) - Required tag. Repeatable; all tags must match.
+- `tags` (`string`, optional) - Comma-separated required tags; all tags must match.
+- `q` (`string`, optional) - Filter by title or Markdown content substring.
+- `include_content` (`boolean`, optional, default `False`) - Include full Markdown content in list items.
+- `limit` (`integer`, optional, default `500`) - Maximum rows to return.
+
+Request body: none
+
+Response: `DailySummaryRecordListResponse`
+
+### GET /manage/daily-summary-records/item
+
+Return one stored daily summary content record.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `summary_id` (`string`, optional) - Summary content ID.
+- `run_id` (`string`, optional) - Summary run ID.
+
+Request body: none
+
+Response: `DailySummaryRecordResponse`
 
 ### POST /manage/discover-origins
 
@@ -779,6 +963,166 @@ Response: `ParticipantRefreshResultResponse`
 | --- | --- | --- |
 | `items` | `array<Chat>` | yes |
 
+### DailyPackageRun
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `date` | `string` | yes |
+| `timezone` | `string` | yes |
+| `scope` | `object` | no |
+| `output_dir` | `string` | no |
+| `package_json_path` | `string` | no |
+| `package_md_path` | `string` | no |
+| `origin_count` | `integer` | no |
+| `message_count` | `integer` | no |
+| `media_count` | `integer` | no |
+| `important_origin_count` | `integer` | no |
+| `error` | `string` | no |
+| `started_at` | `string` | no |
+| `finished_at` | `string` | no |
+
+### DailyPackageRunInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `date` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `account_id` | `string` | no |
+| `origin_id` | `integer` | no |
+| `topic_id` | `integer` | no |
+| `tags` | `string` | no |
+| `tag_groups` | `array` | no |
+
+### DailyPackageRunListResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `items` | `array<DailyPackageRun>` | yes |
+
+### DailyPackageRunResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailyPackageRun` | yes |
+
+### DailyPackageSchedule
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `enabled` | `boolean` | yes |
+| `time_of_day` | `string` | yes |
+| `timezone` | `string` | yes |
+| `scope` | `object` | yes |
+| `system_manager` | `string` | yes |
+| `installed` | `boolean` | yes |
+| `last_installed_at` | `string` | no |
+| `last_error` | `string` | no |
+| `updated_at` | `string` | no |
+
+### DailyPackageScheduleInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `enabled` | `boolean` | no |
+| `time_of_day` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `system_manager` | `string` | no |
+| `activate_systemd` | `boolean` | no |
+
+### DailyPackageScheduleResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailyPackageSchedule` | yes |
+
+### DailySummaryRecord
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `summary_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `package_run_id` | `string` | no |
+| `date` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `tags` | `array` | no |
+| `important` | `boolean` | no |
+| `provider` | `string` | no |
+| `title` | `string` | no |
+| `content_preview` | `string` | yes |
+| `content_md` | `string` | no |
+| `content_json` | `object` | no |
+| `summary_path` | `string` | no |
+| `origin_count` | `integer` | no |
+| `group_count` | `integer` | no |
+| `image_count` | `integer` | no |
+| `content_length` | `integer` | no |
+| `created_at` | `string` | no |
+| `updated_at` | `string` | no |
+
+### DailySummaryRecordListResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `items` | `array<DailySummaryRecord>` | yes |
+
+### DailySummaryRecordResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailySummaryRecord` | yes |
+
+### DailySummaryRun
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `run_id` | `string` | yes |
+| `status` | `string` | yes |
+| `package_run_id` | `string` | no |
+| `date` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `output_dir` | `string` | no |
+| `summary_path` | `string` | no |
+| `provider` | `string` | no |
+| `origin_count` | `integer` | no |
+| `group_count` | `integer` | no |
+| `image_count` | `integer` | no |
+| `error` | `string` | no |
+| `started_at` | `string` | no |
+| `finished_at` | `string` | no |
+
+### DailySummaryRunInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `package_run_id` | `string` | no |
+| `date` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `account_id` | `string` | no |
+| `origin_id` | `integer` | no |
+| `topic_id` | `integer` | no |
+| `tags` | `string` | no |
+| `tag_groups` | `array` | no |
+| `background` | `boolean` | no |
+
+### DailySummaryRunListResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `items` | `array<DailySummaryRun>` | yes |
+
+### DailySummaryRunResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailySummaryRun` | yes |
+
 ### DiscoveryInput
 
 | Field | Type | Required |
@@ -979,6 +1323,7 @@ Response: `ParticipantRefreshResultResponse`
 | `title` | `string` | no |
 | `username` | `string` | no |
 | `is_forum` | `boolean` | no |
+| `important` | `boolean` | no |
 | `archived_at` | `string` | no |
 | `last_message_at` | `string` | no |
 | `discovered_at` | `string` | no |
@@ -1009,6 +1354,16 @@ Response: `ParticipantRefreshResultResponse`
 | --- | --- | --- |
 | `item` | `object` | yes |
 
+### OriginImportantInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `source` | `string` | no |
+| `account_id` | `string` | yes |
+| `origin_id` | `integer` | yes |
+| `topic_id` | `integer` | no |
+| `important` | `boolean` | no |
+
 ### OriginInput
 
 | Field | Type | Required |
@@ -1022,6 +1377,7 @@ Response: `ParticipantRefreshResultResponse`
 | `title` | `string` | no |
 | `username` | `string` | no |
 | `is_forum` | `boolean` | no |
+| `important` | `boolean` | no |
 | `last_message_at` | `string` | no |
 
 ### OriginItemResponse

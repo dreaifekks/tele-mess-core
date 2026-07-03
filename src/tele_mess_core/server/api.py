@@ -103,7 +103,7 @@ class SyncApiServer:
         config = self.config
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.1.1"
+            server_version = "tele-mess-core/0.2.0"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
@@ -240,6 +240,74 @@ class SyncApiServer:
                             "items": [_operation_event_public_item(item) for item in items]
                         }
                     )
+                elif path == "/manage/daily-package-schedule":
+                    self._json({"item": store.get_daily_package_schedule()})
+                elif path == "/manage/daily-package-runs":
+                    self._json(
+                        {
+                            "items": store.list_daily_package_runs(
+                                status=_optional_str_param(params, "status"),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
+                elif path == "/manage/daily-package-runs/content":
+                    from tele_mess_core.daily import read_run_content
+
+                    body, content_type = read_run_content(
+                        store,
+                        "package",
+                        _str_param(params, "run_id", ""),
+                        _str_param(params, "format", "md"),
+                    )
+                    self._text(body, content_type=content_type)
+                elif path == "/manage/daily-summary-runs":
+                    self._json(
+                        {
+                            "items": store.list_daily_summary_runs(
+                                package_run_id=_optional_str_param(params, "package_run_id"),
+                                status=_optional_str_param(params, "status"),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
+                elif path == "/manage/daily-summary-runs/content":
+                    from tele_mess_core.daily import read_run_content
+
+                    body, content_type = read_run_content(
+                        store,
+                        "summary",
+                        _str_param(params, "run_id", ""),
+                        "md",
+                    )
+                    self._text(body, content_type=content_type)
+                elif path == "/manage/daily-summary-records":
+                    self._json(
+                        {
+                            "items": store.list_daily_summary_records(
+                                summary_id=_optional_str_param(params, "summary_id"),
+                                run_id=_optional_str_param(params, "run_id"),
+                                package_run_id=_optional_str_param(params, "package_run_id"),
+                                date=_optional_str_param(params, "date"),
+                                date_from=_optional_str_param(params, "date_from"),
+                                date_to=_optional_str_param(params, "date_to"),
+                                provider=_optional_str_param(params, "provider"),
+                                important=_optional_bool_param(params, "important"),
+                                tags=_tags_param(params),
+                                q=_optional_str_param(params, "q"),
+                                include_content=_bool_param(params, "include_content", False),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
+                elif path == "/manage/daily-summary-records/item":
+                    item = store.get_daily_summary_record(
+                        summary_id=_optional_str_param(params, "summary_id"),
+                        run_id=_optional_str_param(params, "run_id"),
+                    )
+                    if item is None:
+                        raise ValueError("Unknown daily summary record")
+                    self._json({"item": item})
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -269,6 +337,9 @@ class SyncApiServer:
                 elif path == "/manage/origins/archive" and method == "PATCH":
                     item = _archive_origin(store, payload)
                     self._json({"item": item})
+                elif path == "/manage/origins/important" and method == "PATCH":
+                    item = _set_origin_important(store, payload)
+                    self._json({"item": item})
                 elif path == "/manage/backup-policies" and method in {"POST", "PATCH"}:
                     item = _set_backup_policy(store, payload)
                     self._json({"item": item})
@@ -293,6 +364,15 @@ class SyncApiServer:
                 elif path == "/manage/operation-events" and method == "DELETE":
                     item = _delete_operation_events(store, payload)
                     self._json({"item": item})
+                elif path == "/manage/daily-package-schedule" and method == "PATCH":
+                    item = _update_daily_package_schedule(config, store, payload)
+                    self._json({"item": item})
+                elif path == "/manage/daily-packages" and method == "POST":
+                    item = _create_daily_package(config, store, payload)
+                    self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/daily-summaries" and method == "POST":
+                    item = _create_daily_summary(config, store, payload)
+                    self._json({"item": item}, status=HTTPStatus.CREATED)
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -389,6 +469,10 @@ def _capabilities() -> dict[str, Any]:
             "operation_events",
             "operation_event_delete",
             "detailed_operation_events",
+            "daily_package_schedule",
+            "daily_package_runs",
+            "daily_summary_runs",
+            "daily_summary_records",
             "web_console",
         ],
         "auth_flow": {
@@ -634,11 +718,24 @@ def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, An
             title=_optional_payload_str(payload, "title"),
             username=_optional_payload_str(payload, "username"),
             is_forum=_payload_bool(payload, "is_forum", False),
+            important=_payload_bool(payload, "important", False),
             last_message_at=_optional_payload_str(payload, "last_message_at"),
             updated_at=utc_now_iso(),
             raw_json=_public_raw_json(payload),
         )
     )
+    return _find_origin(store, account_id, origin_id, topic_id)
+
+
+def _set_origin_important(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    source = _source(payload)
+    account_id = _required_str(payload, "account_id")
+    origin_id = _required_int(payload, "origin_id")
+    topic_id = _payload_int(payload, "topic_id", 0)
+    important = _payload_bool(payload, "important", True)
+    changed = store.set_origin_important(source, account_id, origin_id, topic_id, important)
+    if changed == 0:
+        raise ValueError("origin was not found")
     return _find_origin(store, account_id, origin_id, topic_id)
 
 
@@ -799,6 +896,77 @@ def _refresh_participants(config: "AppConfig | None", store: ArchiveStore, paylo
     return asyncio.run(TelegramDiscoveryService(account, store).refresh_participants(origin_id, limit))
 
 
+def _update_daily_package_schedule(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily package scheduling")
+    from tele_mess_core.daily import update_daily_package_schedule
+
+    return update_daily_package_schedule(store, config, payload)
+
+
+def _create_daily_package(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily package runs")
+    from tele_mess_core.daily import build_daily_package
+
+    scope = _daily_scope(payload)
+    return build_daily_package(
+        store,
+        config,
+        run_date=_optional_payload_str(payload, "date"),
+        timezone_name=_optional_payload_str(payload, "timezone"),
+        scope=scope,
+    )
+
+
+def _create_daily_summary(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily summary runs")
+    from tele_mess_core.daily import run_daily_summary, start_daily_summary_thread
+
+    scope = _daily_scope(payload)
+    if _payload_bool(payload, "background", True):
+        return start_daily_summary_thread(
+            store,
+            config,
+            package_run_id=_optional_payload_str(payload, "package_run_id"),
+            run_date=_optional_payload_str(payload, "date"),
+            timezone_name=_optional_payload_str(payload, "timezone"),
+            scope=scope,
+        )
+    return run_daily_summary(
+        store,
+        config,
+        package_run_id=_optional_payload_str(payload, "package_run_id"),
+        run_date=_optional_payload_str(payload, "date"),
+        timezone_name=_optional_payload_str(payload, "timezone"),
+        scope=scope,
+    )
+
+
+def _daily_scope(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_scope = payload.get("scope") or {}
+    if not isinstance(raw_scope, dict):
+        raise ValueError("scope must be an object")
+    scope = dict(raw_scope)
+    for key in ("account_id", "origin_id", "topic_id", "tags", "tag_groups"):
+        if key in payload and payload[key] not in (None, ""):
+            scope[key] = payload[key]
+    return scope
+
+
 def _account_config(
     config: "AppConfig | None",
     store: ArchiveStore,
@@ -942,6 +1110,12 @@ def _bool_param(params: dict[str, list[str]], key: str, default: bool) -> bool:
     return bool(value)
 
 
+def _optional_bool_param(params: dict[str, list[str]], key: str) -> bool | None:
+    if key not in params:
+        return None
+    return _bool_param(params, key, False)
+
+
 def _str_param(params: dict[str, list[str]], key: str, default: str) -> str:
     return params.get(key, [default])[0]
 
@@ -949,6 +1123,23 @@ def _str_param(params: dict[str, list[str]], key: str, default: str) -> str:
 def _optional_str_param(params: dict[str, list[str]], key: str) -> str | None:
     value = params.get(key, [None])[0]
     return value if value else None
+
+
+def _tags_param(params: dict[str, list[str]]) -> list[str]:
+    values: list[str] = []
+    for item in params.get("tag", []):
+        values.append(item)
+    for item in params.get("tags", []):
+        values.extend(part for part in item.split(",") if part.strip())
+    tags: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        tag = value.strip()
+        key = tag.lower()
+        if tag and key not in seen:
+            seen.add(key)
+            tags.append(tag)
+    return tags
 
 
 def _console_html() -> str:
@@ -1003,8 +1194,9 @@ def _console_html() -> str:
     .form-grid { display: grid; gap: 10px; }
     .two { grid-template-columns: repeat(2, minmax(0, 1fr)); }
     label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); }
-    input, select, button { font: inherit; min-height: 34px; }
-    input, select { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 9px; background: #fff; color: var(--text); }
+    input, select, button, textarea { font: inherit; min-height: 34px; }
+    input, select, textarea { width: 100%; border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 9px; background: #fff; color: var(--text); }
+    textarea { resize: vertical; min-height: 92px; }
     input[type=checkbox] { width: 16px; min-height: 16px; }
     .check { display: flex; gap: 8px; align-items: center; color: var(--text); }
     button { border: 1px solid var(--line-strong); border-radius: 6px; padding: 7px 10px; background: var(--surface-2); color: var(--text); cursor: pointer; white-space: nowrap; }
@@ -1071,6 +1263,7 @@ def _console_html() -> str:
       <button class=\"tab active\" data-view=\"overview\">Overview</button>
       <button class=\"tab\" data-view=\"accounts\">Accounts</button>
       <button class=\"tab\" data-view=\"origins\">Origins</button>
+      <button class=\"tab\" data-view=\"daily\">Daily</button>
       <button class=\"tab\" data-view=\"people\">Members</button>
       <button class=\"tab\" data-view=\"files\">Files</button>
       <button class=\"tab\" data-view=\"raw\">Raw</button>
@@ -1144,6 +1337,46 @@ def _console_html() -> str:
     </div>
   </section>
 
+  <section id=\"view-daily\" class=\"view grid hidden\">
+    <div class=\"panel\">
+      <div class=\"panel-head\"><h2>Daily Packaging</h2><button data-action=\"load-daily\">Load</button></div>
+      <form id=\"daily-schedule-form\" class=\"form-grid\">
+        <label class=\"check\"><input type=\"checkbox\" name=\"enabled\"> Enabled</label>
+        <label>Time of day<input name=\"time_of_day\" value=\"08:00\" pattern=\"[0-9]{2}:[0-9]{2}\"></label>
+        <label>Timezone<input name=\"timezone\" value=\"Asia/Tokyo\"></label>
+        <label>Scope JSON<textarea name=\"scope\" rows=\"6\" placeholder='{\"tag_groups\":[\"web3 it info\",\"web3 info\",\"ai info\"]}'></textarea></label>
+        <label class=\"check\"><input type=\"checkbox\" name=\"activate_systemd\"> Activate systemd user timer</label>
+        <button class=\"primary\" type=\"submit\">Save schedule</button>
+      </form>
+      <h3>Run package</h3>
+      <form id=\"daily-package-form\" class=\"form-grid\">
+        <label>Date<input name=\"date\" placeholder=\"YYYY-MM-DD\"></label>
+        <label>Timezone<input name=\"timezone\" placeholder=\"Asia/Tokyo\"></label>
+        <label>Account<input name=\"account_id\"></label>
+        <label>Tags<input name=\"tags\" placeholder=\"web3,info\"></label>
+        <label>Tag groups<input name=\"tag_groups\" placeholder=\"web3 it info; web3 info; ai info\"></label>
+        <button type=\"submit\">Generate package</button>
+      </form>
+      <h3>Run summary</h3>
+      <form id=\"daily-summary-form\" class=\"form-grid\">
+        <label>Package run ID<input name=\"package_run_id\"></label>
+        <label class=\"check\"><input type=\"checkbox\" name=\"background\" checked> Background</label>
+        <button type=\"submit\">Run summary</button>
+      </form>
+    </div>
+    <div class=\"panel\">
+      <div class=\"panel-head\"><h2>Daily Runs</h2><button data-action=\"load-daily\">Refresh</button></div>
+      <h3>Schedule</h3>
+      <pre id=\"daily-schedule-raw\"></pre>
+      <h3>Package runs</h3>
+      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Date</th><th>Origins</th><th>Messages</th><th>Output</th></tr></thead><tbody id=\"daily-package-runs-body\"></tbody></table></div>
+      <h3>Summary runs</h3>
+      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Package</th><th>Provider</th><th>Images</th><th>Output</th></tr></thead><tbody id=\"daily-summary-runs-body\"></tbody></table></div>
+      <h3>Summary records</h3>
+      <div class=\"table-wrap\"><table><thead><tr><th>Summary</th><th>Date</th><th>Tags</th><th>Important</th><th>Content</th><th>Path</th></tr></thead><tbody id=\"daily-summary-records-body\"></tbody></table></div>
+    </div>
+  </section>
+
   <section id=\"view-people\" class=\"view grid hidden\">
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Refresh Participants</h2></div>
@@ -1207,7 +1440,7 @@ def _console_html() -> str:
 <datalist id=\"tag-suggestions\"></datalist>
 
 <script>
-const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
+const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
 let messageRefreshTimer = null;
 let messageRefreshInFlight = false;
 let originSelectionAnchor = null;
@@ -1541,10 +1774,11 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages] = await Promise.all([
+    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
       api('/manage/api-manifest'), api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
-      api('/sync/messages?latest=true&limit=100&include_media=true')
+      api('/sync/messages?latest=true&limit=100&include_media=true'), api('/manage/daily-package-schedule'),
+      api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api('/manage/daily-summary-records')
     ]);
     const contractWarning = updateApiManifest(apiManifest);
     state.service = service;
@@ -1557,6 +1791,10 @@ async function loadAll() {
     state.operationEvents = operationEvents.items || [];
     state.media = media.items || [];
     state.messages = messages.items || [];
+    state.dailySchedule = dailySchedule.item || null;
+    state.dailyPackageRuns = packageRuns.items || [];
+    state.dailySummaryRuns = summaryRuns.items || [];
+    state.dailySummaryRecords = summaryRecords.items || [];
     refreshTagSuggestions();
     renderAll();
     startMessageAutoRefresh();
@@ -1576,6 +1814,21 @@ async function loadMessages(options={}) {
     messageRefreshInFlight = false;
   }
 }
+async function loadDaily() {
+  const [schedule, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+    api('/manage/daily-package-schedule'),
+    api('/manage/daily-package-runs'),
+    api('/manage/daily-summary-runs'),
+    api('/manage/daily-summary-records'),
+  ]);
+  state.dailySchedule = schedule.item || null;
+  state.dailyPackageRuns = packageRuns.items || [];
+  state.dailySummaryRuns = summaryRuns.items || [];
+  state.dailySummaryRecords = summaryRecords.items || [];
+  renderDaily();
+  renderRaw();
+  setStatus('Daily runs loaded', 'ok');
+}
 function startMessageAutoRefresh() {
   if (messageRefreshTimer || !tokenValue()) return;
   messageRefreshTimer = window.setInterval(() => {
@@ -1589,7 +1842,7 @@ function stopMessageAutoRefresh() {
   messageRefreshTimer = null;
 }
 function renderAll() {
-  renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderOperationEvents(); renderMedia(); renderRaw();
+  renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderDaily(); renderParticipants(); renderCursors(); renderOperationEvents(); renderMedia(); renderRaw();
 }
 function renderSummary() {
   const manifest = state.apiManifest || {};
@@ -1648,7 +1901,7 @@ function renderOrigins() {
     }
   }
   for (const item of orphanTopics) rows.push(originRow(item, 0, true));
-  fillTable('origins-body', rows, state.manageOrigins ? 9 : 8);
+  fillTable('origins-body', rows, state.manageOrigins ? 10 : 9);
   updateOriginBulk();
 }
 function filteredOrigins() {
@@ -1687,7 +1940,7 @@ function compareOrigins(a, b, sort) {
   return textCompare(originLastMessageValue(b), originLastMessageValue(a)) || textCompare(a.title, b.title);
 }
 function renderOriginHead() {
-  $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Last message</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
+  $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Important</th><th>Last message</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
 }
 function originRow(item, childCount, isTopic) {
   const policy = item.backup_policy;
@@ -1707,7 +1960,9 @@ function originRow(item, childCount, isTopic) {
     state.selectedOrigins[rowKey] ? 'origin-selected' : '',
   ].filter(Boolean).join(' ');
   const selectCell = state.manageOrigins ? `<td><input class=\"origin-select\" type=\"checkbox\" data-action=\"select-origin-row\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" ${state.selectedOrigins[rowKey] ? 'checked' : ''}></td>` : '';
-  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td>${text(item.last_message_at)}</td><td><div class=\"tag-list\">${renderTags(policyTags)}</div></td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
+  const importantLabel = item.important ? pill('important') : '<span class=\"muted\">-</span>';
+  const importantAction = item.important ? 'Uncheck important' : 'Check important';
+  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td>${importantLabel}</td><td>${text(item.last_message_at)}</td><td><div class=\"tag-list\">${renderTags(policyTags)}</div></td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-important=\"${attr(!item.important)}\" data-action=\"toggle-important\">${importantAction}</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
 }
 function updateOriginBulk() {
   const bulk = $('origin-bulk');
@@ -1745,7 +2000,42 @@ function renderMessages(previousTop) {
   }
   requestAnimationFrame(syncOverviewHeights);
 }
+function renderDaily() {
+  const schedule = state.dailySchedule || {};
+  const form = $('daily-schedule-form');
+  if (form) {
+    form.enabled.checked = Boolean(schedule.enabled);
+    form.time_of_day.value = schedule.time_of_day || '08:00';
+    form.timezone.value = schedule.timezone || 'Asia/Tokyo';
+    form.scope.value = JSON.stringify(schedule.scope || {}, null, 2);
+    form.activate_systemd.checked = false;
+  }
+  const raw = $('daily-schedule-raw');
+  if (raw) raw.textContent = JSON.stringify(schedule, null, 2);
+  fillTable('daily-package-runs-body', (state.dailyPackageRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${text(item.origin_count)}</td><td>${text(item.message_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.package_md_path || item.output_dir)}</td></tr>`), 6);
+  fillTable('daily-summary-runs-body', (state.dailySummaryRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.package_run_id)}</td><td>${text(item.provider)}</td><td>${text(item.image_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.summary_path || item.output_dir)}</td></tr>`), 6);
+  fillTable('daily-summary-records-body', (state.dailySummaryRecords || []).map(item => `<tr><td>${text(item.summary_id)}<div class=\"muted\">${text(item.provider)}</div></td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${text((item.tags || []).join(', '))}</td><td>${pill(item.important ? 'important' : 'normal')}</td><td>${text(item.content_preview)}</td><td title=\"${attr(item.summary_path)}\">${text(item.summary_path)}</td></tr>`), 6);
+}
 function renderRaw() { $('raw').textContent = JSON.stringify(state, null, 2); }
+function parseScopeJson(value) {
+  const textValue = String(value || '').trim();
+  if (!textValue) return {};
+  const parsed = JSON.parse(textValue);
+  if (!parsed || Array.isArray(parsed) || typeof parsed !== 'object') throw new Error('Scope JSON must be an object');
+  return parsed;
+}
+function dailyRunPayload(form) {
+  const data = formData(form);
+  const payload = {};
+  for (const key of ['date', 'timezone', 'account_id', 'tags', 'package_run_id']) {
+    if (data[key]) payload[key] = data[key];
+  }
+  if (data.origin_id) payload.origin_id = Number(data.origin_id);
+  if (data.topic_id) payload.topic_id = Number(data.topic_id);
+  if (data.tag_groups) payload.tag_groups = String(data.tag_groups).split(';').map(item => item.trim()).filter(Boolean);
+  if (data.background !== undefined) payload.background = Boolean(data.background);
+  return payload;
+}
 function setupTagEditor(editor, initialTags='') {
   if (!editor) return;
   const chips = editor.querySelector('[data-tag-chips]');
@@ -1936,6 +2226,7 @@ document.addEventListener('click', async (event) => {
     else if (action === 'load-cursors') { const data = await api('/manage/capture-cursors'); state.cursors = data.items || []; renderCursors(); }
     else if (action === 'load-operation-events') { const data = await api('/manage/operation-events'); state.operationEvents = data.items || []; renderOperationEvents(); }
     else if (action === 'load-media') { const data = await api('/sync/media-files'); state.media = data.items || []; renderMedia(); }
+    else if (action === 'load-daily') await loadDaily();
     else if (action === 'load-raw') renderRaw();
     else if (action === 'preview-media') await previewMedia(target);
     else if (action === 'open-media') await openMedia(target);
@@ -1944,6 +2235,7 @@ document.addEventListener('click', async (event) => {
     else if (action === 'select-origin') { document.querySelector('#participant-refresh-form [name=account_id]').value = target.dataset.account; document.querySelector('#participant-refresh-form [name=origin_id]').value = target.dataset.origin; }
     else if (action === 'delete-account') { if (confirm(`Delete account ${target.dataset.account}? Stored messages are kept.`)) await removeRecord('/manage/accounts', { account_id: target.dataset.account }); }
     else if (action === 'remove-origin' || action === 'restore-origin') { const removed = action === 'remove-origin'; if (confirm(`${removed ? 'Remove' : 'Restore'} origin ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await setOriginRemoved(originPayload(target.dataset.account, target.dataset.origin, target.dataset.topic), removed); }
+    else if (action === 'toggle-important') { await post('/manage/origins/important', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0), important: target.dataset.important === 'true' }, 'PATCH'); }
     else if (action === 'delete-policy') { if (confirm(`Clear backup policy for ${target.dataset.origin}/${target.dataset.topic || 0}?`)) await removeRecord('/manage/backup-policies', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), topic_id: Number(target.dataset.topic || 0) }); }
     else if (action === 'delete-participant') { if (confirm(`Delete participant ${target.dataset.user}?`)) await removeRecord('/manage/participants', { account_id: target.dataset.account, origin_id: Number(target.dataset.origin), user_id: Number(target.dataset.user) }); }
     else if (action === 'auth-status') await post('/manage/accounts/auth/status', { account_id: selectedAccount() });
@@ -1974,6 +2266,33 @@ window.addEventListener('beforeunload', () => {
   for (const url of mediaObjectUrls.values()) URL.revokeObjectURL(url);
 });
 $('account-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/accounts', formData(event.target)); } catch (error) { setStatus(String(error), 'error'); } });
+$('daily-schedule-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const data = formData(event.target);
+    const payload = { enabled: Boolean(data.enabled), time_of_day: data.time_of_day, timezone: data.timezone, scope: parseScopeJson(data.scope), activate_systemd: Boolean(data.activate_systemd) };
+    const result = await api('/manage/daily-package-schedule', { method: 'PATCH', body: JSON.stringify(payload) });
+    state.dailySchedule = result.item;
+    await loadDaily();
+    setStatus('Daily schedule saved', result.item?.last_error ? 'warn' : 'ok');
+  } catch (error) { setStatus(String(error), 'error'); }
+});
+$('daily-package-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api('/manage/daily-packages', { method: 'POST', body: JSON.stringify(dailyRunPayload(event.target)) });
+    await loadDaily();
+    setStatus(`Package ${result.item?.run_id || ''} ${result.item?.status || ''}`, result.item?.status === 'failed' ? 'error' : 'ok');
+  } catch (error) { setStatus(String(error), 'error'); }
+});
+$('daily-summary-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api('/manage/daily-summaries', { method: 'POST', body: JSON.stringify(dailyRunPayload(event.target)) });
+    await loadDaily();
+    setStatus(`Summary ${result.item?.run_id || ''} ${result.item?.status || ''}`, result.item?.status === 'failed' ? 'error' : 'ok');
+  } catch (error) { setStatus(String(error), 'error'); }
+});
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('show-archived').addEventListener('change', async () => { try { await loadOrigins(); setStatus('Origins loaded', 'ok'); } catch (error) { setStatus(String(error), 'error'); } });
@@ -1993,7 +2312,7 @@ function openPolicy(button) {
   const row = document.createElement('tr');
   row.className = 'policy-row';
   const cell = document.createElement('td');
-  cell.colSpan = state.manageOrigins ? 9 : 8;
+  cell.colSpan = state.manageOrigins ? 10 : 9;
   const form = $('policy-template').content.firstElementChild.cloneNode(true);
   form.account_id.value = accountId; form.origin_id.value = originId; form.topic_id.value = topicId;
   form.enabled.checked = policy.enabled ?? origin?.backup_policy?.enabled ?? false;

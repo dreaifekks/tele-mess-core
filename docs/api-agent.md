@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-07-03.1`
-- Contract hash: `56d36c6eac0a0f95`
+- Contract version: `2026-07-03.3`
+- Contract hash: `1975e0cadf569537`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -27,12 +27,16 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `POST /manage/origins` body `OriginInput` - Create or update origin metadata.
 - `DELETE /manage/origins` body `OriginArchiveInput` - Delete an origin and related management metadata.
 - `PATCH /manage/origins/archive` body `OriginArchiveInput` - Archive or restore an origin.
+- `PATCH /manage/origins/important` body `OriginImportantInput` - Mark or unmark an origin as important.
 - `POST /manage/backup-policies` body `BackupPolicyInput` - Create or update an origin backup policy.
 - `PATCH /manage/backup-policies` body `BackupPolicyInput` - Patch an origin backup policy.
 - `DELETE /manage/backup-policies` body `BackupPolicyInput` - Delete an origin backup policy.
 - `POST /manage/participants` body `ParticipantInput` - Create or update a participant profile.
 - `DELETE /manage/participants` body `ParticipantInput` - Delete a participant profile.
 - `DELETE /manage/operation-events` body `OperationEventDeleteInput` - Delete one or more operation events.
+- `PATCH /manage/daily-package-schedule` body `DailyPackageScheduleInput` - Update the daily package system schedule.
+- `POST /manage/daily-packages` body `DailyPackageRunInput` - Generate a daily package immediately.
+- `POST /manage/daily-summaries` body `DailySummaryRunInput` - Run a daily summary immediately.
 - `POST /manage/discover-origins` body `DiscoveryInput` - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` body `ParticipantRefreshInput` - Refresh participants for a Telegram origin.
 

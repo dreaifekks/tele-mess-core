@@ -8,8 +8,10 @@ plane for Mac/web clients.
 
 The core owns Telegram ingestion, SQLite storage, sync cursors, account auth
 state, origin discovery, backup policy, participants, capture cursors, media
-file records, and structured operation events. Client-specific UI state,
-summaries, labels, and higher-level processing belong outside the core.
+file records, structured operation events, daily package runs, system-managed
+daily package schedules, local Codex-backed daily summary runs, and stored
+daily summary content records.
+Client-specific UI state and labels belong outside the core.
 
 ## API Contract Workflow
 

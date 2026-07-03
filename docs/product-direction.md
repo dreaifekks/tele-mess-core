@@ -26,6 +26,9 @@ The basic management model is implemented in SQLite and exposed through HTTP:
 - Built-in web console using the same management endpoints.
 - Structured operation events for expected Telegram auth/discovery failures,
   bounded topic/participant scans, and media-download retry failures.
+- Daily package runs generated from archived messages by origin, tag group,
+  timezone, and local date.
+- Local Codex-backed daily summary runs with run records and artifact paths.
 
 The remaining work is longer-duration real-world soak testing and client polish:
 watching how the core behaves across days of Telegram reconnects, very large
@@ -60,6 +63,10 @@ configure Telegram origins:
   archived, and whether media metadata or media files should be included.
 - Member/person profile: group participants and sender profiles used later to
   identify important information sources.
+- Daily package run: a local-date package of enabled archived origins, grouped
+  by tag intersections and split by important origin status.
+- Daily summary run: an on-demand local AI analysis of a daily package, backed
+  by configurable Codex CLI invocation.
 
 ## Interface Priorities
 
@@ -75,6 +82,10 @@ The next API surface should be management-first, not just sync-first:
 - Fetch and refresh group participants where available.
 - Keep sync endpoints cursor-based so clients can efficiently mirror archive
   changes.
+- Configure daily package time and scope through the management API while the
+  recurring trigger stays in user-level systemd.
+- Trigger daily package and summary runs on demand and inspect their status,
+  output paths, and errors.
 
 ## Open Design Questions
 

@@ -80,6 +80,7 @@ class OriginRecord:
     title: str | None = None
     username: str | None = None
     is_forum: bool = False
+    important: bool = False
     archived_at: str | None = None
     last_message_at: str | None = None
     discovered_at: str | None = None
@@ -157,6 +158,80 @@ class OperationEventRecord:
     retry_after: int | None = None
     occurred_at: str | None = None
     raw_json: str | None = None
+
+
+@dataclass(slots=True)
+class DailyPackageScheduleRecord:
+    enabled: bool = False
+    time_of_day: str = "08:00"
+    timezone: str = "Asia/Tokyo"
+    scope_json: str | None = None
+    system_manager: str = "systemd-user"
+    installed: bool = False
+    last_installed_at: str | None = None
+    last_error: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(slots=True)
+class DailyPackageRunRecord:
+    run_id: str
+    status: str
+    date: str
+    timezone: str
+    scope_json: str | None = None
+    output_dir: str | None = None
+    package_json_path: str | None = None
+    package_md_path: str | None = None
+    origin_count: int = 0
+    message_count: int = 0
+    media_count: int = 0
+    important_origin_count: int = 0
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@dataclass(slots=True)
+class DailySummaryRunRecord:
+    run_id: str
+    status: str
+    package_run_id: str | None = None
+    date: str | None = None
+    timezone: str | None = None
+    scope_json: str | None = None
+    output_dir: str | None = None
+    summary_path: str | None = None
+    provider: str | None = None
+    origin_count: int = 0
+    group_count: int = 0
+    image_count: int = 0
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+
+
+@dataclass(slots=True)
+class DailySummaryRecord:
+    summary_id: str
+    run_id: str
+    content_md: str
+    package_run_id: str | None = None
+    date: str | None = None
+    timezone: str | None = None
+    scope_json: str | None = None
+    tags_json: str | None = None
+    important: bool = False
+    provider: str | None = None
+    title: str | None = None
+    content_json: str | None = None
+    summary_path: str | None = None
+    origin_count: int = 0
+    group_count: int = 0
+    image_count: int = 0
+    content_length: int = 0
+    created_at: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(slots=True)

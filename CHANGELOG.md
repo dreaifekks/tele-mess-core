@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.0 - 2026-07-03
+
+- Added daily origin packaging by group, tag, tag intersections, timezone, and daily window.
+- Added important-origin handling with staged AI analysis tasks, including media OCR/image analysis placeholders and Codex CLI provider support.
+- Added persistent daily summary/package storage plus list, detail, filter, create, and rerun APIs.
+- Added systemd user timer installation and schedule update commands for daily package jobs.
+- Documented the durable daily packaging and AI analysis behavior in `docs/daily-packaging.md`.
+
 ## 0.1.1 - 2026-07-03
 
 - Added a generated API contract registry for sync, management, docs, and console endpoints.

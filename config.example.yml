@@ -29,6 +29,30 @@ server:
   port: 8765
   token: ""
 
+daily:
+  output_dir: "./data/daily-packages"
+  # Optional. Defaults to "~/.config/systemd/user" when installing the timer.
+  systemd_user_dir: "~/.config/systemd/user"
+  cli_path: "tele-mess-core"
+  ai:
+    provider: "codex-cli"
+    command:
+      - "codex"
+      - "-a"
+      - "never"
+      - "exec"
+      - "--skip-git-repo-check"
+      - "--output-last-message"
+      - "{output}"
+      # Expanded to repeated "--image <path>" args for image-analysis tasks.
+      - "{images}"
+      # Optional placeholder for wrappers/logging: media_image_analysis,
+      # normal_origin_key_extraction, normal_group_analysis,
+      # important_origin_analysis, or final_daily_summary.
+      # - "{task}"
+      - "-"
+    timeout_seconds: 900
+
 logging:
   level: "INFO"
   file: "./logs/tele-mess-core.log"

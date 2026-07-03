@@ -11,6 +11,8 @@ from urllib.request import Request, urlopen
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import (
     AppConfig,
+    DailyAiConfig,
+    DailyPackagingConfig,
     LoggingConfig,
     ServerConfig,
     StorageConfig,
@@ -48,7 +50,19 @@ class SyncApiTest(unittest.TestCase):
             ),
             event_type="new",
         )
-        self.api = SyncApiServer(self.store, "127.0.0.1", 0, token="secret")
+        self.config = AppConfig(
+            storage=StorageConfig(data_dir=Path(self.tmp.name), database=Path(self.tmp.name) / "archive.db"),
+            telegram=TelegramConfig(),
+            server=ServerConfig(),
+            logging=LoggingConfig(file=None),
+            daily=DailyPackagingConfig(
+                output_dir=Path(self.tmp.name) / "daily-packages",
+                systemd_user_dir=Path(self.tmp.name) / "systemd-user",
+                ai=DailyAiConfig(provider="disabled"),
+            ),
+            config_path=Path(self.tmp.name) / "config.yml",
+        )
+        self.api = SyncApiServer(self.store, "127.0.0.1", 0, token="secret", config=self.config)
         self.api.start_background()
         deadline = time.time() + 2
         while self.api._httpd is None and time.time() < deadline:
@@ -138,6 +152,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("tele-mess-core", html)
         self.assertIn("teleMessToken", html)
         self.assertIn('data-view="accounts"', html)
+        self.assertIn('data-view="daily"', html)
         self.assertIn('data-view="people">Members', html)
         self.assertIn("/manage/accounts/auth/request-code", html)
         self.assertIn("/manage/accounts/auth/submit-code", html)
@@ -201,6 +216,15 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("Last message", html)
         self.assertIn("Removed", html)
         self.assertIn("Tags", html)
+        self.assertIn("Important", html)
+        self.assertIn("/manage/origins/important", html)
+        self.assertIn("/manage/daily-package-schedule", html)
+        self.assertIn("/manage/daily-packages", html)
+        self.assertIn("/manage/daily-summaries", html)
+        self.assertIn("/manage/daily-summary-records", html)
+        self.assertIn("daily-summary-records-body", html)
+        self.assertIn("daily-schedule-form", html)
+        self.assertIn("Daily Runs", html)
         self.assertIn("policy-row", html)
         self.assertIn("button.closest('tr').after(row)", html)
         self.assertIn(".raw-panel", html)
@@ -235,6 +259,78 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn(f"Contract hash: `{API_CONTRACT_HASH}`", markdown)
         self.assertIn("GET /manage/api-manifest", markdown)
         self.assertIn("POST /manage/discover-origins", markdown)
+
+    def test_daily_package_and_summary_endpoints(self) -> None:
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-2001,
+                message_id=77,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="daily api payload",
+            ),
+            event_type="new",
+        )
+        self.request_json(
+            "/manage/origins",
+            method="POST",
+            payload={"account_id": "default", "origin_id": -2001, "origin_type": "group", "title": "Daily API"},
+        )
+        important = self.request_json(
+            "/manage/origins/important",
+            method="PATCH",
+            payload={"account_id": "default", "origin_id": -2001, "important": True},
+        )["item"]
+        self.assertTrue(important["important"])
+        self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={"account_id": "default", "origin_id": -2001, "enabled": True, "tags": "web3,info"},
+        )
+
+        schedule = self.request_json(
+            "/manage/daily-package-schedule",
+            method="PATCH",
+            payload={
+                "enabled": True,
+                "time_of_day": "08:30",
+                "timezone": "UTC",
+                "scope": {"tag_groups": ["web3 info"]},
+            },
+        )["item"]
+        self.assertTrue(schedule["installed"])
+        self.assertEqual(schedule["time_of_day"], "08:30")
+
+        package = self.request_json(
+            "/manage/daily-packages",
+            method="POST",
+            payload={"date": "2026-07-03", "timezone": "UTC", "tag_groups": ["web3 info"]},
+        )["item"]
+        self.assertEqual(package["status"], "completed")
+        self.assertEqual(package["message_count"], 1)
+        package_md = self.request_text(f"/manage/daily-package-runs/content?run_id={package['run_id']}&format=md")
+        self.assertIn("Daily Package 2026-07-03", package_md)
+
+        summary = self.request_json(
+            "/manage/daily-summaries",
+            method="POST",
+            payload={"package_run_id": package["run_id"], "background": False},
+        )["item"]
+        self.assertEqual(summary["status"], "completed")
+        summary_md = self.request_text(f"/manage/daily-summary-runs/content?run_id={summary['run_id']}")
+        self.assertIn("AI provider is disabled", summary_md)
+        records = self.request_json(
+            f"/manage/daily-summary-records?package_run_id={package['run_id']}&tag=web3&tags=info&important=true"
+        )["items"]
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["run_id"], summary["run_id"])
+        self.assertIn("AI provider is disabled", records[0]["content_preview"])
+        self.assertNotIn("content_md", records[0])
+        record = self.request_json(f"/manage/daily-summary-records/item?run_id={summary['run_id']}")["item"]
+        self.assertIn("AI provider is disabled", record["content_md"])
+        self.assertEqual(record["tags"], ["web3", "info"])
 
     def test_api_manifest_requires_token(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/manage/api-manifest")

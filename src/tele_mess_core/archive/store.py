@@ -14,6 +14,10 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailyPackageRunRecord,
+    DailyPackageScheduleRecord,
+    DailySummaryRecord,
+    DailySummaryRunRecord,
     MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
@@ -24,7 +28,7 @@ from tele_mess_core.models import (
 )
 
 
-SCHEMA_VERSION = "8"
+SCHEMA_VERSION = "10"
 
 
 class ArchiveStore:
@@ -258,15 +262,16 @@ class ArchiveStore:
                 """
                 INSERT INTO origins(
                   source, account_id, origin_id, topic_id, origin_type, parent_origin_id,
-                  title, username, is_forum, archived_at, last_message_at, discovered_at, updated_at, raw_json
+                  title, username, is_forum, important, archived_at, last_message_at, discovered_at, updated_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
                   origin_type = excluded.origin_type,
                   parent_origin_id = excluded.parent_origin_id,
                   title = excluded.title,
                   username = excluded.username,
                   is_forum = excluded.is_forum,
+                  important = CASE WHEN excluded.important = 1 THEN 1 ELSE origins.important END,
                   last_message_at = COALESCE(excluded.last_message_at, origins.last_message_at),
                   updated_at = excluded.updated_at,
                   raw_json = excluded.raw_json
@@ -281,6 +286,7 @@ class ArchiveStore:
                     origin.title,
                     origin.username,
                     int(origin.is_forum),
+                    int(origin.important),
                     archived_at,
                     origin.last_message_at,
                     discovered_at,
@@ -377,7 +383,7 @@ class ArchiveStore:
             SELECT
               o.source, o.account_id, o.origin_id, o.topic_id, o.origin_type,
               o.parent_origin_id, o.title, o.username, o.is_forum,
-              o.archived_at, o.last_message_at, o.discovered_at, o.updated_at, o.raw_json,
+              o.important, o.archived_at, o.last_message_at, o.discovered_at, o.updated_at, o.raw_json,
               p.enabled AS backup_enabled,
               p.capture_text,
               p.capture_media_metadata,
@@ -414,7 +420,7 @@ class ArchiveStore:
             data = _row_to_dict(
                 row,
                 json_fields={"raw_json"},
-                bool_fields={"is_forum", "backup_enabled", "capture_text", "capture_media_metadata", "download_media"},
+                bool_fields={"is_forum", "important", "backup_enabled", "capture_text", "capture_media_metadata", "download_media"},
             )
             backup_enabled = data.pop("backup_enabled")
             if backup_enabled is None:
@@ -435,6 +441,26 @@ class ArchiveStore:
                 }
             items.append(data)
         return items
+
+    def set_origin_important(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+        important: bool = True,
+    ) -> int:
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE origins
+                SET important = ?, updated_at = ?
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+                (int(important), utc_now_iso(), source, account_id, origin_id, topic_id),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def set_backup_policy(self, policy: BackupPolicyRecord) -> None:
         now = policy.updated_at or utc_now_iso()
@@ -1016,6 +1042,472 @@ class ArchiveStore:
             grouped.setdefault(key, []).append(item)
         return grouped
 
+    def list_messages_for_origin_window(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+        window_start: str = "",
+        window_end: str = "",
+        limit: int = 10000,
+    ) -> list[dict[str, Any]]:
+        clauses = [
+            "m.source = ?",
+            "m.account_id = ?",
+            "m.chat_id = ?",
+            "m.sent_at >= ?",
+            "m.sent_at < ?",
+        ]
+        params: list[Any] = [source, account_id, origin_id, window_start, window_end]
+        if topic_id:
+            clauses.append("COALESCE(m.topic_id, 0) = ?")
+            params.append(topic_id)
+        sql = f"""
+            SELECT
+              m.source, m.account_id, m.chat_id, m.message_id, m.topic_id, m.sender_id, m.sender_name,
+              m.sender_username, m.sent_at, m.edited_at, m.ingested_at, m.deleted_at,
+              m.text, m.has_media, m.media_kind, m.grouped_id, m.reply_to_message_id,
+              m.forward_from_id, m.forward_from_name, m.permalink, m.reactions_json,
+              m.raw_json, m.version,
+              COALESCE(c.title, o.title) AS chat_title,
+              o.title AS origin_title
+            FROM messages m
+            LEFT JOIN chats c
+              ON c.source = m.source
+             AND c.account_id = m.account_id
+             AND c.chat_id = m.chat_id
+            LEFT JOIN origins o
+              ON o.source = m.source
+             AND o.account_id = m.account_id
+             AND o.origin_id = m.chat_id
+             AND o.topic_id = COALESCE(m.topic_id, 0)
+            WHERE {" AND ".join(clauses)}
+            ORDER BY m.sent_at ASC, m.message_id ASC
+            LIMIT ?
+        """
+        params.append(_bounded_limit(limit, max_limit=50000))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}, bool_fields={"has_media"}) for row in rows]
+
+    def get_daily_package_schedule(self) -> dict[str, Any]:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT enabled, time_of_day, timezone, scope_json, system_manager,
+                       installed, last_installed_at, last_error, updated_at
+                FROM daily_package_schedule
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return {
+                "enabled": False,
+                "time_of_day": "08:00",
+                "timezone": "Asia/Tokyo",
+                "scope": {},
+                "system_manager": "systemd-user",
+                "installed": False,
+                "last_installed_at": None,
+                "last_error": None,
+                "updated_at": None,
+            }
+        data = _row_to_dict(row, json_fields={"scope_json"}, bool_fields={"enabled", "installed"})
+        data["scope"] = data.pop("scope_json") or {}
+        return data
+
+    def set_daily_package_schedule(self, schedule: DailyPackageScheduleRecord) -> dict[str, Any]:
+        now = schedule.updated_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_package_schedule(
+                  id, enabled, time_of_day, timezone, scope_json, system_manager,
+                  installed, last_installed_at, last_error, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  enabled = excluded.enabled,
+                  time_of_day = excluded.time_of_day,
+                  timezone = excluded.timezone,
+                  scope_json = excluded.scope_json,
+                  system_manager = excluded.system_manager,
+                  installed = excluded.installed,
+                  last_installed_at = excluded.last_installed_at,
+                  last_error = excluded.last_error,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    int(schedule.enabled),
+                    schedule.time_of_day,
+                    schedule.timezone,
+                    schedule.scope_json,
+                    schedule.system_manager,
+                    int(schedule.installed),
+                    schedule.last_installed_at,
+                    schedule.last_error,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        return self.get_daily_package_schedule()
+
+    def upsert_daily_package_run(self, run: DailyPackageRunRecord) -> dict[str, Any]:
+        started_at = run.started_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_package_runs(
+                  run_id, status, date, timezone, scope_json, output_dir,
+                  package_json_path, package_md_path, origin_count, message_count,
+                  media_count, important_origin_count, error, started_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                  status = excluded.status,
+                  date = excluded.date,
+                  timezone = excluded.timezone,
+                  scope_json = excluded.scope_json,
+                  output_dir = excluded.output_dir,
+                  package_json_path = excluded.package_json_path,
+                  package_md_path = excluded.package_md_path,
+                  origin_count = excluded.origin_count,
+                  message_count = excluded.message_count,
+                  media_count = excluded.media_count,
+                  important_origin_count = excluded.important_origin_count,
+                  error = excluded.error,
+                  finished_at = excluded.finished_at
+                """,
+                (
+                    run.run_id,
+                    run.status,
+                    run.date,
+                    run.timezone,
+                    run.scope_json,
+                    run.output_dir,
+                    run.package_json_path,
+                    run.package_md_path,
+                    int(run.origin_count),
+                    int(run.message_count),
+                    int(run.media_count),
+                    int(run.important_origin_count),
+                    run.error,
+                    started_at,
+                    run.finished_at,
+                ),
+            )
+            self._conn.commit()
+        item = self.get_daily_package_run(run.run_id)
+        if item is None:
+            raise ValueError("daily package run was not persisted")
+        return item
+
+    def get_daily_package_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT run_id, status, date, timezone, scope_json, output_dir,
+                       package_json_path, package_md_path, origin_count, message_count,
+                       media_count, important_origin_count, error, started_at, finished_at
+                FROM daily_package_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        data = _row_to_dict(row, json_fields={"scope_json"})
+        data["scope"] = data.pop("scope_json") or {}
+        return data
+
+    def list_daily_package_runs(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
+        sql = """
+            SELECT run_id, status, date, timezone, scope_json, output_dir,
+                   package_json_path, package_md_path, origin_count, message_count,
+                   media_count, important_origin_count, error, started_at, finished_at
+            FROM daily_package_runs
+        """
+        params: list[Any] = []
+        if status:
+            sql += " WHERE status = ?"
+            params.append(status)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(_bounded_limit(limit, max_limit=500))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        items = []
+        for row in rows:
+            data = _row_to_dict(row, json_fields={"scope_json"})
+            data["scope"] = data.pop("scope_json") or {}
+            items.append(data)
+        return items
+
+    def upsert_daily_summary_run(self, run: DailySummaryRunRecord) -> dict[str, Any]:
+        started_at = run.started_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_summary_runs(
+                  run_id, status, package_run_id, date, timezone, scope_json,
+                  output_dir, summary_path, provider, origin_count, group_count,
+                  image_count, error, started_at, finished_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(run_id) DO UPDATE SET
+                  status = excluded.status,
+                  package_run_id = excluded.package_run_id,
+                  date = excluded.date,
+                  timezone = excluded.timezone,
+                  scope_json = excluded.scope_json,
+                  output_dir = excluded.output_dir,
+                  summary_path = excluded.summary_path,
+                  provider = excluded.provider,
+                  origin_count = excluded.origin_count,
+                  group_count = excluded.group_count,
+                  image_count = excluded.image_count,
+                  error = excluded.error,
+                  finished_at = excluded.finished_at
+                """,
+                (
+                    run.run_id,
+                    run.status,
+                    run.package_run_id,
+                    run.date,
+                    run.timezone,
+                    run.scope_json,
+                    run.output_dir,
+                    run.summary_path,
+                    run.provider,
+                    int(run.origin_count),
+                    int(run.group_count),
+                    int(run.image_count),
+                    run.error,
+                    started_at,
+                    run.finished_at,
+                ),
+            )
+            self._conn.commit()
+        item = self.get_daily_summary_run(run.run_id)
+        if item is None:
+            raise ValueError("daily summary run was not persisted")
+        return item
+
+    def get_daily_summary_run(self, run_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT run_id, status, package_run_id, date, timezone, scope_json,
+                       output_dir, summary_path, provider, origin_count, group_count,
+                       image_count, error, started_at, finished_at
+                FROM daily_summary_runs
+                WHERE run_id = ?
+                """,
+                (run_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        data = _row_to_dict(row, json_fields={"scope_json"})
+        data["scope"] = data.pop("scope_json") or {}
+        return data
+
+    def list_daily_summary_runs(
+        self,
+        package_run_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT run_id, status, package_run_id, date, timezone, scope_json,
+                   output_dir, summary_path, provider, origin_count, group_count,
+                   image_count, error, started_at, finished_at
+            FROM daily_summary_runs
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if package_run_id:
+            clauses.append("package_run_id = ?")
+            params.append(package_run_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(_bounded_limit(limit, max_limit=500))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        items = []
+        for row in rows:
+            data = _row_to_dict(row, json_fields={"scope_json"})
+            data["scope"] = data.pop("scope_json") or {}
+            items.append(data)
+        return items
+
+    def upsert_daily_summary_record(self, record: DailySummaryRecord) -> dict[str, Any]:
+        now = record.updated_at or utc_now_iso()
+        created_at = record.created_at or now
+        content_length = record.content_length or len(record.content_md)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_summary_records(
+                  summary_id, run_id, package_run_id, date, timezone, scope_json,
+                  tags_json, important, provider, title, content_md, content_json,
+                  summary_path, origin_count, group_count, image_count, content_length,
+                  created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(summary_id) DO UPDATE SET
+                  run_id = excluded.run_id,
+                  package_run_id = excluded.package_run_id,
+                  date = excluded.date,
+                  timezone = excluded.timezone,
+                  scope_json = excluded.scope_json,
+                  tags_json = excluded.tags_json,
+                  important = excluded.important,
+                  provider = excluded.provider,
+                  title = excluded.title,
+                  content_md = excluded.content_md,
+                  content_json = excluded.content_json,
+                  summary_path = excluded.summary_path,
+                  origin_count = excluded.origin_count,
+                  group_count = excluded.group_count,
+                  image_count = excluded.image_count,
+                  content_length = excluded.content_length,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    record.summary_id,
+                    record.run_id,
+                    record.package_run_id,
+                    record.date,
+                    record.timezone,
+                    record.scope_json,
+                    record.tags_json,
+                    int(record.important),
+                    record.provider,
+                    record.title,
+                    record.content_md,
+                    record.content_json,
+                    record.summary_path,
+                    int(record.origin_count),
+                    int(record.group_count),
+                    int(record.image_count),
+                    int(content_length),
+                    created_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        item = self.get_daily_summary_record(summary_id=record.summary_id)
+        if item is None:
+            raise ValueError("daily summary record was not persisted")
+        return item
+
+    def get_daily_summary_record(
+        self,
+        *,
+        summary_id: str | None = None,
+        run_id: str | None = None,
+    ) -> dict[str, Any] | None:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if summary_id:
+            clauses.append("summary_id = ?")
+            params.append(summary_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if not clauses:
+            return None
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
+                       tags_json, important, provider, title, content_md, content_json,
+                       summary_path, origin_count, group_count, image_count, content_length,
+                       created_at, updated_at
+                FROM daily_summary_records
+                WHERE """ + " AND ".join(clauses),
+                tuple(params),
+            ).fetchone()
+        if row is None:
+            return None
+        return _summary_record_from_row(row, include_content=True)
+
+    def list_daily_summary_records(
+        self,
+        *,
+        summary_id: str | None = None,
+        run_id: str | None = None,
+        package_run_id: str | None = None,
+        date: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        provider: str | None = None,
+        important: bool | None = None,
+        tags: list[str] | None = None,
+        q: str | None = None,
+        include_content: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
+                   tags_json, important, provider, title, content_md, content_json,
+                   summary_path, origin_count, group_count, image_count, content_length,
+                   created_at, updated_at
+            FROM daily_summary_records
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if summary_id:
+            clauses.append("summary_id = ?")
+            params.append(summary_id)
+        if run_id:
+            clauses.append("run_id = ?")
+            params.append(run_id)
+        if package_run_id:
+            clauses.append("package_run_id = ?")
+            params.append(package_run_id)
+        if date:
+            clauses.append("date = ?")
+            params.append(date)
+        if date_from:
+            clauses.append("date >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("date <= ?")
+            params.append(date_to)
+        if provider:
+            clauses.append("provider = ?")
+            params.append(provider)
+        if important is not None:
+            clauses.append("important = ?")
+            params.append(int(important))
+        if q:
+            clauses.append("(title LIKE ? OR content_md LIKE ?)")
+            params.extend((f"%{q}%", f"%{q}%"))
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY created_at DESC LIMIT ?"
+        requested_limit = _bounded_limit(limit, max_limit=500)
+        params.append(500 if tags else requested_limit)
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        required_tags = {_normalize_tag(tag) for tag in (tags or []) if _normalize_tag(tag)}
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            item = _summary_record_from_row(row, include_content=include_content)
+            if required_tags:
+                item_tags = {_normalize_tag(tag) for tag in item.get("tags") or []}
+                if not required_tags.issubset(item_tags):
+                    continue
+            items.append(item)
+            if len(items) >= requested_limit:
+                break
+        return items
+
     def add_operation_event(self, event: OperationEventRecord) -> int:
         occurred_at = event.occurred_at or utc_now_iso()
         with self._lock:
@@ -1313,6 +1805,8 @@ class ArchiveStore:
             self._conn.execute("ALTER TABLE origins ADD COLUMN archived_at TEXT")
         if self._has_table("origins") and not self._has_column("origins", "last_message_at"):
             self._conn.execute("ALTER TABLE origins ADD COLUMN last_message_at TEXT")
+        if self._has_table("origins") and not self._has_column("origins", "important"):
+            self._conn.execute("ALTER TABLE origins ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
 
@@ -1420,6 +1914,23 @@ def _row_to_dict(
         if key in data and data[key] is not None:
             data[key] = bool(data[key])
     return data
+
+
+def _summary_record_from_row(row: sqlite3.Row, *, include_content: bool) -> dict[str, Any]:
+    data = _row_to_dict(row, json_fields={"scope_json", "tags_json", "content_json"}, bool_fields={"important"})
+    data["scope"] = data.pop("scope_json") or {}
+    data["tags"] = data.pop("tags_json") or []
+    content = str(data.get("content_md") or "")
+    data["content_preview"] = content[:240]
+    data["content_length"] = int(data.get("content_length") or len(content))
+    if not include_content:
+        data.pop("content_md", None)
+        data.pop("content_json", None)
+    return data
+
+
+def _normalize_tag(tag: Any) -> str:
+    return str(tag or "").strip().lower()
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

@@ -40,6 +40,36 @@ def main(argv: list[str] | None = None) -> int:
     smoke_parser.add_argument("--discover-origins", action="store_true", help="Run live origin discovery after auth status")
     smoke_parser.add_argument("--topic-limit", type=int, default=20, help="Max forum topics to inspect during discovery")
 
+    daily_package_parser = sub.add_parser("daily-package", help="Generate a daily package from archived messages")
+    add_config_arg(daily_package_parser)
+    daily_package_parser.add_argument("--date", help="Local package date in YYYY-MM-DD. Defaults to yesterday in the target timezone.")
+    daily_package_parser.add_argument("--timezone", help="Timezone for the local day window")
+    daily_package_parser.add_argument("--account-id", help="Filter to one account")
+    daily_package_parser.add_argument("--origin-id", type=int, help="Filter to one origin")
+    daily_package_parser.add_argument("--topic-id", type=int, help="Filter to one topic")
+    daily_package_parser.add_argument("--tags", help="Comma-separated tags that all selected origins must have")
+    daily_package_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
+    daily_package_parser.add_argument("--scheduled", action="store_true", help="Use saved daily package schedule scope/timezone")
+
+    daily_summary_parser = sub.add_parser("daily-summary", help="Run AI analysis for a daily package")
+    add_config_arg(daily_summary_parser)
+    daily_summary_parser.add_argument("--package-run-id", help="Daily package run ID to summarize")
+    daily_summary_parser.add_argument("--date", help="Local package date in YYYY-MM-DD when no package run is supplied")
+    daily_summary_parser.add_argument("--timezone", help="Timezone for the local day window")
+    daily_summary_parser.add_argument("--account-id", help="Filter to one account when building a package first")
+    daily_summary_parser.add_argument("--origin-id", type=int, help="Filter to one origin when building a package first")
+    daily_summary_parser.add_argument("--topic-id", type=int, help="Filter to one topic when building a package first")
+    daily_summary_parser.add_argument("--tags", help="Comma-separated tags when building a package first")
+    daily_summary_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
+
+    daily_schedule_parser = sub.add_parser("daily-schedule", help="Install or remove the system daily package timer")
+    add_config_arg(daily_schedule_parser)
+    daily_schedule_sub = daily_schedule_parser.add_subparsers(dest="daily_schedule_command", required=True)
+    daily_schedule_install = daily_schedule_sub.add_parser("install", help="Write and optionally activate the systemd user timer")
+    daily_schedule_install.add_argument("--activate-systemd", action="store_true", help="Run systemctl --user enable/disable after writing timer files")
+    daily_schedule_remove = daily_schedule_sub.add_parser("remove", help="Disable the saved daily schedule and rewrite timer files")
+    daily_schedule_remove.add_argument("--activate-systemd", action="store_true", help="Run systemctl --user disable after writing timer files")
+
     import_parser = sub.add_parser("import-ndjson", help="Import legacy .bak NDJSON messages")
     add_config_arg(import_parser)
     import_parser.add_argument("path", help="NDJSON backup file")
@@ -76,6 +106,15 @@ def main(argv: list[str] | None = None) -> int:
             return _run_async(_run_server(config, store))
         if args.command == "smoke-telegram":
             return _run_async(_smoke_telegram(config, store, args.account_id, args.discover_origins, args.topic_limit))
+        if args.command == "daily-package":
+            _daily_package(config, store, args)
+            return 0
+        if args.command == "daily-summary":
+            _daily_summary(config, store, args)
+            return 0
+        if args.command == "daily-schedule":
+            _daily_schedule(config, store, args)
+            return 0
         if args.command == "import-ndjson":
             _import_ndjson(store, Path(args.path), args.chat_id, args.account_id)
             logger.info("Imported %s", args.path)
@@ -244,6 +283,58 @@ def _run_async(coro: object) -> int:
         return result if isinstance(result, int) else 0
     except KeyboardInterrupt:
         return 130
+
+
+def _daily_package(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
+    from tele_mess_core.daily import build_daily_package
+
+    schedule = store.get_daily_package_schedule() if args.scheduled else {}
+    scope = dict(schedule.get("scope") or {}) if args.scheduled else {}
+    scope.update(_daily_scope_from_args(args))
+    timezone_name = args.timezone or schedule.get("timezone") or scope.get("timezone")
+    item = build_daily_package(store, config, run_date=args.date, timezone_name=timezone_name, scope=scope)
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
+    from tele_mess_core.daily import run_daily_summary
+
+    scope = _daily_scope_from_args(args)
+    item = run_daily_summary(
+        store,
+        config,
+        package_run_id=args.package_run_id,
+        run_date=args.date,
+        timezone_name=args.timezone,
+        scope=scope,
+    )
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _daily_schedule(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
+    from tele_mess_core.daily import update_daily_package_schedule
+
+    current = store.get_daily_package_schedule()
+    payload = dict(current)
+    payload["enabled"] = args.daily_schedule_command == "install"
+    payload["activate_systemd"] = bool(args.activate_systemd)
+    item = update_daily_package_schedule(store, config, payload)
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _daily_scope_from_args(args: argparse.Namespace) -> dict[str, object]:
+    scope: dict[str, object] = {}
+    if getattr(args, "account_id", None):
+        scope["account_id"] = args.account_id
+    if getattr(args, "origin_id", None) is not None:
+        scope["origin_id"] = args.origin_id
+    if getattr(args, "topic_id", None) is not None:
+        scope["topic_id"] = args.topic_id
+    if getattr(args, "tags", None):
+        scope["tags"] = args.tags
+    if getattr(args, "tag_group", None):
+        scope["tag_groups"] = args.tag_group
+    return scope
 
 
 def _import_ndjson(store: ArchiveStore, path: Path, chat_id: int, account_id: str) -> None:

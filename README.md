@@ -8,10 +8,12 @@ for remote clients. The core is meant to run as a long-running local database an
 control plane: clients manage account authentication, origin discovery, backup
 selection, capture policy, topics, and participant metadata through the core API.
 
-It intentionally does not forward messages to backup Telegram groups and does not
-run summary generation on the server. See
+It intentionally does not forward messages to backup Telegram groups. Daily
+package generation and local Codex-backed daily summaries run as local jobs
+against the archive. See
 [docs/product-direction.md](docs/product-direction.md) for the management
-interface direction.
+interface direction and [docs/daily-packaging.md](docs/daily-packaging.md) for
+daily package and AI analysis details.
 
 ## Current Scope
 
@@ -27,6 +29,9 @@ interface direction.
   Telegram sessions.
 - Runtime operation events for Telegram auth/discovery/media-download failures.
 - Server daemon mode for devNuc-style always-on deployment.
+- Daily package generation by origin, tag group, timezone, and local date.
+- Local Codex-backed daily summary runs with configurable AI command templates.
+- System-managed daily package scheduling through user-level systemd timer files.
 
 ## Quick Start
 
@@ -42,7 +47,8 @@ tele-mess-core run-server --config config.yml
 
 The first Telethon run may ask for Telegram login if no session file exists.
 See [docs/server-mode.md](docs/server-mode.md) for the devNuc-style deployment
-shape and client sync contract.
+shape and client sync contract. See [docs/daily-packaging.md](docs/daily-packaging.md)
+for the daily packaging, scheduling, and staged AI analysis workflow.
 
 Use `telegram.accounts[]` for multi-account auth/runtime configuration. Message
 capture sources are managed in SQLite through origin discovery plus backup
@@ -76,6 +82,13 @@ policies; `telegram.chats` in config is no longer used.
 - `POST /manage/participants`
 - `GET /manage/capture-cursors?account_id=main`
 - `GET /manage/operation-events?account_id=main&status=failed`
+- `GET` or `PATCH /manage/daily-package-schedule`
+- `POST /manage/daily-packages`
+- `GET /manage/daily-package-runs`
+- `POST /manage/daily-summaries`
+- `GET /manage/daily-summary-runs`
+- `GET /manage/daily-summary-records`
+- `GET /manage/daily-summary-records/item`
 - `POST /manage/discover-origins`
 - `POST /manage/participants/refresh`
 - `GET /console`
@@ -128,11 +141,38 @@ directory next to the SQLite database. Download failures are retried according
 to `telegram.media_download` and then recorded in `/manage/operation-events`
 if they still fail.
 
+## Daily Packaging
+
+Daily packages are generated from already archived messages. The run selects
+enabled, non-removed backup origins by account, origin, topic, tag intersection,
+or tag groups. Tag groups are assigned from most-specific to least-specific so a
+`web3,it,info` origin is removed from broader `web3,info` processing after it is
+assigned.
+
+Origin rows can be marked `important`; important origins are packaged separately
+and analyzed per origin before the final rollup. Summary runs use a staged AI
+pipeline:
+
+- image media analysis with OCR/visual extraction through Codex image inputs;
+- non-image long media such as PDF/video preserved as file references;
+- normal-origin key information extraction;
+- normal tag-group analysis;
+- important-origin analysis;
+- final daily rollup from those stage outputs.
+
+Package and summary artifacts are written under the configured daily output
+directory, while SQLite stores run status, paths, counts, errors, and completed
+summary Markdown for API lookup/filtering.
+
+The default AI provider is a configurable local `codex exec` command template
+using `--output-last-message`. Templates can use `{output}`, `{images}`, and
+`{task}`. Set `daily.ai.provider: disabled` only for local testing or dry runs.
+
 ## Design Boundary
 
-The server is responsible for durable collection, sync, and capture-management
-state. Client-side features such as search UI, summaries, labels, AI workflows,
-and higher-level processing should live in the Mac app.
+The server is responsible for durable collection, sync, capture-management
+state, daily packaging, and local daily analysis jobs. Client-side features such
+as labels and app-specific UI state should live in the Mac app.
 
 ## License
 

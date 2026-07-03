@@ -12,6 +12,7 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailySummaryRecord,
     MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
@@ -250,11 +251,27 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual({origin["origin_type"] for origin in origins}, {"group", "topic"})
         group = next(origin for origin in origins if origin["topic_id"] == 0)
         self.assertEqual(group["last_message_at"], "2026-01-01T00:00:00+00:00")
+        self.assertFalse(group["important"])
         topic = next(origin for origin in origins if origin["topic_id"] == 42)
         self.assertTrue(topic["backup_policy"]["enabled"])
         self.assertTrue(topic["backup_policy"]["capture_media_metadata"])
         self.assertFalse(topic["backup_policy"]["download_media"])
         self.assertEqual(topic["backup_policy"]["tags"], "ops,important")
+
+        self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 42, True)
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                topic_id=42,
+                origin_type="topic",
+                parent_origin_id=-1001,
+                title="Important Topic",
+            )
+        )
+        topic = next(origin for origin in self.store.list_origins(account_id="main") if origin["topic_id"] == 42)
+        self.assertTrue(topic["important"])
 
         self.store.upsert_capture_cursor(
             CaptureCursorRecord(
@@ -453,6 +470,41 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(self.store.list_operation_events(account_id="main", status="failed"), [])
         self.assertEqual(self.store.state()["operation_error_count"], 0)
 
+    def test_daily_summary_records_are_queryable_by_tags_and_flags(self) -> None:
+        self.store.upsert_daily_summary_record(
+            DailySummaryRecord(
+                summary_id="sum_a",
+                run_id="sum_a",
+                package_run_id="pkg_a",
+                date="2026-07-03",
+                timezone="UTC",
+                tags_json='["web3", "info"]',
+                important=True,
+                provider="disabled",
+                title="Daily Summary 2026-07-03",
+                content_md="# Daily Summary\n\nweb3 alpha",
+                content_json='{"source":"test"}',
+                summary_path="/tmp/summary.md",
+                origin_count=1,
+                group_count=1,
+            )
+        )
+
+        listed = self.store.list_daily_summary_records(tags=["web3", "info"], important=True)
+
+        self.assertEqual(len(listed), 1)
+        self.assertEqual(listed[0]["summary_id"], "sum_a")
+        self.assertEqual(listed[0]["tags"], ["web3", "info"])
+        self.assertNotIn("content_md", listed[0])
+        self.assertIn("web3 alpha", listed[0]["content_preview"])
+
+        fetched = self.store.get_daily_summary_record(run_id="sum_a")
+        assert fetched is not None
+        self.assertEqual(fetched["content_md"], "# Daily Summary\n\nweb3 alpha")
+        self.assertEqual(fetched["content_json"]["source"], "test")
+
+        self.assertEqual(self.store.list_daily_summary_records(tags=["web3", "ai"]), [])
+
 
 class ArchiveMigrationTest(unittest.TestCase):
     def test_v1_database_migrates_to_account_aware_schema(self) -> None:
@@ -499,7 +551,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "8")
+                self.assertEqual(store.state()["schema_version"], "10")
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")

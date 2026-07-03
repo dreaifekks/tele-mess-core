@@ -547,6 +547,441 @@
         ],
         "type": "object"
       },
+      "DailyPackageRun": {
+        "properties": {
+          "date": {
+            "type": "string"
+          },
+          "error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "finished_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "important_origin_count": {
+            "type": "integer"
+          },
+          "media_count": {
+            "type": "integer"
+          },
+          "message_count": {
+            "type": "integer"
+          },
+          "origin_count": {
+            "type": "integer"
+          },
+          "output_dir": {
+            "nullable": true,
+            "type": "string"
+          },
+          "package_json_path": {
+            "nullable": true,
+            "type": "string"
+          },
+          "package_md_path": {
+            "nullable": true,
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "started_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "status",
+          "date",
+          "timezone"
+        ],
+        "type": "object"
+      },
+      "DailyPackageRunInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "tag_groups": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "type": "string"
+          },
+          "timezone": {
+            "default": "Asia/Tokyo",
+            "type": "string"
+          },
+          "topic_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "DailyPackageRunListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DailyPackageRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DailyPackageRunResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailyPackageRun"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailyPackageSchedule": {
+        "properties": {
+          "enabled": {
+            "type": "boolean"
+          },
+          "installed": {
+            "type": "boolean"
+          },
+          "last_error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "last_installed_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "system_manager": {
+            "type": "string"
+          },
+          "time_of_day": {
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "time_of_day",
+          "timezone",
+          "scope",
+          "system_manager",
+          "installed"
+        ],
+        "type": "object"
+      },
+      "DailyPackageScheduleInput": {
+        "properties": {
+          "activate_systemd": {
+            "default": false,
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "system_manager": {
+            "default": "systemd-user",
+            "type": "string"
+          },
+          "time_of_day": {
+            "default": "08:00",
+            "type": "string"
+          },
+          "timezone": {
+            "default": "Asia/Tokyo",
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "DailyPackageScheduleResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailyPackageSchedule"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRecord": {
+        "properties": {
+          "content_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "content_length": {
+            "type": "integer"
+          },
+          "content_md": {
+            "type": "string"
+          },
+          "content_preview": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "date": {
+            "nullable": true,
+            "type": "string"
+          },
+          "group_count": {
+            "type": "integer"
+          },
+          "image_count": {
+            "type": "integer"
+          },
+          "important": {
+            "type": "boolean"
+          },
+          "origin_count": {
+            "type": "integer"
+          },
+          "package_run_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "provider": {
+            "nullable": true,
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "summary_id": {
+            "type": "string"
+          },
+          "summary_path": {
+            "nullable": true,
+            "type": "string"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "timezone": {
+            "nullable": true,
+            "type": "string"
+          },
+          "title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "summary_id",
+          "run_id",
+          "content_preview"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRecordListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DailySummaryRecord"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRecordResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailySummaryRecord"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRun": {
+        "properties": {
+          "date": {
+            "nullable": true,
+            "type": "string"
+          },
+          "error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "finished_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "group_count": {
+            "type": "integer"
+          },
+          "image_count": {
+            "type": "integer"
+          },
+          "origin_count": {
+            "type": "integer"
+          },
+          "output_dir": {
+            "nullable": true,
+            "type": "string"
+          },
+          "package_run_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "provider": {
+            "nullable": true,
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "started_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "summary_path": {
+            "nullable": true,
+            "type": "string"
+          },
+          "timezone": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "run_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRunInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "background": {
+            "default": true,
+            "type": "boolean"
+          },
+          "date": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "package_run_id": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "tag_groups": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags": {
+            "type": "string"
+          },
+          "timezone": {
+            "default": "Asia/Tokyo",
+            "type": "string"
+          },
+          "topic_id": {
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "DailySummaryRunListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DailySummaryRun"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRunResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailySummaryRun"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
       "DiscoveryInput": {
         "properties": {
           "account_id": {
@@ -1083,6 +1518,9 @@
             "nullable": true,
             "type": "string"
           },
+          "important": {
+            "type": "boolean"
+          },
           "is_forum": {
             "type": "boolean"
           },
@@ -1223,10 +1661,41 @@
         ],
         "type": "object"
       },
+      "OriginImportantInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "important": {
+            "default": true,
+            "type": "boolean"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id"
+        ],
+        "type": "object"
+      },
       "OriginInput": {
         "properties": {
           "account_id": {
             "type": "string"
+          },
+          "important": {
+            "default": false,
+            "type": "boolean"
           },
           "is_forum": {
             "default": false,
@@ -1587,8 +2056,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-03.1",
-    "x-contract-hash": "56d36c6eac0a0f95"
+    "version": "2026-07-03.3",
+    "x-contract-hash": "1975e0cadf569537"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -2772,6 +3241,850 @@
         ]
       }
     },
+    "/manage/daily-package-runs": {
+      "get": {
+        "operationId": "get_manage_daily_package_runs",
+        "parameters": [
+          {
+            "description": "Filter by run status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyPackageRunListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List daily package runs.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-package-runs/content": {
+      "get": {
+        "operationId": "get_manage_daily_package_runs_content",
+        "parameters": [
+          {
+            "description": "Daily package run ID.",
+            "in": "query",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Content format: md or json.",
+            "in": "query",
+            "name": "format",
+            "required": false,
+            "schema": {
+              "default": "md",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/markdown": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return daily package run content.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-package-schedule": {
+      "get": {
+        "operationId": "get_manage_daily_package_schedule",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyPackageScheduleResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return the daily package system schedule.",
+        "tags": [
+          "management"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_manage_daily_package_schedule",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailyPackageScheduleInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyPackageScheduleResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Update the daily package system schedule.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-packages": {
+      "post": {
+        "operationId": "post_manage_daily_packages",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailyPackageRunInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyPackageRunResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Generate a daily package immediately.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summaries": {
+      "post": {
+        "operationId": "post_manage_daily_summaries",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryRunInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRunResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Run a daily summary immediately.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-records": {
+      "get": {
+        "operationId": "get_manage_daily_summary_records",
+        "parameters": [
+          {
+            "description": "Filter by summary content ID.",
+            "in": "query",
+            "name": "summary_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by summary run ID.",
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by package run ID.",
+            "in": "query",
+            "name": "package_run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by local summary date.",
+            "in": "query",
+            "name": "date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter summaries on or after this local date.",
+            "in": "query",
+            "name": "date_from",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter summaries on or before this local date.",
+            "in": "query",
+            "name": "date_to",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by AI provider.",
+            "in": "query",
+            "name": "provider",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter summaries that include important origins.",
+            "in": "query",
+            "name": "important",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Required tag. Repeatable; all tags must match.",
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated required tags; all tags must match.",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by title or Markdown content substring.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include full Markdown content in list items.",
+            "in": "query",
+            "name": "include_content",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRecordListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List stored daily summary contents.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-records/item": {
+      "get": {
+        "operationId": "get_manage_daily_summary_records_item",
+        "parameters": [
+          {
+            "description": "Summary content ID.",
+            "in": "query",
+            "name": "summary_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Summary run ID.",
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRecordResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return one stored daily summary content record.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-runs": {
+      "get": {
+        "operationId": "get_manage_daily_summary_runs",
+        "parameters": [
+          {
+            "description": "Filter by package run ID.",
+            "in": "query",
+            "name": "package_run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by run status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRunListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List daily summary runs.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-runs/content": {
+      "get": {
+        "operationId": "get_manage_daily_summary_runs_content",
+        "parameters": [
+          {
+            "description": "Daily summary run ID.",
+            "in": "query",
+            "name": "run_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "text/markdown": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return daily summary run content.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
     "/manage/discover-origins": {
       "post": {
         "operationId": "post_manage_discover_origins",
@@ -3275,6 +4588,75 @@
           }
         ],
         "summary": "Archive or restore an origin.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/origins/important": {
+      "patch": {
+        "operationId": "patch_manage_origins_important",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OriginImportantInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Mark or unmark an origin as important.",
         "tags": [
           "management"
         ]

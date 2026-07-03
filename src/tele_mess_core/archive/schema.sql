@@ -65,6 +65,7 @@ CREATE TABLE IF NOT EXISTS origins (
   title TEXT,
   username TEXT,
   is_forum INTEGER NOT NULL DEFAULT 0,
+  important INTEGER NOT NULL DEFAULT 0,
   archived_at TEXT,
   last_message_at TEXT,
   discovered_at TEXT NOT NULL,
@@ -174,6 +175,77 @@ CREATE TABLE IF NOT EXISTS operation_events (
   raw_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS daily_package_schedule (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0,
+  time_of_day TEXT NOT NULL DEFAULT '08:00',
+  timezone TEXT NOT NULL DEFAULT 'Asia/Tokyo',
+  scope_json TEXT,
+  system_manager TEXT NOT NULL DEFAULT 'systemd-user',
+  installed INTEGER NOT NULL DEFAULT 0,
+  last_installed_at TEXT,
+  last_error TEXT,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_package_runs (
+  run_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  date TEXT NOT NULL,
+  timezone TEXT NOT NULL,
+  scope_json TEXT,
+  output_dir TEXT,
+  package_json_path TEXT,
+  package_md_path TEXT,
+  origin_count INTEGER NOT NULL DEFAULT 0,
+  message_count INTEGER NOT NULL DEFAULT 0,
+  media_count INTEGER NOT NULL DEFAULT 0,
+  important_origin_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary_runs (
+  run_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  package_run_id TEXT,
+  date TEXT,
+  timezone TEXT,
+  scope_json TEXT,
+  output_dir TEXT,
+  summary_path TEXT,
+  provider TEXT,
+  origin_count INTEGER NOT NULL DEFAULT 0,
+  group_count INTEGER NOT NULL DEFAULT 0,
+  image_count INTEGER NOT NULL DEFAULT 0,
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary_records (
+  summary_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL UNIQUE,
+  package_run_id TEXT,
+  date TEXT,
+  timezone TEXT,
+  scope_json TEXT,
+  tags_json TEXT,
+  important INTEGER NOT NULL DEFAULT 0,
+  provider TEXT,
+  title TEXT,
+  content_md TEXT NOT NULL,
+  content_json TEXT,
+  summary_path TEXT,
+  origin_count INTEGER NOT NULL DEFAULT 0,
+  group_count INTEGER NOT NULL DEFAULT 0,
+  image_count INTEGER NOT NULL DEFAULT 0,
+  content_length INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS events (
   seq INTEGER PRIMARY KEY AUTOINCREMENT,
   source TEXT NOT NULL,
@@ -194,6 +266,11 @@ CREATE INDEX IF NOT EXISTS idx_operation_events_account ON operation_events(sour
 CREATE INDEX IF NOT EXISTS idx_operation_events_status ON operation_events(status, error_code);
 CREATE INDEX IF NOT EXISTS idx_backup_policies_enabled ON backup_policies(enabled);
 CREATE INDEX IF NOT EXISTS idx_participants_account_origin ON participants(source, account_id, origin_id);
+CREATE INDEX IF NOT EXISTS idx_daily_package_runs_date ON daily_package_runs(date, started_at);
+CREATE INDEX IF NOT EXISTS idx_daily_summary_runs_package ON daily_summary_runs(package_run_id, started_at);
+CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
 
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_chat_msg ON events(source, account_id, chat_id, message_id);

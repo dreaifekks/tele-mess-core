@@ -36,6 +36,36 @@ server:
         self.assertEqual(account.account_id, "main")
         self.assertFalse(hasattr(account, "chats"))
 
+    def test_daily_packaging_config_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yml"
+            config_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+daily:
+  output_dir: ./daily-output
+  systemd_user_dir: ./systemd-user
+  cli_path: ./bin/tele-mess-core
+  ai:
+    provider: disabled
+    command: [python3, -c, pass]
+    timeout_seconds: 12
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.daily.output_dir, Path(tmp) / "daily-output")
+        self.assertEqual(config.daily.systemd_user_dir, Path(tmp) / "systemd-user")
+        self.assertEqual(config.daily.cli_path, "./bin/tele-mess-core")
+        self.assertEqual(config.daily.ai.provider, "disabled")
+        self.assertEqual(config.daily.ai.timeout_seconds, 12)
+
 
 if __name__ == "__main__":
     unittest.main()

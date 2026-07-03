@@ -57,11 +57,40 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class DailyAiConfig:
+    provider: str = "codex-cli"
+    command: list[str] = field(
+        default_factory=lambda: [
+            "codex",
+            "-a",
+            "never",
+            "exec",
+            "--skip-git-repo-check",
+            "--output-last-message",
+            "{output}",
+            "{images}",
+            "-",
+        ]
+    )
+    timeout_seconds: int = 900
+
+
+@dataclass(slots=True)
+class DailyPackagingConfig:
+    output_dir: Path | None = None
+    systemd_user_dir: Path | None = None
+    cli_path: str = "tele-mess-core"
+    ai: DailyAiConfig = field(default_factory=DailyAiConfig)
+
+
+@dataclass(slots=True)
 class AppConfig:
     storage: StorageConfig
     telegram: TelegramConfig
     server: ServerConfig
     logging: LoggingConfig
+    daily: DailyPackagingConfig = field(default_factory=DailyPackagingConfig)
+    config_path: Path | None = None
 
 
 def load_config(path: str | Path) -> AppConfig:
@@ -74,6 +103,7 @@ def load_config(path: str | Path) -> AppConfig:
     telegram_raw = raw.get("telegram", {})
     server_raw = raw.get("server", {})
     logging_raw = raw.get("logging", {})
+    daily_raw = raw.get("daily", {})
 
     telegram = TelegramConfig(
         accounts=_parse_accounts(base_dir, telegram_raw),
@@ -95,7 +125,15 @@ def load_config(path: str | Path) -> AppConfig:
         level=str(logging_raw.get("level", "INFO")),
         file=_resolve_path(base_dir, log_file) if log_file else None,
     )
-    return AppConfig(storage=storage, telegram=telegram, server=server, logging=logging_config)
+    daily = _parse_daily(base_dir, daily_raw)
+    return AppConfig(
+        storage=storage,
+        telegram=telegram,
+        server=server,
+        logging=logging_config,
+        daily=daily,
+        config_path=config_path.resolve(),
+    )
 
 
 def _parse_accounts(base_dir: Path, telegram_raw: dict[str, Any]) -> list[TelegramAccountConfig]:
@@ -160,6 +198,42 @@ def _parse_media_download(raw: Any) -> MediaDownloadConfig:
     return MediaDownloadConfig(
         retries=max(0, int(raw.get("retries", 2))),
         retry_delay_seconds=max(0.0, float(raw.get("retry_delay_seconds", 1.0))),
+    )
+
+
+def _parse_daily(base_dir: Path, raw: Any) -> DailyPackagingConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("daily must be a mapping")
+    output_dir = raw.get("output_dir")
+    systemd_user_dir = raw.get("systemd_user_dir")
+    return DailyPackagingConfig(
+        output_dir=_resolve_path(base_dir, output_dir) if output_dir else None,
+        systemd_user_dir=_resolve_path(base_dir, systemd_user_dir) if systemd_user_dir else None,
+        cli_path=str(raw.get("cli_path", "tele-mess-core") or "tele-mess-core"),
+        ai=_parse_daily_ai(raw.get("ai", {})),
+    )
+
+
+def _parse_daily_ai(raw: Any) -> DailyAiConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("daily.ai must be a mapping")
+    command = raw.get("command")
+    if command is None:
+        command_list = DailyAiConfig().command
+    elif isinstance(command, list):
+        command_list = [str(item) for item in command]
+    elif isinstance(command, str):
+        command_list = [command]
+    else:
+        raise ValueError("daily.ai.command must be a string or list")
+    return DailyAiConfig(
+        provider=str(raw.get("provider", "codex-cli") or "codex-cli"),
+        command=command_list,
+        timeout_seconds=max(1, int(raw.get("timeout_seconds", 900))),
     )
 
 
