@@ -80,6 +80,24 @@ accepted and is mapped to `account_id: default`.
 - `POST /manage/participants/refresh`
 - `GET /console`
 
+The authoritative API reference is generated from
+`src/tele_mess_core/server/contracts.py`:
+
+- `docs/api.md` for human-readable endpoint docs.
+- `docs/openapi.json` for tools.
+- `docs/api-agent.md` for short agent lookup.
+- `GET /manage/api-manifest` for the runtime contract version/hash and route
+  registry.
+- `GET /openapi.json` and `GET /docs/api.md` for runtime docs served by the
+  core process.
+
+Regenerate and verify these files with:
+
+```bash
+tele-mess-core generate-api-docs
+tele-mess-core generate-api-docs --check
+```
+
 `GET /console` serves the built-in management console. The page can be opened in
 a browser without a token header, then the operator enters `server.token` in the
 page. API calls from the console still use the same token-protected management

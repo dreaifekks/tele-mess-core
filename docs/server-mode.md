@@ -121,6 +121,9 @@ Management endpoints use the same token as sync endpoints. They provide the
 basic control-plane model for future Mac and web clients:
 
 1. Call `GET /manage/capabilities` to inspect supported management objects.
+   Clients that need to detect interface changes should also call
+   `GET /manage/api-manifest` and compare `contract_hash` before issuing
+   write requests.
 2. Call `GET /manage/accounts` to list configured or remotely registered
    Telegram accounts and auth/session state.
 3. Use `POST /manage/accounts`, `POST /manage/accounts/auth/request-code`,
@@ -147,3 +150,16 @@ basic control-plane model for future Mac and web clients:
 History backfill runs when Telegram ingestion starts. It uses `telegram.backfill`
 limits and per-origin cursors so restarts only ask Telegram for messages newer
 than the last stored message ID.
+
+## API Documentation
+
+The API reference is generated from `src/tele_mess_core/server/contracts.py`.
+
+```bash
+tele-mess-core generate-api-docs
+tele-mess-core generate-api-docs --check
+```
+
+Generated files live at `docs/api.md`, `docs/openapi.json`, and
+`docs/api-agent.md`. The running server also exposes `GET /openapi.json`,
+`GET /docs/api.md`, and token-protected `GET /manage/api-manifest`.

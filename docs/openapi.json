@@ -1,0 +1,4268 @@
+{
+  "components": {
+    "schemas": {
+      "Account": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_state": {
+            "nullable": true,
+            "type": "string"
+          },
+          "auth_updated_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "display_name": {
+            "nullable": true,
+            "type": "string"
+          },
+          "kind": {
+            "nullable": true,
+            "type": "string"
+          },
+          "last_error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "phone": {
+            "nullable": true,
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "session_dir": {
+            "nullable": true,
+            "type": "string"
+          },
+          "session_name": {
+            "nullable": true,
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccountAuthInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_state": {
+            "type": "string"
+          },
+          "last_error": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "session_dir": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccountDeleteResponse": {
+        "properties": {
+          "item": {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "deleted_rows": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "AccountInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_state": {
+            "default": "pending_auth",
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "kind": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "session_dir": {
+            "type": "string"
+          },
+          "session_name": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "AccountItemResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/Account"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "AccountListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Account"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ApiManifest": {
+        "properties": {
+          "agent_doc": {
+            "type": "string"
+          },
+          "contract_hash": {
+            "type": "string"
+          },
+          "contract_version": {
+            "type": "string"
+          },
+          "endpoints": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "markdown_url": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          },
+          "openapi_url": {
+            "type": "string"
+          },
+          "schemas": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "contract_version",
+          "contract_hash",
+          "endpoints"
+        ],
+        "type": "object"
+      },
+      "AuthResult": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_state": {
+            "type": "string"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "message": {
+            "nullable": true,
+            "type": "string"
+          },
+          "phone": {
+            "nullable": true,
+            "type": "string"
+          },
+          "phone_code_hash": {
+            "nullable": true,
+            "type": "string"
+          },
+          "requires_password": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "AuthResultResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/AuthResult"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "AuthStatusInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "BackupPolicy": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "capture_media_metadata": {
+            "type": "boolean"
+          },
+          "capture_text": {
+            "type": "boolean"
+          },
+          "download_media": {
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "tags": {
+            "nullable": true,
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "origin_id",
+          "topic_id"
+        ],
+        "type": "object"
+      },
+      "BackupPolicyDeleteResponse": {
+        "properties": {
+          "item": {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "deleted_rows": {
+                "type": "integer"
+              },
+              "origin_id": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "topic_id": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "BackupPolicyInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "capture_media_metadata": {
+            "default": true,
+            "type": "boolean"
+          },
+          "capture_text": {
+            "default": true,
+            "type": "boolean"
+          },
+          "download_media": {
+            "default": false,
+            "type": "boolean"
+          },
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "tags": {
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id"
+        ],
+        "type": "object"
+      },
+      "BackupPolicyItemResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/BackupPolicy"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "BackupPolicyListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/BackupPolicy"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "CapabilitiesResponse": {
+        "properties": {
+          "api_contract": {
+            "type": "object"
+          },
+          "auth_flow": {
+            "type": "object"
+          },
+          "management": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "mode": {
+            "type": "string"
+          },
+          "sync": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "mode",
+          "sync",
+          "management"
+        ],
+        "type": "object"
+      },
+      "CaptureCursor": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "last_backfill_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "last_message_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "last_message_id": {
+            "type": "integer"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "origin_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "source": {
+            "type": "string"
+          },
+          "topic_id": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "origin_id",
+          "topic_id"
+        ],
+        "type": "object"
+      },
+      "CaptureCursorListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/CaptureCursor"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "Chat": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "chat_id": {
+            "type": "integer"
+          },
+          "kind": {
+            "nullable": true,
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "source": {
+            "type": "string"
+          },
+          "title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "username": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "chat_id"
+        ],
+        "type": "object"
+      },
+      "ChatListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Chat"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DiscoveryInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "include_private": {
+            "default": false,
+            "type": "boolean"
+          },
+          "include_topics": {
+            "default": true,
+            "type": "boolean"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "topic_limit": {
+            "default": 100,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id"
+        ],
+        "type": "object"
+      },
+      "DiscoveryResult": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "errors": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "include_private": {
+            "type": "boolean"
+          },
+          "origins": {
+            "type": "integer"
+          },
+          "private_skipped": {
+            "type": "integer"
+          },
+          "status": {
+            "type": "string"
+          },
+          "topic_limit": {
+            "type": "integer"
+          },
+          "topics": {
+            "type": "integer"
+          },
+          "topics_truncated": {
+            "type": "boolean"
+          }
+        },
+        "type": "object"
+      },
+      "DiscoveryResultResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DiscoveryResult"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "ErrorResponse": {
+        "properties": {
+          "detail": {
+            "type": "string"
+          },
+          "error": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "error"
+        ],
+        "type": "object"
+      },
+      "Event": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "chat_id": {
+            "type": "integer"
+          },
+          "event_at": {
+            "type": "string"
+          },
+          "event_type": {
+            "type": "string"
+          },
+          "message_id": {
+            "type": "integer"
+          },
+          "payload_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "seq": {
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "seq",
+          "source",
+          "account_id",
+          "event_type"
+        ],
+        "type": "object"
+      },
+      "EventPage": {
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "HealthResponse": {
+        "properties": {
+          "database_id": {
+            "type": "string"
+          },
+          "last_event_seq": {
+            "type": "integer"
+          },
+          "message_count": {
+            "type": "integer"
+          },
+          "ok": {
+            "type": "boolean"
+          },
+          "operation_error_count": {
+            "type": "integer"
+          },
+          "schema_version": {
+            "type": "integer"
+          },
+          "server_time": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "ok",
+          "schema_version",
+          "message_count",
+          "last_event_seq"
+        ],
+        "type": "object"
+      },
+      "MediaFile": {
+        "properties": {
+          "access_url": {
+            "type": "string"
+          },
+          "account_id": {
+            "type": "string"
+          },
+          "chat_id": {
+            "type": "integer"
+          },
+          "chat_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "content_type": {
+            "type": "string"
+          },
+          "download_url": {
+            "type": "string"
+          },
+          "downloaded_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "file_index": {
+            "type": "integer"
+          },
+          "file_path": {
+            "type": "string"
+          },
+          "file_size": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "media_kind": {
+            "nullable": true,
+            "type": "string"
+          },
+          "message_id": {
+            "type": "integer"
+          },
+          "mime_type": {
+            "nullable": true,
+            "type": "string"
+          },
+          "origin_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "preview_kind": {
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "source": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "chat_id",
+          "message_id",
+          "file_index"
+        ],
+        "type": "object"
+      },
+      "MediaFileListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/MediaFile"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "Message": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "chat_id": {
+            "type": "integer"
+          },
+          "chat_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "deleted_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "edited_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "event_seq": {
+            "type": "integer"
+          },
+          "has_media": {
+            "type": "boolean"
+          },
+          "ingested_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "media_count": {
+            "type": "integer"
+          },
+          "media_files": {
+            "items": {
+              "$ref": "#/components/schemas/MediaFile"
+            },
+            "type": "array"
+          },
+          "media_kind": {
+            "nullable": true,
+            "type": "string"
+          },
+          "message_id": {
+            "type": "integer"
+          },
+          "origin_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "sender_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "sender_name": {
+            "nullable": true,
+            "type": "string"
+          },
+          "sender_username": {
+            "nullable": true,
+            "type": "string"
+          },
+          "sent_at": {
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "text": {
+            "nullable": true,
+            "type": "string"
+          },
+          "topic_id": {
+            "nullable": true,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "chat_id",
+          "message_id"
+        ],
+        "type": "object"
+      },
+      "MessageListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "MessagePage": {
+        "properties": {
+          "has_more": {
+            "type": "boolean"
+          },
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Message"
+            },
+            "type": "array"
+          },
+          "next_cursor": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "items",
+          "next_cursor",
+          "has_more"
+        ],
+        "type": "object"
+      },
+      "OperationEvent": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "auth_state": {
+            "nullable": true,
+            "type": "string"
+          },
+          "error": {
+            "type": "object"
+          },
+          "error_code": {
+            "nullable": true,
+            "type": "string"
+          },
+          "error_type": {
+            "nullable": true,
+            "type": "string"
+          },
+          "id": {
+            "type": "integer"
+          },
+          "message": {
+            "nullable": true,
+            "type": "string"
+          },
+          "occurred_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "operation": {
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "retry_after": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "source": {
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "subject": {
+            "type": "object"
+          },
+          "subject_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "subject_label": {
+            "nullable": true,
+            "type": "string"
+          },
+          "subject_type": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "id",
+          "source",
+          "account_id",
+          "operation",
+          "status"
+        ],
+        "type": "object"
+      },
+      "OperationEventDeleteInput": {
+        "properties": {
+          "id": {
+            "type": "integer"
+          },
+          "ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "OperationEventDeleteResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/OperationEventDeleteResult"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "OperationEventDeleteResult": {
+        "properties": {
+          "deleted": {
+            "type": "integer"
+          },
+          "ids": {
+            "items": {
+              "type": "integer"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "ids",
+          "deleted"
+        ],
+        "type": "object"
+      },
+      "OperationEventListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/OperationEvent"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "Origin": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "archived_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "backup_policy": {
+            "$ref": "#/components/schemas/BackupPolicy",
+            "nullable": true
+          },
+          "discovered_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "is_forum": {
+            "type": "boolean"
+          },
+          "last_message_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "origin_type": {
+            "type": "string"
+          },
+          "parent_origin_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "parent_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "source": {
+            "type": "string"
+          },
+          "title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "username": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "origin_id",
+          "topic_id",
+          "origin_type"
+        ],
+        "type": "object"
+      },
+      "OriginArchiveInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "archived": {
+            "default": true,
+            "type": "boolean"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id"
+        ],
+        "type": "object"
+      },
+      "OriginArchiveResponse": {
+        "properties": {
+          "item": {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "archived": {
+                "type": "boolean"
+              },
+              "changed_rows": {
+                "type": "integer"
+              },
+              "origin_id": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "topic_id": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "OriginDeleteResponse": {
+        "properties": {
+          "item": {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "deleted_rows": {
+                "type": "integer"
+              },
+              "origin_id": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "topic_id": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "OriginInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "is_forum": {
+            "default": false,
+            "type": "boolean"
+          },
+          "last_message_at": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "origin_type": {
+            "type": "string"
+          },
+          "parent_origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "title": {
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id",
+          "origin_type"
+        ],
+        "type": "object"
+      },
+      "OriginItemResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/Origin"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "OriginListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Origin"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "Participant": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "nullable": true,
+            "type": "string"
+          },
+          "is_bot": {
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "raw_json": {
+            "nullable": true,
+            "type": "object"
+          },
+          "role": {
+            "nullable": true,
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "user_id": {
+            "type": "integer"
+          },
+          "username": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "source",
+          "account_id",
+          "origin_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "ParticipantDeleteResponse": {
+        "properties": {
+          "item": {
+            "properties": {
+              "account_id": {
+                "type": "string"
+              },
+              "deleted_rows": {
+                "type": "integer"
+              },
+              "origin_id": {
+                "type": "integer"
+              },
+              "source": {
+                "type": "string"
+              },
+              "user_id": {
+                "type": "integer"
+              }
+            },
+            "type": "object"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "ParticipantInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "display_name": {
+            "type": "string"
+          },
+          "is_bot": {
+            "default": false,
+            "type": "boolean"
+          },
+          "last_seen_at": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "role": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "user_id": {
+            "type": "integer"
+          },
+          "username": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id",
+          "user_id"
+        ],
+        "type": "object"
+      },
+      "ParticipantItemResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/Participant"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "ParticipantListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/Participant"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "ParticipantRefreshInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "limit": {
+            "default": 500,
+            "type": "integer"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id"
+        ],
+        "type": "object"
+      },
+      "ParticipantRefreshResult": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "authorized": {
+            "type": "boolean"
+          },
+          "errors": {
+            "items": {
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "participants": {
+            "type": "integer"
+          },
+          "participants_truncated": {
+            "type": "boolean"
+          },
+          "status": {
+            "type": "string"
+          }
+        },
+        "type": "object"
+      },
+      "ParticipantRefreshResultResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/ParticipantRefreshResult"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "RequestCodeInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "phone"
+        ],
+        "type": "object"
+      },
+      "StateResponse": {
+        "properties": {
+          "database_id": {
+            "type": "string"
+          },
+          "last_event_seq": {
+            "type": "integer"
+          },
+          "message_count": {
+            "type": "integer"
+          },
+          "operation_error_count": {
+            "type": "integer"
+          },
+          "schema_version": {
+            "type": "integer"
+          },
+          "server_time": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "schema_version",
+          "message_count",
+          "last_event_seq"
+        ],
+        "type": "object"
+      },
+      "SubmitCodeInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "code": {
+            "type": "string"
+          },
+          "password": {
+            "type": "string"
+          },
+          "phone": {
+            "type": "string"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          }
+        },
+        "required": [
+          "account_id",
+          "phone",
+          "code"
+        ],
+        "type": "object"
+      }
+    },
+    "securitySchemes": {
+      "ApiTokenAuth": {
+        "in": "header",
+        "name": "X-Api-Token",
+        "type": "apiKey"
+      },
+      "BearerAuth": {
+        "scheme": "bearer",
+        "type": "http"
+      }
+    }
+  },
+  "info": {
+    "title": "tele-mess-core API",
+    "version": "2026-07-03.1",
+    "x-contract-hash": "56d36c6eac0a0f95"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/": {
+      "get": {
+        "operationId": "get_root",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "summary": "Serve the built-in management console.",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/console": {
+      "get": {
+        "operationId": "get_console",
+        "responses": {
+          "200": {
+            "content": {
+              "text/html": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "summary": "Serve the built-in management console.",
+        "tags": [
+          "console"
+        ]
+      }
+    },
+    "/docs/api.md": {
+      "get": {
+        "operationId": "get_docs_api.md",
+        "responses": {
+          "200": {
+            "content": {
+              "text/markdown": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "summary": "Return the generated Markdown API reference.",
+        "tags": [
+          "docs"
+        ]
+      }
+    },
+    "/healthz": {
+      "get": {
+        "operationId": "get_healthz",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HealthResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return health and archive state.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/manage/accounts": {
+      "delete": {
+        "operationId": "delete_manage_accounts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthStatusInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Delete management account metadata.",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_manage_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List management account state.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_accounts",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Create or update account metadata.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/accounts/auth": {
+      "patch": {
+        "operationId": "patch_manage_accounts_auth",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountAuthInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Patch account auth state.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_accounts_auth",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AccountAuthInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Create or update account auth state.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/accounts/auth/request-code": {
+      "post": {
+        "operationId": "post_manage_accounts_auth_request_code",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RequestCodeInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResultResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Request a Telegram login code.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/accounts/auth/status": {
+      "post": {
+        "operationId": "post_manage_accounts_auth_status",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AuthStatusInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResultResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Check live Telegram auth status.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/accounts/auth/submit-code": {
+      "post": {
+        "operationId": "post_manage_accounts_auth_submit_code",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SubmitCodeInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AuthResultResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Submit a Telegram login code and optional 2FA password.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/api-manifest": {
+      "get": {
+        "operationId": "get_manage_api_manifest",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiManifest"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return the machine-readable API contract manifest.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/backup-policies": {
+      "delete": {
+        "operationId": "delete_manage_backup_policies",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupPolicyInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupPolicyDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Delete an origin backup policy.",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_manage_backup_policies",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupPolicyListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List origin backup policies.",
+        "tags": [
+          "management"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_manage_backup_policies",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupPolicyInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupPolicyItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Patch an origin backup policy.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_backup_policies",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/BackupPolicyInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BackupPolicyItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Create or update an origin backup policy.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/capabilities": {
+      "get": {
+        "operationId": "get_manage_capabilities",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CapabilitiesResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return supported management capabilities.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/capture-cursors": {
+      "get": {
+        "operationId": "get_manage_capture_cursors",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CaptureCursorListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List capture cursors.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/discover-origins": {
+      "post": {
+        "operationId": "post_manage_discover_origins",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DiscoveryInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DiscoveryResultResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Discover Telegram dialogs and topics for an authenticated account.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/operation-events": {
+      "delete": {
+        "operationId": "delete_manage_operation_events",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OperationEventDeleteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationEventDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Delete one or more operation events.",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_manage_operation_events",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by status, for example failed.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum events to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OperationEventListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List structured operation events.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/origins": {
+      "delete": {
+        "operationId": "delete_manage_origins",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OriginArchiveInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Delete an origin and related management metadata.",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_manage_origins",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include removed origins.",
+            "in": "query",
+            "name": "include_archived",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List known origins and topics.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_origins",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OriginInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Create or update origin metadata.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/origins/archive": {
+      "patch": {
+        "operationId": "patch_manage_origins_archive",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OriginArchiveInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OriginArchiveResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Archive or restore an origin.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/participants": {
+      "delete": {
+        "operationId": "delete_manage_participants",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParticipantInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Delete a participant profile.",
+        "tags": [
+          "management"
+        ]
+      },
+      "get": {
+        "operationId": "get_manage_participants",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter to an origin.",
+            "in": "query",
+            "name": "origin_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List participant profiles.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_participants",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParticipantInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantItemResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Create or update a participant profile.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/participants/refresh": {
+      "post": {
+        "operationId": "post_manage_participants_refresh",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ParticipantRefreshInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ParticipantRefreshResultResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Refresh participants for a Telegram origin.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/openapi.json": {
+      "get": {
+        "operationId": "get_openapi.json",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "summary": "Return the current OpenAPI document.",
+        "tags": [
+          "docs"
+        ]
+      }
+    },
+    "/sync/accounts": {
+      "get": {
+        "operationId": "get_sync_accounts",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AccountListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return archive account metadata.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/chats": {
+      "get": {
+        "operationId": "get_sync_chats",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ChatListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return archived chat metadata.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/events": {
+      "get": {
+        "operationId": "get_sync_events",
+        "parameters": [
+          {
+            "description": "Last consumed event sequence.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EventPage"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return raw event rows after a cursor.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/media-files": {
+      "get": {
+        "operationId": "get_sync_media_files",
+        "parameters": [
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter to a Telegram chat or origin ID.",
+            "in": "query",
+            "name": "chat_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter to a message ID.",
+            "in": "query",
+            "name": "message_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MediaFileListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return downloaded media file records.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/media-files/content": {
+      "get": {
+        "operationId": "get_sync_media_files_content",
+        "parameters": [
+          {
+            "description": "Source system.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "default": "telegram",
+              "type": "string"
+            }
+          },
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Telegram chat or origin ID.",
+            "in": "query",
+            "name": "chat_id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Telegram message ID.",
+            "in": "query",
+            "name": "message_id",
+            "required": true,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Media index on the message.",
+            "in": "query",
+            "name": "file_index",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/octet-stream": {
+                "schema": {
+                  "format": "binary",
+                  "type": "string"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return the binary contents of a registered media file.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/messages": {
+      "get": {
+        "operationId": "get_sync_messages",
+        "parameters": [
+          {
+            "description": "Last consumed event sequence.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "default": 0,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Return latest messages instead of cursor page.",
+            "in": "query",
+            "name": "latest",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Attach media_files to each message.",
+            "in": "query",
+            "name": "include_media",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessagePage"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return message rows after a cursor or the latest messages.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/search": {
+      "get": {
+        "operationId": "get_sync_search",
+        "parameters": [
+          {
+            "description": "Search text.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum messages to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 50,
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Attach media_files to each message.",
+            "in": "query",
+            "name": "include_media",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MessageListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Search archived message text.",
+        "tags": [
+          "sync"
+        ]
+      }
+    },
+    "/sync/state": {
+      "get": {
+        "operationId": "get_sync_state",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/StateResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return archive sync state.",
+        "tags": [
+          "sync"
+        ]
+      }
+    }
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8765"
+    }
+  ]
+}

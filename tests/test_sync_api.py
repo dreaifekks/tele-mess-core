@@ -27,6 +27,7 @@ from tele_mess_core.models import (
 )
 from tele_mess_core.server import SyncApiServer
 from tele_mess_core.server.api import _account_config
+from tele_mess_core.server.contracts import API_CONTRACT_HASH, API_CONTRACT_VERSION
 
 
 class SyncApiTest(unittest.TestCase):
@@ -145,6 +146,11 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("/manage/participants/refresh", html)
         self.assertIn("/manage/operation-events", html)
         self.assertIn("/sync/media-files", html)
+        self.assertIn("/manage/api-manifest", html)
+        self.assertIn("teleMessApiContractHash", html)
+        self.assertIn("API contract", html)
+        self.assertIn("API docs", html)
+        self.assertIn("contract_hash", html)
         self.assertIn("Save policy", html)
         self.assertIn("escapeHtml", html)
         self.assertIn("API token required", html)
@@ -208,6 +214,34 @@ class SyncApiTest(unittest.TestCase):
         html = self.request_text_no_auth("/")
         self.assertIn("tele-mess-core console", html)
         self.assertIn("API token", html)
+
+    def test_runtime_contract_docs_endpoints(self) -> None:
+        manifest = self.request_json("/manage/api-manifest")
+        self.assertEqual(manifest["contract_version"], API_CONTRACT_VERSION)
+        self.assertEqual(manifest["contract_hash"], API_CONTRACT_HASH)
+        self.assertIn({"method": "GET", "path": "/sync/messages"}, [
+            {"method": item["method"], "path": item["path"]} for item in manifest["endpoints"]
+        ])
+        self.assertEqual(manifest["openapi_url"], "/openapi.json")
+        self.assertEqual(manifest["markdown_url"], "/docs/api.md")
+
+        openapi_text = self.request_text_no_auth("/openapi.json")
+        openapi = json.loads(openapi_text)
+        self.assertEqual(openapi["info"]["x-contract-hash"], API_CONTRACT_HASH)
+        self.assertIn("/manage/api-manifest", openapi["paths"])
+        self.assertIn("/sync/messages", openapi["paths"])
+
+        markdown = self.request_text_no_auth("/docs/api.md")
+        self.assertIn(f"Contract hash: `{API_CONTRACT_HASH}`", markdown)
+        self.assertIn("GET /manage/api-manifest", markdown)
+        self.assertIn("POST /manage/discover-origins", markdown)
+
+    def test_api_manifest_requires_token(self) -> None:
+        req = Request(f"http://127.0.0.1:{self.port}/manage/api-manifest")
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.assertEqual(caught.exception.code, 401)
+        caught.exception.close()
 
     def test_media_files_endpoint(self) -> None:
         media_path = Path(self.tmp.name) / "api-media.jpg"

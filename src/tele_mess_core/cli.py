@@ -48,7 +48,14 @@ def main(argv: list[str] | None = None) -> int:
     import_parser.add_argument("--chat-id", type=int, required=True, help="Chat ID to attach imported messages to")
     import_parser.add_argument("--account-id", default="default", help="Account ID for imported messages")
 
+    docs_parser = sub.add_parser("generate-api-docs", help="Generate static API reference files")
+    docs_parser.add_argument("--output-dir", default="docs", help="Directory for generated docs")
+    docs_parser.add_argument("--check", action="store_true", help="Fail if generated docs are not current")
+
     args = parser.parse_args(argv)
+    if args.command == "generate-api-docs":
+        return _generate_api_docs(Path(args.output_dir), args.check)
+
     from tele_mess_core.config import load_config
     from tele_mess_core.logging_setup import setup_logging
 
@@ -80,6 +87,39 @@ def main(argv: list[str] | None = None) -> int:
 
     parser.error(f"Unknown command: {args.command}")
     return 2
+
+
+def _generate_api_docs(output_dir: Path, check: bool = False) -> int:
+    from tele_mess_core.server.contracts import agent_markdown_document, markdown_document, openapi_json
+
+    files = {
+        output_dir / "api.md": markdown_document(),
+        output_dir / "api-agent.md": agent_markdown_document(),
+        output_dir / "openapi.json": openapi_json(),
+    }
+    if check:
+        stale: list[Path] = []
+        missing: list[Path] = []
+        for path, expected in files.items():
+            if not path.exists():
+                missing.append(path)
+                continue
+            if path.read_text(encoding="utf-8") != expected:
+                stale.append(path)
+        if missing or stale:
+            for path in missing:
+                print(f"missing generated API doc: {path}")
+            for path in stale:
+                print(f"stale generated API doc: {path}")
+            return 1
+        print("API docs are current")
+        return 0
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    for path, content in files.items():
+        path.write_text(content, encoding="utf-8")
+        print(f"wrote {path}")
+    return 0
 
 
 def _serve_api(config: AppConfig, store: ArchiveStore) -> int:

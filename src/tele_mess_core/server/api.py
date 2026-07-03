@@ -21,10 +21,23 @@ from tele_mess_core.models import (
     SOURCE_TELEGRAM,
     utc_now_iso,
 )
+from tele_mess_core.server.contracts import (
+    API_CONTRACT_HASH,
+    API_CONTRACT_VERSION,
+    API_MANIFEST_PATH,
+    MARKDOWN_API_DOC_PATH,
+    OPENAPI_PATH,
+    api_manifest,
+    markdown_document,
+    openapi_document,
+)
 from tele_mess_core.telegram.runtime import TelegramOperationError
 
 if TYPE_CHECKING:
     from tele_mess_core.config import AppConfig, TelegramAccountConfig
+
+
+PUBLIC_GET_PATHS = {"/", "/console", OPENAPI_PATH, MARKDOWN_API_DOC_PATH}
 
 
 class SyncApiServer:
@@ -90,7 +103,7 @@ class SyncApiServer:
         config = self.config
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.1"
+            server_version = "tele-mess-core/0.1.1"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
@@ -110,7 +123,7 @@ class SyncApiServer:
             def _handle(self, method: str) -> None:
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
-                if token and not (method == "GET" and parsed.path in {"/", "/console"}) and not self._authorized(token):
+                if token and not (method == "GET" and parsed.path in PUBLIC_GET_PATHS) and not self._authorized(token):
                     self._json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
                     return
 
@@ -132,6 +145,10 @@ class SyncApiServer:
             def _handle_get(self, path: str, params: dict[str, list[str]]) -> None:
                 if path == "/" or path == "/console":
                     self._html(_console_html())
+                elif path == OPENAPI_PATH:
+                    self._json(openapi_document())
+                elif path == MARKDOWN_API_DOC_PATH:
+                    self._text(markdown_document(), content_type="text/markdown; charset=utf-8")
                 elif path == "/healthz":
                     self._json({"ok": True, **store.state()})
                 elif path == "/sync/state":
@@ -186,6 +203,8 @@ class SyncApiServer:
                     )
                 elif path == "/manage/capabilities":
                     self._json(_capabilities())
+                elif path == API_MANIFEST_PATH:
+                    self._json(api_manifest())
                 elif path == "/manage/accounts":
                     self._json({"items": store.list_management_accounts()})
                 elif path == "/manage/origins":
@@ -309,6 +328,14 @@ class SyncApiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _text(self, text: str, content_type: str, status: HTTPStatus = HTTPStatus.OK) -> None:
+                body = text.encode("utf-8")
+                self.send_response(int(status))
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
             def _media_file(self, item: dict[str, Any] | None) -> None:
                 if item is None:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
@@ -367,6 +394,13 @@ def _capabilities() -> dict[str, Any]:
         "auth_flow": {
             "status": "implemented",
             "note": "Remote clients can request a Telegram login code, submit it, and provide a 2FA password when Telegram requires one.",
+        },
+        "api_contract": {
+            "version": API_CONTRACT_VERSION,
+            "hash": API_CONTRACT_HASH,
+            "manifest_url": API_MANIFEST_PATH,
+            "openapi_url": OPENAPI_PATH,
+            "markdown_url": MARKDOWN_API_DOC_PATH,
         },
     }
 
@@ -1012,6 +1046,7 @@ def _console_html() -> str:
     .media-name { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
+    .status.warn { color: var(--warn); border-color: #dfc16d; background: #fffbea; }
     .status.error { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
     .pill { display: inline-flex; align-items: center; border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 7px; color: var(--muted); font-size: 12px; }
     .pill.ok { color: var(--ok); border-color: #86c79a; }
@@ -1173,13 +1208,14 @@ def _console_html() -> str:
 <datalist id=\"tag-suggestions\"></datalist>
 
 <script>
-const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
+const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
 let messageRefreshTimer = null;
 let messageRefreshInFlight = false;
 let originSelectionAnchor = null;
 let originDragState = null;
 let ignoreNextOriginClick = false;
 const MEDIA_CONTENT_PATH = '/sync/media-files/content';
+const CONTRACT_HASH_KEY = 'teleMessApiContractHash';
 const mediaObjectUrls = new Map();
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
@@ -1208,6 +1244,17 @@ async function api(path, options={}) {
   const text = await response.text();
   if (!response.ok) throw new Error(`${response.status} ${text}`);
   return text ? JSON.parse(text) : {};
+}
+function updateApiManifest(manifest) {
+  state.apiManifest = manifest || null;
+  const nextHash = manifest?.contract_hash;
+  if (!nextHash) return '';
+  const previousHash = localStorage.getItem(CONTRACT_HASH_KEY);
+  localStorage.setItem(CONTRACT_HASH_KEY, nextHash);
+  if (previousHash && previousHash !== nextHash) {
+    return `API contract updated ${previousHash.slice(0, 8)} -> ${nextHash.slice(0, 8)}; refresh clients before writes`;
+  }
+  return '';
 }
 function formData(form) {
   const data = {};
@@ -1494,11 +1541,12 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [service, accounts, origins, policies, participants, cursors, operationEvents, media, messages] = await Promise.all([
-      api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
+    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages] = await Promise.all([
+      api('/manage/api-manifest'), api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
       api('/sync/messages?latest=true&limit=100&include_media=true')
     ]);
+    const contractWarning = updateApiManifest(apiManifest);
     state.service = service;
     state.accounts = accounts.items || [];
     state.origins = origins.items || [];
@@ -1512,7 +1560,7 @@ async function loadAll() {
     refreshTagSuggestions();
     renderAll();
     startMessageAutoRefresh();
-    setStatus('Loaded', 'ok');
+    setStatus(contractWarning || 'Loaded', contractWarning ? 'warn' : 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
 }
 async function loadMessages(options={}) {
@@ -1544,8 +1592,13 @@ function renderAll() {
   renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderOperationEvents(); renderMedia(); renderRaw();
 }
 function renderSummary() {
+  const manifest = state.apiManifest || {};
+  const contract = manifest.contract_hash ? `${manifest.contract_version} / ${manifest.contract_hash}` : '-';
+  const docs = manifest.markdown_url ? `<a href=\"${attr(manifest.markdown_url)}\" target=\"_blank\" rel=\"noopener\">API</a> <a href=\"${attr(manifest.openapi_url)}\" target=\"_blank\" rel=\"noopener\">OpenAPI</a>` : '-';
   const html = [
     `<div><span class=\"muted\">Schema</span> ${text(state.service?.schema_version)}</div>`,
+    `<div><span class=\"muted\">API contract</span> ${text(contract)}</div>`,
+    `<div><span class=\"muted\">API docs</span> ${docs}</div>`,
     `<div><span class=\"muted\">Messages</span> ${text(state.service?.message_count)}</div>`,
     `<div><span class=\"muted\">Last event</span> ${text(state.service?.last_event_seq)}</div>`,
     `<div><span class=\"muted\">Accounts</span> ${state.accounts.length}</div>`,
