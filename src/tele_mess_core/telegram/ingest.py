@@ -307,41 +307,57 @@ class TelegramArchiveService:
             if not policy.get("enabled", False):
                 self.logger.info("Skipping backfill for disabled origin %s/%s", self.account_id, chat_id)
                 continue
-            cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, self.account_id, chat_id)
-            min_id = int(cursor["last_message_id"]) if cursor else 0
-            limit = self.backfill.catch_up_limit if min_id else self.backfill.initial_limit
-            limit_arg = None if limit <= 0 else limit
-            count = 0
-            last_message_id = min_id
-            last_message_at = cursor.get("last_message_at") if cursor else None
-            self.logger.info(
-                "Backfilling account=%s chat=%s min_id=%s limit=%s",
-                self.account_id,
-                chat_id,
-                min_id,
-                limit_arg if limit_arg is not None else "unlimited",
-            )
-            async for message in self.client.iter_messages(chat_id, min_id=min_id, reverse=True, limit=limit_arg):
-                if isinstance(message, MessageService):
-                    continue
-                stored = await self._store_message(message, event_type="backfill")
-                if stored:
-                    last_message_id = max(last_message_id, int(message.id))
-                    last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
-                    count += 1
-            self.store.upsert_capture_cursor(
-                CaptureCursorRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=self.account_id,
-                    origin_id=chat_id,
-                    last_message_id=last_message_id,
-                    last_message_at=last_message_at,
-                    last_backfill_at=utc_now_iso(),
-                    updated_at=utc_now_iso(),
-                    raw_json=json.dumps({"count": count, "min_id": min_id, "limit": limit_arg}, ensure_ascii=False),
+            try:
+                cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, self.account_id, chat_id)
+                min_id = int(cursor["last_message_id"]) if cursor else 0
+                limit = self.backfill.catch_up_limit if min_id else self.backfill.initial_limit
+                limit_arg = None if limit <= 0 else limit
+                count = 0
+                last_message_id = min_id
+                last_message_at = cursor.get("last_message_at") if cursor else None
+                self.logger.info(
+                    "Backfilling account=%s chat=%s min_id=%s limit=%s",
+                    self.account_id,
+                    chat_id,
+                    min_id,
+                    limit_arg if limit_arg is not None else "unlimited",
                 )
-            )
-            self.logger.info("Backfilled %s messages for account=%s chat=%s", count, self.account_id, chat_id)
+                async for message in self.client.iter_messages(chat_id, min_id=min_id, reverse=True, limit=limit_arg):
+                    if isinstance(message, MessageService):
+                        continue
+                    stored = await self._store_message(message, event_type="backfill")
+                    if stored:
+                        last_message_id = max(last_message_id, int(message.id))
+                        last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
+                        count += 1
+                self.store.upsert_capture_cursor(
+                    CaptureCursorRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id=self.account_id,
+                        origin_id=chat_id,
+                        last_message_id=last_message_id,
+                        last_message_at=last_message_at,
+                        last_backfill_at=utc_now_iso(),
+                        updated_at=utc_now_iso(),
+                        raw_json=json.dumps({"count": count, "min_id": min_id, "limit": limit_arg}, ensure_ascii=False),
+                    )
+                )
+                self.logger.info("Backfilled %s messages for account=%s chat=%s", count, self.account_id, chat_id)
+            except Exception as exc:
+                error = classify_telegram_exception(exc, default_code="backfill_failed", default_auth_state="authorized")
+                self.logger.warning(
+                    "Backfill failed for account=%s chat=%s: %s",
+                    self.account_id,
+                    chat_id,
+                    error.message,
+                )
+                self._record_operation(
+                    "backfill",
+                    "failed",
+                    subject_type="origin",
+                    subject_id=str(chat_id),
+                    error=error.to_public_dict(),
+                )
 
     def _policy_for(self, chat_id: int, topic_id: int | None = None) -> dict[str, Any]:
         if topic_id:

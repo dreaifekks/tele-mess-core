@@ -12,6 +12,7 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
     OriginRecord,
@@ -63,6 +64,7 @@ class ArchiveStoreTest(unittest.TestCase):
         messages = self.store.list_messages_after(after_event_seq=0)
         self.assertEqual(messages["items"][0]["text"], "hello archive")
         self.assertEqual(messages["items"][0]["event_seq"], 1)
+        self.assertEqual(messages["items"][0]["chat_title"], "Source")
         accounts = self.store.list_accounts()
         self.assertEqual(accounts[0]["account_id"], "main")
 
@@ -122,6 +124,33 @@ class ArchiveStoreTest(unittest.TestCase):
         messages = self.store.list_messages_after(after_event_seq=0)
         self.assertEqual(len(messages["items"]), 2)
         self.assertEqual({item["account_id"] for item in messages["items"]}, {"main", "alt"})
+
+    def test_latest_messages_returns_newest_sent_messages_first(self) -> None:
+        self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, chat_id=-1001, title="Known Chat"))
+        messages = (
+            (1, "2026-01-01T00:00:00+00:00"),
+            (2, "2026-01-03T00:00:00+00:00"),
+            (3, "2026-01-02T00:00:00+00:00"),
+        )
+        for message_id, sent_at in messages:
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    chat_id=-1001,
+                    message_id=message_id,
+                    sent_at=sent_at,
+                    ingested_at=utc_now_iso(),
+                    text=f"message {message_id}",
+                ),
+                event_type="new",
+            )
+
+        latest = self.store.list_latest_messages(limit=2)
+
+        self.assertEqual([item["message_id"] for item in latest["items"]], [2, 3])
+        self.assertEqual([item["chat_title"] for item in latest["items"]], ["Known Chat", "Known Chat"])
+        self.assertEqual(latest["next_cursor"], 3)
+        self.assertTrue(latest["has_more"])
 
     def test_management_objects_cover_account_origin_policy_and_participants(self) -> None:
         self.store.upsert_account(AccountRecord(source=SOURCE_TELEGRAM, account_id="main", display_name="Main"))
@@ -224,8 +253,46 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(participants[0]["username"], "alice")
         self.assertFalse(participants[0]["is_bot"])
 
+    def test_topic_inherits_archived_parent_state(self) -> None:
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                origin_type="group",
+                title="Archived Forum",
+                is_forum=True,
+            )
+        )
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -1001, archived=True)
+
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                topic_id=42,
+                origin_type="topic",
+                parent_origin_id=-1001,
+                title="Late Topic",
+            )
+        )
+
+        self.assertEqual(self.store.list_origins(account_id="main"), [])
+        archived = self.store.list_origins(account_id="main", include_archived=True)
+        topic = next(origin for origin in archived if origin["topic_id"] == 42)
+        self.assertTrue(topic["archived_at"])
 
     def test_backup_policy_and_capture_cursor_are_queryable(self) -> None:
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                origin_type="group",
+                title="Cursor Chat",
+            )
+        )
         self.store.set_backup_policy(
             BackupPolicyRecord(
                 source=SOURCE_TELEGRAM,
@@ -267,7 +334,28 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNotNone(cursor)
         assert cursor is not None
         self.assertEqual(cursor["last_message_id"], 10)
-        self.assertEqual(self.store.list_capture_cursors(account_id="main")[0]["origin_id"], -1001)
+        listed_cursor = self.store.list_capture_cursors(account_id="main")[0]
+        self.assertEqual(listed_cursor["origin_id"], -1001)
+        self.assertEqual(listed_cursor["origin_title"], "Cursor Chat")
+
+    def test_media_files_include_chat_title(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, account_id="main", chat_id=-1002, title="Media Chat"))
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1002,
+                message_id=22,
+                file_path="/tmp/media.bin",
+                media_kind="photo",
+                downloaded_at=now,
+            )
+        )
+
+        files = self.store.list_media_files(account_id="main")
+
+        self.assertEqual(files[0]["chat_title"], "Media Chat")
 
     def test_operation_events_are_queryable_and_counted_in_state(self) -> None:
         self.store.add_operation_event(

@@ -16,7 +16,14 @@ from tele_mess_core.config import (
     TelegramAccountConfig,
     TelegramConfig,
 )
-from tele_mess_core.models import MessageRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.models import (
+    ChatRecord,
+    MediaFileRecord,
+    MessageRecord,
+    OperationEventRecord,
+    SOURCE_TELEGRAM,
+    utc_now_iso,
+)
 from tele_mess_core.server import SyncApiServer
 from tele_mess_core.server.api import _account_config
 
@@ -27,6 +34,7 @@ class SyncApiTest(unittest.TestCase):
         self.store = ArchiveStore(Path(self.tmp.name) / "archive.db")
         self.store.initialize()
         now = utc_now_iso()
+        self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, chat_id=-1001, title="API Chat"))
         self.store.upsert_message(
             MessageRecord(
                 source=SOURCE_TELEGRAM,
@@ -86,6 +94,29 @@ class SyncApiTest(unittest.TestCase):
         with urlopen(req, timeout=3) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         self.assertEqual(payload["items"][0]["text"], "api payload")
+        self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
+
+    def test_latest_messages_endpoint(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=2,
+                sent_at=now,
+                ingested_at=now,
+                text="newer payload",
+            ),
+            event_type="new",
+        )
+
+        req = Request(f"http://127.0.0.1:{self.port}/sync/messages?latest=true&limit=1")
+        req.add_header("X-Api-Token", "secret")
+        with urlopen(req, timeout=3) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+
+        self.assertEqual(payload["items"][0]["text"], "newer payload")
+        self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
 
     def test_accounts_endpoint(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/sync/accounts")
@@ -99,6 +130,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("tele-mess-core", html)
         self.assertIn("teleMessToken", html)
         self.assertIn('data-view="accounts"', html)
+        self.assertIn('data-view="people">Members', html)
         self.assertIn("/manage/accounts/auth/request-code", html)
         self.assertIn("/manage/accounts/auth/submit-code", html)
         self.assertIn("/manage/discover-origins", html)
@@ -119,8 +151,27 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn('data-action="bulk-remove-origins"', html)
         self.assertIn('data-action="bulk-restore-origins"', html)
         self.assertIn('data-action="bulk-clear-policies"', html)
+        self.assertIn("originSelectionAnchor", html)
+        self.assertIn("selectOriginRange", html)
+        self.assertIn("toggleOriginRowKey", html)
+        self.assertIn("orphanTopics", html)
+        self.assertIn("origin-dragging", html)
+        self.assertIn("event.ctrlKey || event.metaKey", html)
+        self.assertIn("event?.shiftKey", html)
         self.assertIn('data-action="delete-policy"', html)
         self.assertIn('data-action="delete-participant"', html)
+        self.assertIn('id="service-panel"', html)
+        self.assertIn("messages-panel", html)
+        self.assertIn("syncOverviewHeights", html)
+        self.assertIn("/sync/messages?latest=true&limit=100", html)
+        self.assertIn("startMessageAutoRefresh", html)
+        self.assertIn("stopMessageAutoRefresh", html)
+        self.assertIn("operationEvents", html)
+        self.assertIn("messageChatLabel", html)
+        self.assertIn("data-tag-editor", html)
+        self.assertIn("data-tag-remove", html)
+        self.assertIn('id="tag-suggestions"', html)
+        self.assertIn("setupTagEditor", html)
         self.assertNotIn("Manual Origin", html)
         self.assertIn('id="origin-search"', html)
         self.assertIn('id="origin-type-filter"', html)
@@ -146,8 +197,20 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("API token", html)
 
     def test_media_files_endpoint(self) -> None:
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-1001,
+                message_id=1,
+                file_path="/tmp/api-media.bin",
+                media_kind="photo",
+                downloaded_at=utc_now_iso(),
+            )
+        )
+
         payload = self.request_json("/sync/media-files")
-        self.assertEqual(payload["items"], [])
+        self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
 
     def test_operation_events_endpoint(self) -> None:
         self.store.add_operation_event(

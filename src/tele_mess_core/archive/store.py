@@ -242,6 +242,18 @@ class ArchiveStore:
         now = origin.updated_at or utc_now_iso()
         discovered_at = origin.discovered_at or now
         with self._lock:
+            archived_at = origin.archived_at
+            if origin.topic_id and archived_at is None:
+                row = self._conn.execute(
+                    """
+                    SELECT archived_at
+                    FROM origins
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
+                    """,
+                    (origin.source, origin.account_id, origin.origin_id),
+                ).fetchone()
+                if row and row["archived_at"]:
+                    archived_at = row["archived_at"]
             self._conn.execute(
                 """
                 INSERT INTO origins(
@@ -269,7 +281,7 @@ class ArchiveStore:
                     origin.title,
                     origin.username,
                     int(origin.is_forum),
-                    origin.archived_at,
+                    archived_at,
                     origin.last_message_at,
                     discovered_at,
                     now,
@@ -373,6 +385,11 @@ class ArchiveStore:
               p.tags,
               p.updated_at AS policy_updated_at
             FROM origins o
+            LEFT JOIN origins parent
+              ON parent.source = o.source
+             AND parent.account_id = o.account_id
+             AND parent.origin_id = o.origin_id
+             AND parent.topic_id = 0
             LEFT JOIN backup_policies p
               ON p.source = o.source
              AND p.account_id = o.account_id
@@ -386,6 +403,7 @@ class ArchiveStore:
             params.append(account_id)
         if not include_archived:
             clauses.append("o.archived_at IS NULL")
+            clauses.append("(o.topic_id = 0 OR parent.archived_at IS NULL)")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY o.account_id, o.origin_type, o.title, o.origin_id, o.topic_id"
@@ -582,15 +600,21 @@ class ArchiveStore:
 
     def list_capture_cursors(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
-            SELECT source, account_id, origin_id, topic_id, last_message_id,
-                   last_message_at, last_backfill_at, updated_at, raw_json
-            FROM capture_cursors
+            SELECT c.source, c.account_id, c.origin_id, c.topic_id, c.last_message_id,
+                   c.last_message_at, c.last_backfill_at, c.updated_at, c.raw_json,
+                   o.title AS origin_title
+            FROM capture_cursors c
+            LEFT JOIN origins o
+              ON o.source = c.source
+             AND o.account_id = c.account_id
+             AND o.origin_id = c.origin_id
+             AND o.topic_id = c.topic_id
         """
         params: tuple[Any, ...] = ()
         if account_id is not None:
-            sql += " WHERE account_id = ?"
+            sql += " WHERE c.account_id = ?"
             params = (account_id,)
-        sql += " ORDER BY account_id, origin_id, topic_id"
+        sql += " ORDER BY c.account_id, c.origin_id, c.topic_id"
         with self._lock:
             rows = self._conn.execute(sql, params).fetchall()
         return [_row_to_dict(row, json_fields={"raw_json"}) for row in rows]
@@ -869,24 +893,34 @@ class ArchiveStore:
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         sql = """
-            SELECT source, account_id, chat_id, message_id, file_index, file_path,
-                   media_kind, mime_type, file_size, downloaded_at, raw_json
-            FROM media_files
+            SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
+                   m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                   COALESCE(c.title, o.title) AS chat_title
+            FROM media_files m
+            LEFT JOIN chats c
+              ON c.source = m.source
+             AND c.account_id = m.account_id
+             AND c.chat_id = m.chat_id
+            LEFT JOIN origins o
+              ON o.source = m.source
+             AND o.account_id = m.account_id
+             AND o.origin_id = m.chat_id
+             AND o.topic_id = 0
         """
         clauses: list[str] = []
         params: list[Any] = []
         if account_id is not None:
-            clauses.append("account_id = ?")
+            clauses.append("m.account_id = ?")
             params.append(account_id)
         if chat_id is not None:
-            clauses.append("chat_id = ?")
+            clauses.append("m.chat_id = ?")
             params.append(chat_id)
         if message_id is not None:
-            clauses.append("message_id = ?")
+            clauses.append("m.message_id = ?")
             params.append(message_id)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY downloaded_at DESC, account_id, chat_id, message_id, file_index LIMIT ?"
+        sql += " ORDER BY m.downloaded_at DESC, m.account_id, m.chat_id, m.message_id, m.file_index LIMIT ?"
         params.append(_bounded_limit(limit))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
@@ -991,13 +1025,23 @@ class ArchiveStore:
                   m.sender_username, m.sent_at, m.edited_at, m.ingested_at, m.deleted_at,
                   m.text, m.has_media, m.media_kind, m.grouped_id, m.reply_to_message_id,
                   m.forward_from_id, m.forward_from_name, m.permalink, m.reactions_json,
-                  m.raw_json, m.version
+                  m.raw_json, m.version,
+                  COALESCE(c.title, o.title) AS chat_title
                 FROM events e
                 JOIN messages m
                   ON m.source = e.source
                  AND m.chat_id = e.chat_id
                  AND m.account_id = e.account_id
                  AND m.message_id = e.message_id
+                LEFT JOIN chats c
+                  ON c.source = m.source
+                 AND c.account_id = m.account_id
+                 AND c.chat_id = m.chat_id
+                LEFT JOIN origins o
+                  ON o.source = m.source
+                 AND o.account_id = m.account_id
+                 AND o.origin_id = m.chat_id
+                 AND o.topic_id = COALESCE(m.topic_id, 0)
                 WHERE e.seq > ?
                   AND e.message_id IS NOT NULL
                 ORDER BY e.seq ASC
@@ -1007,6 +1051,49 @@ class ArchiveStore:
             ).fetchall()
         messages = [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}) for row in rows]
         next_cursor = messages[-1]["event_seq"] if messages else after_event_seq
+        return {"items": messages, "next_cursor": next_cursor, "has_more": len(messages) == limit}
+
+    def list_latest_messages(self, limit: int = 50) -> dict[str, Any]:
+        limit = _bounded_limit(limit, max_limit=100)
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                WITH latest_events AS (
+                  SELECT source, account_id, chat_id, message_id, MAX(seq) AS event_seq
+                  FROM events
+                  WHERE message_id IS NOT NULL
+                  GROUP BY source, account_id, chat_id, message_id
+                )
+                SELECT
+                  e.event_seq AS event_seq,
+                  m.source, m.account_id, m.chat_id, m.message_id, m.topic_id, m.sender_id, m.sender_name,
+                  m.sender_username, m.sent_at, m.edited_at, m.ingested_at, m.deleted_at,
+                  m.text, m.has_media, m.media_kind, m.grouped_id, m.reply_to_message_id,
+                  m.forward_from_id, m.forward_from_name, m.permalink, m.reactions_json,
+                  m.raw_json, m.version,
+                  COALESCE(c.title, o.title) AS chat_title
+                FROM messages m
+                JOIN latest_events e
+                  ON e.source = m.source
+                 AND e.chat_id = m.chat_id
+                 AND e.account_id = m.account_id
+                 AND e.message_id = m.message_id
+                LEFT JOIN chats c
+                  ON c.source = m.source
+                 AND c.account_id = m.account_id
+                 AND c.chat_id = m.chat_id
+                LEFT JOIN origins o
+                  ON o.source = m.source
+                 AND o.account_id = m.account_id
+                 AND o.origin_id = m.chat_id
+                 AND o.topic_id = COALESCE(m.topic_id, 0)
+                ORDER BY m.sent_at DESC, e.event_seq DESC
+                LIMIT ?
+                """,
+                (limit,),
+            ).fetchall()
+        messages = [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}) for row in rows]
+        next_cursor = max((item["event_seq"] for item in messages), default=0)
         return {"items": messages, "next_cursor": next_cursor, "has_more": len(messages) == limit}
 
     def list_chats(self) -> list[dict[str, Any]]:

@@ -138,12 +138,15 @@ class SyncApiServer:
                 elif path == "/sync/events":
                     self._json(store.list_events(after=_int_param(params, "after", 0), limit=_int_param(params, "limit", 500)))
                 elif path == "/sync/messages":
-                    self._json(
-                        store.list_messages_after(
-                            after_event_seq=_int_param(params, "after", 0),
-                            limit=_int_param(params, "limit", 500),
+                    if _bool_param(params, "latest", False):
+                        self._json(store.list_latest_messages(limit=_int_param(params, "limit", 50)))
+                    else:
+                        self._json(
+                            store.list_messages_after(
+                                after_event_seq=_int_param(params, "after", 0),
+                                limit=_int_param(params, "limit", 500),
+                            )
                         )
-                    )
                 elif path == "/sync/chats":
                     self._json({"items": store.list_chats()})
                 elif path == "/sync/accounts":
@@ -743,7 +746,10 @@ def _console_html() -> str:
     .tab { background: transparent; color: var(--text); border-color: transparent; }
     .tab.active { background: #dbeafe; color: #0f3f8f; border-color: #bfdbfe; }
     .grid { display: grid; grid-template-columns: minmax(280px, 380px) minmax(0, 1fr); gap: 16px; align-items: start; }
+    .overview-grid { align-items: start; }
     .panel { background: var(--surface); border: 1px solid var(--line); border-radius: var(--radius); padding: 14px; }
+    .messages-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); overflow: hidden; }
+    .messages-panel .table-wrap { max-height: none; min-height: 0; }
     summary { cursor: pointer; }
     summary h2 { display: inline; }
     details .form-grid { margin-top: 12px; }
@@ -769,11 +775,22 @@ def _console_html() -> str:
     td.actions { width: 1%; white-space: nowrap; }
     td.actions button + button { margin-left: 6px; }
     tr.removed-row { color: var(--muted); }
+    .origin-table .origin-manage-row { user-select: none; }
+    .origin-table .origin-manage-row td { cursor: pointer; }
+    .origin-table .origin-manage-row td.actions, .origin-table .origin-manage-row td:has(.origin-select) { cursor: auto; }
+    .origin-table tr.origin-selected td { background: #eff6ff; }
+    body.origin-dragging, body.origin-dragging * { user-select: none; }
     .tree-cell { display: flex; align-items: center; gap: 7px; }
     .tree-toggle { width: 22px; min-width: 22px; height: 22px; min-height: 22px; line-height: 20px; padding: 0; border-radius: 4px; font-size: 13px; font-weight: 650; text-align: center; }
     .tree-spacer { width: 22px; min-width: 22px; height: 22px; }
     .topic-row .tree-cell { padding-left: 28px; }
-    .tag-list { color: var(--muted); font-size: 12px; }
+    .tag-list, .tag-chips { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; }
+    .tag-chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid var(--line-strong); border-radius: 999px; padding: 2px 7px; color: var(--muted); background: #f8fafc; font-size: 12px; line-height: 1.4; }
+    .tag-chip.pending-remove { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
+    .tag-remove { display: inline-grid; place-items: center; width: 16px; min-width: 16px; height: 16px; min-height: 16px; padding: 0; border-radius: 999px; border: 0; background: transparent; color: inherit; font-size: 11px; line-height: 1; }
+    .tag-editor { display: flex; flex-wrap: wrap; gap: 5px; align-items: center; min-height: 34px; border: 1px solid var(--line-strong); border-radius: 6px; padding: 4px 6px; background: #fff; }
+    .tag-editor input[data-tag-input] { flex: 1 1 120px; min-width: 120px; width: auto; border: 0; min-height: 24px; padding: 2px; background: transparent; }
+    .tag-editor input[data-tag-input]:focus { outline: none; }
     .origin-select { min-height: 16px; }
     .bulk-toolbar { border-left: 1px solid var(--line); padding-left: 8px; }
     .policy-row td { background: #fbfcfe; }
@@ -793,7 +810,7 @@ def _console_html() -> str:
     pre { margin: 0; overflow: auto; background: #101828; color: #e5e7eb; border-radius: 6px; padding: 10px; max-height: 280px; font-size: 12px; }
     .raw-panel { display: grid; grid-template-rows: auto minmax(0, 1fr); height: calc(100vh - 170px); min-height: 360px; }
     #raw { max-height: none; min-height: 0; height: 100%; }
-    @media (max-width: 920px) { .topbar, .grid, .two, .property-bar { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } th { position: static; } }
+    @media (max-width: 920px) { .topbar, .grid, .two, .property-bar { grid-template-columns: 1fr; } .token-row { grid-template-columns: 1fr; } .messages-panel { height: auto !important; } th { position: static; } }
   </style>
 </head>
 <body>
@@ -804,7 +821,7 @@ def _console_html() -> str:
       <button class=\"tab active\" data-view=\"overview\">Overview</button>
       <button class=\"tab\" data-view=\"accounts\">Accounts</button>
       <button class=\"tab\" data-view=\"origins\">Origins</button>
-      <button class=\"tab\" data-view=\"people\">People</button>
+      <button class=\"tab\" data-view=\"people\">Members</button>
       <button class=\"tab\" data-view=\"files\">Files</button>
       <button class=\"tab\" data-view=\"raw\">Raw</button>
     </nav>
@@ -819,12 +836,12 @@ def _console_html() -> str:
   <div id=\"status\" class=\"status\">Ready</div>
 
   <section id=\"view-overview\" class=\"view stack\">
-    <div class=\"grid\">
-      <div class=\"panel\">
+    <div class=\"grid overview-grid\">
+      <div class=\"panel\" id=\"service-panel\">
         <div class=\"panel-head\"><h2>Service</h2><button data-action=\"load\">Refresh</button></div>
         <div id=\"summary\" class=\"stack\"></div>
       </div>
-      <div class=\"panel\">
+      <div class=\"panel messages-panel\" id=\"recent-panel\">
         <div class=\"panel-head\"><h2>Recent Messages</h2><button data-action=\"load-messages\">Load</button></div>
         <div class=\"table-wrap\"><table><thead><tr><th>Seq</th><th>Account</th><th>Chat</th><th>Message</th><th>Text</th></tr></thead><tbody id=\"messages-body\"></tbody></table></div>
       </div>
@@ -865,7 +882,7 @@ def _console_html() -> str:
         <label>Account<input id=\"origin-filter\" placeholder=\"Account filter\"></label>
         <label>Type<select id=\"origin-type-filter\"><option value=\"\">Any type</option><option value=\"group\">Group</option><option value=\"channel\">Channel</option><option value=\"topic\">Topic</option><option value=\"configured_chat\">Configured</option><option value=\"private\">Private</option><option value=\"unknown\">Unknown</option></select></label>
         <label>Backup<select id=\"origin-backup-filter\"><option value=\"\">Any backup</option><option value=\"on\">On</option><option value=\"off\">Off</option></select></label>
-        <label>Tags<input id=\"origin-tag-filter\" placeholder=\"Tag filter\"></label>
+        <label>Tags<input id=\"origin-tag-filter\" list=\"tag-suggestions\" placeholder=\"Tag filter\"></label>
         <label>Sort<select id=\"origin-sort\"><option value=\"last_desc\">Last message desc</option><option value=\"last_asc\">Last message asc</option><option value=\"title_asc\">Title A-Z</option><option value=\"account_asc\">Account A-Z</option><option value=\"type_asc\">Type A-Z</option><option value=\"backup_desc\">Backup first</option></select></label>
         <label class=\"check\"><input id=\"show-archived\" type=\"checkbox\"> Removed</label>
       </div>
@@ -923,13 +940,25 @@ def _console_html() -> str:
     <label class=\"check\"><input type=\"checkbox\" name=\"capture_text\"> Text</label>
     <label class=\"check\"><input type=\"checkbox\" name=\"capture_media_metadata\"> Media metadata</label>
     <label class=\"check\"><input type=\"checkbox\" name=\"download_media\"> Download media</label>
-    <label>Tags<input name=\"tags\" placeholder=\"tag1, tag2\"></label>
+    <label>Tags
+      <div class=\"tag-editor\" data-tag-editor>
+        <div class=\"tag-chips\" data-tag-chips></div>
+        <input data-tag-input list=\"tag-suggestions\" placeholder=\"Add tag\">
+        <input type=\"hidden\" name=\"tags\">
+      </div>
+    </label>
     <button type=\"submit\">Save policy</button>
   </form>
 </template>
+<datalist id=\"tag-suggestions\"></datalist>
 
 <script>
-const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
+const state = { accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
+let messageRefreshTimer = null;
+let messageRefreshInFlight = false;
+let originSelectionAnchor = null;
+let originDragState = null;
+let ignoreNextOriginClick = false;
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
 tokenInput.value = localStorage.getItem('teleMessToken') || '';
@@ -987,17 +1016,141 @@ function originKey(accountId, originId, topicId=0) {
 function originPayload(accountId, originId, topicId=0) {
   return { account_id: accountId, origin_id: Number(originId), topic_id: Number(topicId || 0) };
 }
+function originEntryFromRow(row) {
+  if (!row?.dataset?.key) return null;
+  return {
+    key: row.dataset.key,
+    payload: originPayload(row.dataset.account, row.dataset.origin, row.dataset.topic),
+  };
+}
+function visibleOriginEntries() {
+  return [...document.querySelectorAll('#origins-body tr[data-key]')].map(originEntryFromRow).filter(Boolean);
+}
+function originRangeEntries(fromKey, toKey) {
+  const entries = visibleOriginEntries();
+  const fromIndex = entries.findIndex(entry => entry.key === fromKey);
+  const toIndex = entries.findIndex(entry => entry.key === toKey);
+  if (fromIndex < 0 || toIndex < 0) return entries.filter(entry => entry.key === toKey);
+  const start = Math.min(fromIndex, toIndex);
+  const end = Math.max(fromIndex, toIndex);
+  return entries.slice(start, end + 1);
+}
+function selectionFromEntries(entries, base={}) {
+  const selected = { ...base };
+  for (const entry of entries) selected[entry.key] = entry.payload;
+  return selected;
+}
+function selectOriginRange(fromKey, toKey, additive=false) {
+  const base = additive ? state.selectedOrigins : {};
+  state.selectedOrigins = selectionFromEntries(originRangeEntries(fromKey, toKey), base);
+}
+function selectOriginRowKey(key, event) {
+  const entry = visibleOriginEntries().find(item => item.key === key);
+  if (!entry) return;
+  const additive = event?.ctrlKey || event?.metaKey;
+  if (event?.shiftKey && originSelectionAnchor) {
+    selectOriginRange(originSelectionAnchor, key, additive);
+  } else if (additive) {
+    state.selectedOrigins = { ...state.selectedOrigins };
+    if (state.selectedOrigins[key]) delete state.selectedOrigins[key];
+    else state.selectedOrigins[key] = entry.payload;
+    originSelectionAnchor = key;
+  } else if (state.selectedOrigins[key]) {
+    state.selectedOrigins = { ...state.selectedOrigins };
+    delete state.selectedOrigins[key];
+    if (!Object.keys(state.selectedOrigins).length) originSelectionAnchor = null;
+  } else {
+    state.selectedOrigins = { [key]: entry.payload };
+    originSelectionAnchor = key;
+  }
+  renderOrigins();
+}
+function toggleOriginRowKey(key, event) {
+  const entry = visibleOriginEntries().find(item => item.key === key);
+  if (!entry) return;
+  if (event?.shiftKey && originSelectionAnchor) {
+    selectOriginRange(originSelectionAnchor, key, true);
+  } else {
+    state.selectedOrigins = { ...state.selectedOrigins };
+    if (state.selectedOrigins[key]) delete state.selectedOrigins[key];
+    else state.selectedOrigins[key] = entry.payload;
+    originSelectionAnchor = key;
+  }
+  renderOrigins();
+}
+function clearOriginSelection() {
+  state.selectedOrigins = {};
+  originSelectionAnchor = null;
+  originDragState = null;
+  ignoreNextOriginClick = false;
+  document.body?.classList.remove('origin-dragging');
+}
 function normalized(value) {
   return value === null || value === undefined ? '' : String(value).toLowerCase();
 }
 function originTags(item) {
   return item.backup_policy?.tags || '';
 }
+function splitTags(value) {
+  return String(value || '').split(',').map(tag => tag.trim()).filter(Boolean);
+}
+function uniqueTags(tags) {
+  const seen = new Set();
+  const result = [];
+  for (const tag of tags) {
+    const key = tag.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    result.push(tag);
+  }
+  return result;
+}
+function allTags() {
+  return uniqueTags([
+    ...state.policies.flatMap(item => splitTags(item.tags)),
+    ...state.origins.flatMap(item => splitTags(originTags(item))),
+  ]).sort((a, b) => a.localeCompare(b));
+}
+function refreshTagSuggestions() {
+  const list = $('tag-suggestions');
+  if (!list) return;
+  list.innerHTML = allTags().map(tag => `<option value=\"${attr(tag)}\"></option>`).join('');
+}
+function renderTags(value, removable=false) {
+  const tags = Array.isArray(value) ? value : splitTags(value);
+  if (!tags.length) return '<span class=\"muted\">-</span>';
+  return tags.map((tag, index) => `<span class=\"tag-chip\" data-tag-index=\"${index}\"><span>${text(tag)}</span>${removable ? `<button type=\"button\" class=\"tag-remove\" data-tag-remove=\"${index}\" aria-label=\"Remove ${attr(tag)}\">x</button>` : ''}</span>`).join('');
+}
 function originBackupState(item) {
   return item.backup_policy?.enabled ? 'on' : 'off';
 }
 function originLastMessageValue(item) {
   return item.last_message_at || '';
+}
+function messageChatLabel(item) {
+  return item.chat_title || item.chat_id;
+}
+function originTitle(accountId, originId, topicId=0) {
+  const origin = state.origins.find(item => item.account_id === accountId && item.origin_id === originId && (item.topic_id ?? 0) === (topicId || 0));
+  return origin?.title || originId;
+}
+function cursorOriginLabel(item) {
+  return item.origin_title || originTitle(item.account_id, item.origin_id, item.topic_id);
+}
+function mediaChatLabel(item) {
+  return item.chat_title || originTitle(item.account_id, item.chat_id, 0);
+}
+function syncOverviewHeights() {
+  const service = $('service-panel');
+  const recent = $('recent-panel');
+  if (!service || !recent) return;
+  const wide = window.matchMedia('(min-width: 921px)').matches;
+  if (!wide || service.offsetParent === null || recent.offsetParent === null) {
+    recent.style.height = '';
+    return;
+  }
+  const height = Math.ceil(service.getBoundingClientRect().height);
+  if (height > 0) recent.style.height = `${height}px`;
 }
 function originPath() {
   const params = new URLSearchParams();
@@ -1010,7 +1163,8 @@ function originPath() {
 async function loadOrigins() {
   const data = await api(originPath());
   state.origins = data.items || [];
-  state.selectedOrigins = {};
+  clearOriginSelection();
+  refreshTagSuggestions();
   renderOrigins();
   renderSummary();
   renderRaw();
@@ -1018,29 +1172,54 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [service, accounts, origins, policies, participants, cursors, media] = await Promise.all([
+    const [service, accounts, origins, policies, participants, cursors, operationEvents, media, messages] = await Promise.all([
       api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
-      api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files')
+      api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
+      api('/sync/messages?latest=true&limit=100')
     ]);
     state.service = service;
     state.accounts = accounts.items || [];
     state.origins = origins.items || [];
-    state.selectedOrigins = {};
+    clearOriginSelection();
     state.policies = policies.items || [];
     state.participants = participants.items || [];
     state.cursors = cursors.items || [];
+    state.operationEvents = operationEvents.items || [];
     state.media = media.items || [];
+    state.messages = messages.items || [];
+    refreshTagSuggestions();
     renderAll();
+    startMessageAutoRefresh();
     setStatus('Loaded', 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
 }
-async function loadMessages() {
-  const data = await api('/sync/messages?after=0&limit=50');
-  state.messages = data.items || [];
-  renderMessages();
+async function loadMessages(options={}) {
+  if (messageRefreshInFlight) return;
+  messageRefreshInFlight = true;
+  const previousTop = state.messages[0]?.event_seq;
+  try {
+    const data = await api('/sync/messages?latest=true&limit=100');
+    state.messages = data.items || [];
+    renderMessages(previousTop);
+    if (!options.silent) setStatus('Messages loaded', 'ok');
+  } finally {
+    messageRefreshInFlight = false;
+  }
+}
+function startMessageAutoRefresh() {
+  if (messageRefreshTimer || !tokenValue()) return;
+  messageRefreshTimer = window.setInterval(() => {
+    if (!tokenValue()) return;
+    loadMessages({ silent: true }).catch(error => setStatus(String(error), 'error'));
+  }, 10000);
+}
+function stopMessageAutoRefresh() {
+  if (!messageRefreshTimer) return;
+  window.clearInterval(messageRefreshTimer);
+  messageRefreshTimer = null;
 }
 function renderAll() {
-  renderSummary(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderMedia(); renderRaw();
+  renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderMedia(); renderRaw();
 }
 function renderSummary() {
   const html = [
@@ -1052,6 +1231,7 @@ function renderSummary() {
     `<div><span class=\"muted\">Participants</span> ${state.participants.length}</div>`
   ].join('');
   $('summary').innerHTML = html;
+  requestAnimationFrame(syncOverviewHeights);
 }
 function renderAccounts() {
   fillTable('accounts-body', state.accounts.map(item => `<tr>
@@ -1065,6 +1245,7 @@ function renderOrigins() {
   const topicsByParent = {};
   const parentKeys = new Set();
   const parents = [];
+  const orphanTopics = [];
   for (const item of visibleOrigins) {
     const topicId = item.topic_id ?? 0;
     const key = `${item.account_id}:${item.origin_id}:0`;
@@ -1079,7 +1260,7 @@ function renderOrigins() {
     const topicId = item.topic_id ?? 0;
     const key = `${item.account_id}:${item.origin_id}:0`;
     if (topicId && !parentKeys.has(key)) {
-      parents.push(item);
+      orphanTopics.push(item);
     }
   }
   const rows = [];
@@ -1091,6 +1272,7 @@ function renderOrigins() {
       for (const child of children) rows.push(originRow(child, 0, true));
     }
   }
+  for (const item of orphanTopics) rows.push(originRow(item, 0, true));
   fillTable('origins-body', rows, state.manageOrigins ? 9 : 8);
   updateOriginBulk();
 }
@@ -1143,9 +1325,14 @@ function originRow(item, childCount, isTopic) {
   const backup = item.archived_at ? pill('removed') : policy ? pill(policy.enabled ? 'on' : 'off') : pill('off');
   const removeLabel = item.archived_at ? 'Restore' : 'Remove';
   const removeAction = item.archived_at ? 'restore-origin' : 'remove-origin';
-  const rowClass = `${item.archived_at ? 'removed-row ' : ''}${isTopic ? 'topic-row' : ''}`.trim();
+  const rowClass = [
+    item.archived_at ? 'removed-row' : '',
+    isTopic ? 'topic-row' : '',
+    state.manageOrigins ? 'origin-manage-row' : '',
+    state.selectedOrigins[rowKey] ? 'origin-selected' : '',
+  ].filter(Boolean).join(' ');
   const selectCell = state.manageOrigins ? `<td><input class=\"origin-select\" type=\"checkbox\" data-action=\"select-origin-row\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" ${state.selectedOrigins[rowKey] ? 'checked' : ''}></td>` : '';
-  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td>${text(item.last_message_at)}</td><td class=\"tag-list\">${text(policyTags)}</td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
+  return `<tr class=\"${attr(rowClass)}\" data-key=\"${attr(rowKey)}\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\">${selectCell}<td>${text(item.account_id)}</td><td><div class=\"tree-cell\">${toggle}<span>${text(item.origin_id)}${topicId ? `/${text(topicId)}` : ''}</span></div></td><td>${text(item.origin_type)}</td><td>${text(item.title)}${childCount ? ` <span class=\"muted\">(${text(childCount)} topics)</span>` : ''}</td><td>${text(item.last_message_at)}</td><td><div class=\"tag-list\">${renderTags(policyTags)}</div></td><td>${backup}</td><td class=\"actions\"><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"edit-policy\">Policy</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"select-origin\">Select</button><button data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"delete-policy\">Clear policy</button><button class=\"danger\" data-origin=\"${attr(item.origin_id)}\" data-topic=\"${attr(topicId)}\" data-account=\"${attr(item.account_id)}\" data-action=\"${removeAction}\">${removeLabel}</button></td></tr>`;
 }
 function updateOriginBulk() {
   const bulk = $('origin-bulk');
@@ -1157,7 +1344,7 @@ function updateOriginBulk() {
   $('origin-selection').textContent = `${count} selected`;
 }
 function visibleOriginPayloads() {
-  return [...document.querySelectorAll('.origin-select')].map(input => originPayload(input.dataset.account, input.dataset.origin, input.dataset.topic));
+  return visibleOriginEntries().map(entry => entry.payload);
 }
 function selectedOriginPayloads() {
   return Object.values(state.selectedOrigins);
@@ -1166,15 +1353,82 @@ function renderParticipants() {
   fillTable('participants-body', state.participants.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.username || item.user_id)}</td><td>${text(item.display_name)}</td><td>${text(item.role)}</td><td class=\"actions\"><button class=\"danger\" data-account=\"${attr(item.account_id)}\" data-origin=\"${attr(item.origin_id)}\" data-user=\"${attr(item.user_id)}\" data-action=\"delete-participant\">Delete</button></td></tr>`), 6);
 }
 function renderCursors() {
-  fillTable('cursors-body', state.cursors.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.origin_id)}</td><td>${text(item.topic_id)}</td><td>${text(item.last_message_id)}</td><td>${text(item.last_backfill_at)}</td></tr>`), 5);
+  fillTable('cursors-body', state.cursors.map(item => `<tr><td>${text(item.account_id)}</td><td title=\"${attr(item.origin_id)}\">${text(cursorOriginLabel(item))}</td><td>${text(item.topic_id)}</td><td>${text(item.last_message_id)}</td><td>${text(item.last_backfill_at)}</td></tr>`), 5);
 }
 function renderMedia() {
-  fillTable('media-body', state.media.map(item => `<tr><td>${text(item.account_id)}</td><td>${text(item.chat_id)}</td><td>${text(item.message_id)}</td><td>${text(item.media_kind)}</td><td>${text(item.file_path)}</td></tr>`), 5);
+  fillTable('media-body', state.media.map(item => `<tr><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(mediaChatLabel(item))}</td><td>${text(item.message_id)}</td><td>${text(item.media_kind)}</td><td>${text(item.file_path)}</td></tr>`), 5);
 }
-function renderMessages() {
-  fillTable('messages-body', state.messages.map(item => `<tr><td>${text(item.event_seq)}</td><td>${text(item.account_id)}</td><td>${text(item.chat_id)}</td><td>${text(item.message_id)}</td><td>${text((item.text || '').slice(0, 120))}</td></tr>`), 5);
+function renderMessages(previousTop) {
+  fillTable('messages-body', state.messages.map(item => `<tr><td>${text(item.event_seq)}</td><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(messageChatLabel(item))}</td><td>${text(item.message_id)}</td><td>${text((item.text || '').slice(0, 120))}</td></tr>`), 5);
+  const nextTop = state.messages[0]?.event_seq;
+  if (previousTop && nextTop && previousTop !== nextTop) {
+    const wrap = $('messages-body').closest('.table-wrap');
+    if (wrap) wrap.scrollTop = 0;
+  }
+  requestAnimationFrame(syncOverviewHeights);
 }
 function renderRaw() { $('raw').textContent = JSON.stringify(state, null, 2); }
+function setupTagEditor(editor, initialTags='') {
+  if (!editor) return;
+  const chips = editor.querySelector('[data-tag-chips]');
+  const input = editor.querySelector('[data-tag-input]');
+  const hidden = editor.querySelector('input[name=\"tags\"]');
+  let tags = uniqueTags(splitTags(initialTags));
+  const clearPending = () => {
+    editor.dataset.backspaceArmed = '';
+    chips.querySelectorAll('.pending-remove').forEach(chip => chip.classList.remove('pending-remove'));
+  };
+  const render = () => {
+    hidden.value = tags.join(',');
+    chips.innerHTML = renderTags(tags, true);
+  };
+  const markPending = () => {
+    const last = chips.querySelector('.tag-chip:last-child');
+    chips.querySelectorAll('.pending-remove').forEach(chip => chip.classList.remove('pending-remove'));
+    if (last) last.classList.add('pending-remove');
+  };
+  const addFromInput = () => {
+    const next = splitTags(input.value);
+    if (!next.length) return false;
+    tags = uniqueTags([...tags, ...next]);
+    input.value = '';
+    clearPending();
+    render();
+    return true;
+  };
+  editor.addEventListener('click', () => input.focus());
+  chips.addEventListener('click', event => {
+    const button = event.target.closest('[data-tag-remove]');
+    if (!button) return;
+    tags.splice(Number(button.dataset.tagRemove), 1);
+    clearPending();
+    render();
+    input.focus();
+  });
+  input.addEventListener('keydown', event => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      addFromInput();
+      return;
+    }
+    if (event.key === 'Backspace' && input.value === '') {
+      event.preventDefault();
+      if (editor.dataset.backspaceArmed === '1') {
+        tags.pop();
+        clearPending();
+        render();
+      } else if (tags.length) {
+        editor.dataset.backspaceArmed = '1';
+        markPending();
+      }
+      return;
+    }
+    clearPending();
+  });
+  input.addEventListener('input', clearPending);
+  input.addEventListener('blur', addFromInput);
+  render();
+}
 async function post(path, data, method='POST') {
   setStatus('Saving');
   const result = await api(path, { method, body: JSON.stringify(data) });
@@ -1204,7 +1458,7 @@ async function bulkSetOriginsRemoved(removed) {
   for (const item of items) {
     await api('/manage/origins/archive', { method: 'PATCH', body: JSON.stringify({ ...item, archived: removed }) });
   }
-  state.selectedOrigins = {};
+  clearOriginSelection();
   await loadAll();
   setStatus(removed ? 'Selected origins removed' : 'Selected origins restored', 'ok');
 }
@@ -1216,7 +1470,7 @@ async function bulkClearPolicies() {
   for (const item of items) {
     await api('/manage/backup-policies', { method: 'DELETE', body: JSON.stringify(item) });
   }
-  state.selectedOrigins = {};
+  clearOriginSelection();
   await loadAll();
   setStatus('Selected policies cleared', 'ok');
 }
@@ -1226,6 +1480,67 @@ function selectedOriginAccount() {
   if (filtered) return filtered;
   return state.accounts.length === 1 ? state.accounts[0].account_id : '';
 }
+function isOriginSelectionTarget(target) {
+  return target.closest('button, a, input:not(.origin-select), select, textarea, label, .actions, .policy-row');
+}
+function applyOriginDragSelection(toKey) {
+  if (!originDragState) return;
+  selectOriginRange(originDragState.startKey, toKey, false);
+  if (originDragState.additive) {
+    state.selectedOrigins = { ...originDragState.baseSelection, ...state.selectedOrigins };
+  }
+  renderOrigins();
+}
+document.addEventListener('mousedown', (event) => {
+  if (!state.manageOrigins || event.button !== 0) return;
+  const row = event.target.closest('#origins-body tr[data-key]');
+  if (!row || isOriginSelectionTarget(event.target)) return;
+  const entry = originEntryFromRow(row);
+  if (!entry) return;
+  originDragState = {
+    startKey: entry.key,
+    baseSelection: { ...state.selectedOrigins },
+    additive: event.ctrlKey || event.metaKey,
+    dragged: false,
+    lastKey: entry.key,
+  };
+});
+document.addEventListener('mouseover', (event) => {
+  if (!originDragState) return;
+  const row = event.target.closest('#origins-body tr[data-key]');
+  if (!row) return;
+  const entry = originEntryFromRow(row);
+  if (!entry || entry.key === originDragState.lastKey) return;
+  originDragState.lastKey = entry.key;
+  originDragState.dragged = true;
+  ignoreNextOriginClick = true;
+  document.body.classList.add('origin-dragging');
+  applyOriginDragSelection(entry.key);
+});
+document.addEventListener('mouseup', () => {
+  if (!originDragState) return;
+  originSelectionAnchor = originDragState.startKey;
+  originDragState = null;
+  document.body.classList.remove('origin-dragging');
+});
+document.addEventListener('click', (event) => {
+  if (!state.manageOrigins) return;
+  const checkbox = event.target.closest('[data-action=\"select-origin-row\"]');
+  if (checkbox) {
+    event.preventDefault();
+    event.stopPropagation();
+    toggleOriginRowKey(checkbox.dataset.key, event);
+    return;
+  }
+  const row = event.target.closest('#origins-body tr[data-key]');
+  if (!row || isOriginSelectionTarget(event.target)) return;
+  if (ignoreNextOriginClick) {
+    ignoreNextOriginClick = false;
+    event.preventDefault();
+    return;
+  }
+  selectOriginRowKey(row.dataset.key, event);
+});
 document.addEventListener('click', async (event) => {
   const target = event.target.closest('button');
   if (!target) return;
@@ -1235,6 +1550,7 @@ document.addEventListener('click', async (event) => {
       localStorage.setItem('teleMessToken', tokenValue());
       setStatus(tokenValue() ? 'Token saved' : 'Token cleared', tokenValue() ? 'ok' : 'warn');
       if (tokenValue()) await loadAll();
+      else stopMessageAutoRefresh();
     }
     else if (target.id === 'refresh' || action === 'load') await loadAll();
     else if (action === 'load-messages') await loadMessages();
@@ -1255,30 +1571,23 @@ document.addEventListener('click', async (event) => {
     else if (action === 'filter-origins' || action === 'reload-origins') { await loadOrigins(); setStatus('Origins loaded', 'ok'); }
     else if (action === 'refresh-origins') { const accountId = selectedOriginAccount(); if (!accountId) throw new Error('Select or enter an account first'); await post('/manage/discover-origins', { account_id: accountId, include_topics: true, topic_limit: 500 }); }
     else if (action === 'toggle-origin') { state.expandedOrigins[target.dataset.key] = !state.expandedOrigins[target.dataset.key]; renderOrigins(); }
-    else if (action === 'toggle-origin-manage') { state.manageOrigins = !state.manageOrigins; state.selectedOrigins = {}; renderOrigins(); }
+    else if (action === 'toggle-origin-manage') { state.manageOrigins = !state.manageOrigins; clearOriginSelection(); renderOrigins(); }
     else if (action === 'select-visible-origins') { for (const item of visibleOriginPayloads()) state.selectedOrigins[originKey(item.account_id, item.origin_id, item.topic_id)] = item; renderOrigins(); }
-    else if (action === 'clear-origin-selection') { state.selectedOrigins = {}; renderOrigins(); }
+    else if (action === 'clear-origin-selection') { clearOriginSelection(); renderOrigins(); }
     else if (action === 'bulk-remove-origins') await bulkSetOriginsRemoved(true);
     else if (action === 'bulk-restore-origins') await bulkSetOriginsRemoved(false);
     else if (action === 'bulk-clear-policies') await bulkClearPolicies();
     else if (action === 'edit-policy') openPolicy(target);
   } catch (error) { setStatus(String(error), 'error'); }
 });
-document.addEventListener('change', (event) => {
-  const target = event.target.closest('[data-action=\"select-origin-row\"]');
-  if (!target) return;
-  const payload = originPayload(target.dataset.account, target.dataset.origin, target.dataset.topic);
-  const key = originKey(payload.account_id, payload.origin_id, payload.topic_id);
-  if (target.checked) state.selectedOrigins[key] = payload;
-  else delete state.selectedOrigins[key];
-  updateOriginBulk();
-});
 document.querySelectorAll('.tab').forEach(button => button.addEventListener('click', () => {
   document.querySelectorAll('.tab').forEach(tab => tab.classList.remove('active'));
   button.classList.add('active');
   document.querySelectorAll('.view').forEach(view => view.classList.add('hidden'));
   $(`view-${button.dataset.view}`).classList.remove('hidden');
+  requestAnimationFrame(syncOverviewHeights);
 }));
+window.addEventListener('resize', syncOverviewHeights);
 $('account-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/accounts', formData(event.target)); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
@@ -1289,6 +1598,7 @@ $('show-archived').addEventListener('change', async () => { try { await loadOrig
   if (input) input.addEventListener('change', renderOrigins);
 });
 function openPolicy(button) {
+  refreshTagSuggestions();
   const accountId = button.dataset.account;
   const originId = Number(button.dataset.origin);
   const topicId = Number(button.dataset.topic || 0);
@@ -1305,7 +1615,7 @@ function openPolicy(button) {
   form.capture_text.checked = policy.capture_text ?? origin?.backup_policy?.capture_text ?? true;
   form.capture_media_metadata.checked = policy.capture_media_metadata ?? origin?.backup_policy?.capture_media_metadata ?? true;
   form.download_media.checked = policy.download_media ?? origin?.backup_policy?.download_media ?? false;
-  form.tags.value = policy.tags ?? origin?.backup_policy?.tags ?? '';
+  setupTagEditor(form.querySelector('[data-tag-editor]'), policy.tags ?? origin?.backup_policy?.tags ?? '');
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/backup-policies', numberFields(formData(form), ['origin_id','topic_id']), 'PATCH'); row.remove(); } catch (error) { setStatus(String(error), 'error'); } });
   cell.appendChild(form); row.appendChild(cell); button.closest('tr').after(row);
 }

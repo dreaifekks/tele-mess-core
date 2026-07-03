@@ -7,7 +7,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import MediaDownloadConfig, TelegramAccountConfig
+from tele_mess_core.config import BackfillConfig, MediaDownloadConfig, TelegramAccountConfig
 from tele_mess_core.models import BackupPolicyRecord, SOURCE_TELEGRAM
 from tele_mess_core.telegram.ingest import TelegramArchiveService
 
@@ -66,6 +66,35 @@ class FakeMessage:
 
     def to_dict(self):
         return {"id": self.id, "chat_id": self.chat_id, "text": self.text, "has_media": self.media is not None}
+
+
+class FakeBackfillIterator:
+    def __init__(self, messages: list[FakeMessage] | None = None, error: Exception | None = None):
+        self.messages = list(messages or [])
+        self.error = error
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        if self.error:
+            error = self.error
+            self.error = None
+            raise error
+        if not self.messages:
+            raise StopAsyncIteration
+        return self.messages.pop(0)
+
+
+class FakeBackfillClient:
+    def __init__(self, results):
+        self.results = results
+
+    def iter_messages(self, chat_id, **kwargs):
+        result = self.results[chat_id]
+        if isinstance(result, Exception):
+            return FakeBackfillIterator(error=result)
+        return FakeBackfillIterator(messages=result)
 
 
 class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
@@ -193,6 +222,32 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         events = self.store.list_operation_events(account_id="main", status="failed")
         self.assertEqual(events[0]["operation"], "media_download")
         self.assertEqual(events[0]["error_code"], "media_download_failed")
+
+    async def test_backfill_failure_records_operation_and_continues(self) -> None:
+        for chat_id in (-1007, -1008):
+            self.store.set_backup_policy(
+                BackupPolicyRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=chat_id,
+                    enabled=True,
+                )
+            )
+        self.service.backfill = BackfillConfig(enabled=True, initial_limit=100, catch_up_limit=100)
+        self.service.client = FakeBackfillClient(
+            {
+                -1007: RuntimeError("private history"),
+                -1008: [FakeMessage(21, -1008, text="still captured")],
+            }
+        )
+
+        await self.service._backfill_configured_chats([-1007, -1008])
+
+        self.assertEqual(self.store.state()["message_count"], 1)
+        self.assertEqual(self.store.list_latest_messages()["items"][0]["text"], "still captured")
+        events = self.store.list_operation_events(account_id="main", status="failed")
+        self.assertEqual(events[0]["operation"], "backfill")
+        self.assertEqual(events[0]["subject_id"], "-1007")
 
 
 if __name__ == "__main__":
