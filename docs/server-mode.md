@@ -61,15 +61,11 @@ telegram:
       api_hash: "your_api_hash_here"
       session_name: "main"
       session_dir: "/home/dreaife/.local/share/tele-mess-core/sessions"
-      chats:
-        - id: -1001234567890
-          name: "Source Group"
     - account_id: "alt"
       api_id: 654321
       api_hash: "another_api_hash_here"
       session_name: "alt"
       session_dir: "/home/dreaife/.local/share/tele-mess-core/sessions"
-      chats: []
 
 server:
   host: "127.0.0.1"
@@ -82,6 +78,10 @@ logging:
 
 For Mac access from another machine, bind `server.host` to a LAN/Tailscale
 address or put a reverse proxy in front of the local server.
+
+Telegram chat/channel/private/topic sources are not configured in YAML. Use
+`/console` or the management API to discover origins and enable backup policies;
+the running ingestion process reads enabled policies from SQLite.
 
 ## Commands
 

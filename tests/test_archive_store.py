@@ -152,6 +152,38 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(latest["next_cursor"], 3)
         self.assertTrue(latest["has_more"])
 
+    def test_topic_message_latest_includes_origin_title(self) -> None:
+        self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, account_id="main", chat_id=-1001, title="Forum"))
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                topic_id=42,
+                origin_type="topic",
+                parent_origin_id=-1001,
+                title="Topic One",
+            )
+        )
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1001,
+                topic_id=42,
+                message_id=4,
+                sent_at="2026-01-04T00:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="topic payload",
+            ),
+            event_type="new",
+        )
+
+        latest = self.store.list_latest_messages(limit=1)
+
+        self.assertEqual(latest["items"][0]["chat_title"], "Forum")
+        self.assertEqual(latest["items"][0]["origin_title"], "Topic One")
+
     def test_management_objects_cover_account_origin_policy_and_participants(self) -> None:
         self.store.upsert_account(AccountRecord(source=SOURCE_TELEGRAM, account_id="main", display_name="Main"))
         self.store.upsert_account_auth(

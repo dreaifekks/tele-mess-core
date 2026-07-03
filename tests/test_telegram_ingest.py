@@ -27,6 +27,7 @@ class FakeMessage:
         chat_id: int,
         text: str = "hello",
         media: object | None = None,
+        reply_to: object | None = None,
         fail_download_times: int = 0,
         empty_download: bool = False,
     ):
@@ -39,7 +40,7 @@ class FakeMessage:
         self.media = media
         self.grouped_id = 99 if media else None
         self.reply_to_msg_id = None
-        self.reply_to = None
+        self.reply_to = reply_to
         self.fwd_from = None
         self.reactions = None
         self.fail_download_times = fail_download_times
@@ -122,8 +123,10 @@ class FakeBackfillIterator:
 class FakeBackfillClient:
     def __init__(self, results):
         self.results = results
+        self.calls = []
 
     def iter_messages(self, chat_id, **kwargs):
+        self.calls.append((chat_id, kwargs))
         result = self.results[chat_id]
         if isinstance(result, Exception):
             return FakeBackfillIterator(error=result)
@@ -140,7 +143,6 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             api_id=1,
             api_hash="hash",
             session_name="main",
-            chats=[],
         )
         self.service = TelegramArchiveService(self.config, self.store, media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0))
 
@@ -192,6 +194,44 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertFalse(stored)
         self.assertEqual(self.store.state()["message_count"], 0)
+
+    async def test_topic_policy_captures_topic_message_without_parent_policy(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                topic_id=42,
+                enabled=True,
+            )
+        )
+        reply_to = SimpleNamespace(reply_to_top_id=42, reply_to_msg_id=100)
+
+        stored = await self.service._store_message(FakeMessage(20, -1001, reply_to=reply_to), event_type="new")
+
+        self.assertTrue(stored)
+        latest = self.store.list_latest_messages()["items"]
+        self.assertEqual(latest[0]["message_id"], 20)
+        self.assertEqual(latest[0]["topic_id"], 42)
+        cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, "main", -1001, 42)
+        self.assertIsNotNone(cursor)
+        assert cursor is not None
+        self.assertEqual(cursor["last_message_id"], 20)
+
+    def test_capture_targets_include_enabled_management_policies(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(source=SOURCE_TELEGRAM, account_id="main", origin_id=-1002, enabled=True)
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(source=SOURCE_TELEGRAM, account_id="main", origin_id=-1003, topic_id=42, enabled=True)
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(source=SOURCE_TELEGRAM, account_id="main", origin_id=-1004, enabled=False)
+        )
+
+        targets = self.service._capture_targets()
+
+        self.assertEqual({(target.chat_id, target.topic_id) for target in targets}, {(-1002, 0), (-1003, 42)})
 
     async def test_download_media_policy_writes_media_file(self) -> None:
         self.store.set_backup_policy(
@@ -364,13 +404,34 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        await self.service._backfill_configured_chats([-1008, -1009])
+        await self.service._backfill_capture_targets(self.service._capture_targets())
 
         self.assertEqual(self.store.state()["message_count"], 1)
         self.assertEqual(self.store.list_latest_messages()["items"][0]["text"], "still captured")
         events = self.store.list_operation_events(account_id="main", status="failed")
         self.assertEqual(events[0]["operation"], "backfill")
         self.assertEqual(events[0]["subject_id"], "-1008")
+
+    async def test_topic_backfill_uses_topic_policy_target(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1012,
+                topic_id=77,
+                enabled=True,
+            )
+        )
+        self.service.backfill = BackfillConfig(enabled=True, initial_limit=100, catch_up_limit=100)
+        self.service.client = FakeBackfillClient(
+            {-1012: [FakeMessage(22, -1012, text="topic backfill", reply_to=SimpleNamespace(reply_to_top_id=77))]}
+        )
+
+        await self.service._backfill_capture_targets(self.service._capture_targets())
+
+        self.assertEqual(self.store.list_latest_messages()["items"][0]["text"], "topic backfill")
+        self.assertEqual(self.service.client.calls[0][0], -1012)
+        self.assertEqual(self.service.client.calls[0][1]["reply_to"], 77)
 
 
 if __name__ == "__main__":

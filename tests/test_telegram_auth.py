@@ -73,7 +73,6 @@ class TelegramAuthTest(unittest.IsolatedAsyncioTestCase):
             api_id=1,
             api_hash="hash",
             session_name="main",
-            chats=[],
         )
         self.client = FakeClient()
         self.service = FakeAuthService(self.config, self.store, self.client)

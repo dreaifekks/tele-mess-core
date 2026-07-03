@@ -1166,7 +1166,8 @@ class ArchiveStore:
                   m.text, m.has_media, m.media_kind, m.grouped_id, m.reply_to_message_id,
                   m.forward_from_id, m.forward_from_name, m.permalink, m.reactions_json,
                   m.raw_json, m.version,
-                  COALESCE(c.title, o.title) AS chat_title
+                  COALESCE(c.title, o.title) AS chat_title,
+                  o.title AS origin_title
                 FROM events e
                 JOIN messages m
                   ON m.source = e.source
@@ -1211,7 +1212,8 @@ class ArchiveStore:
                   m.text, m.has_media, m.media_kind, m.grouped_id, m.reply_to_message_id,
                   m.forward_from_id, m.forward_from_name, m.permalink, m.reactions_json,
                   m.raw_json, m.version,
-                  COALESCE(c.title, o.title) AS chat_title
+                  COALESCE(c.title, o.title) AS chat_title,
+                  o.title AS origin_title
                 FROM messages m
                 JOIN latest_events e
                   ON e.source = m.source

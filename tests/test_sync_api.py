@@ -571,7 +571,6 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(account.api_hash, "hash")
         self.assertEqual(account.session_name, "second-main")
         self.assertEqual(account.session_dir, session_dir)
-        self.assertEqual(account.chats, [])
 
 
 if __name__ == "__main__":

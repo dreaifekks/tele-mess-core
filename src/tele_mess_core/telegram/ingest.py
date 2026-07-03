@@ -1,8 +1,9 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
-import asyncio
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -11,19 +12,23 @@ from tele_mess_core.config import BackfillConfig, MediaDownloadConfig, TelegramA
 from tele_mess_core.models import (
     AccountAuthRecord,
     AccountRecord,
-    BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
     MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
-    OriginRecord,
     SOURCE_TELEGRAM,
     UserRecord,
     to_iso,
     utc_now_iso,
 )
 from tele_mess_core.telegram.runtime import classify_telegram_exception
+
+
+@dataclass(frozen=True, slots=True)
+class CaptureTarget:
+    chat_id: int
+    topic_id: int = 0
 
 
 class TelegramArchiveService:
@@ -71,49 +76,21 @@ class TelegramArchiveService:
             )
         )
 
-        chat_ids = [chat.id for chat in self.config.chats]
-        for chat in self.config.chats:
-            self.store.upsert_chat(
-                ChatRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=self.account_id,
-                    chat_id=chat.id,
-                    title=chat.name,
-                    updated_at=utc_now_iso(),
-                )
-            )
-            self.store.upsert_origin(
-                OriginRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=self.account_id,
-                    origin_id=chat.id,
-                    origin_type="configured_chat",
-                    title=chat.name,
-                    updated_at=utc_now_iso(),
-                )
-            )
-            self.store.set_backup_policy(
-                BackupPolicyRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=self.account_id,
-                    origin_id=chat.id,
-                    enabled=True,
-                    capture_text=True,
-                    capture_media_metadata=True,
-                    download_media=False,
-                    updated_at=utc_now_iso(),
-                )
-            )
+        capture_targets = self._capture_targets()
 
-        self.logger.info("Monitoring %s Telegram chats for account %s", len(chat_ids), self.account_id)
+        self.logger.info(
+            "Monitoring Telegram messages for account %s with %s enabled capture targets",
+            self.account_id,
+            len(capture_targets),
+        )
 
-        @self.client.on(events.NewMessage(chats=chat_ids))
+        @self.client.on(events.NewMessage())
         async def on_new(event: Any) -> None:
             if isinstance(event.message, MessageService):
                 return
             await self._store_message(event.message, event_type="new")
 
-        @self.client.on(events.MessageEdited(chats=chat_ids))
+        @self.client.on(events.MessageEdited())
         async def on_edit(event: Any) -> None:
             original_update = getattr(event, "original_update", None)
             if isinstance(original_update, UpdateMessageReactions):
@@ -122,10 +99,10 @@ class TelegramArchiveService:
                 return
             await self._store_message(event.message, event_type="edit")
 
-        @self.client.on(events.MessageDeleted(chats=chat_ids))
+        @self.client.on(events.MessageDeleted())
         async def on_delete(event: Any) -> None:
             chat_id = getattr(event, "chat_id", None)
-            if chat_id is None or not self._policy_for(int(chat_id)).get("enabled", False):
+            if chat_id is None or not self._has_enabled_policy_for_chat(int(chat_id)):
                 return
             self.store.mark_deleted(
                 source=SOURCE_TELEGRAM,
@@ -141,8 +118,8 @@ class TelegramArchiveService:
             if not isinstance(event, UpdateMessageReactions):
                 return
             peer_id = utils.get_peer_id(event.peer)
-            chat_id = self._match_chat_id(peer_id, chat_ids)
-            if chat_id is None or not self._policy_for(chat_id).get("enabled", False):
+            chat_id = self._chat_id_for_reaction_peer(peer_id)
+            if chat_id is None:
                 return
             self.store.update_reactions(
                 source=SOURCE_TELEGRAM,
@@ -154,16 +131,37 @@ class TelegramArchiveService:
                 raw_payload=_safe_dict(event),
             )
 
-        await self._backfill_configured_chats(chat_ids)
+        await self._backfill_capture_targets(capture_targets)
         await self.client.run_until_disconnected()
 
-    def _match_chat_id(self, peer_id: int, configured_chat_ids: list[int]) -> int | None:
-        if peer_id in configured_chat_ids:
-            return peer_id
-        if peer_id > 0:
-            channel_id = int(f"-100{peer_id}")
-            if channel_id in configured_chat_ids:
-                return channel_id
+    def _capture_targets(self) -> list[CaptureTarget]:
+        targets: list[CaptureTarget] = []
+        active_origins = self.store.list_origins(account_id=self.account_id)
+        known_origins = self.store.list_origins(account_id=self.account_id, include_archived=True)
+        active_keys = {
+            (int(item["origin_id"]), int(item.get("topic_id") or 0))
+            for item in active_origins
+            if item.get("source") == SOURCE_TELEGRAM
+        }
+        known_keys = {
+            (int(item["origin_id"]), int(item.get("topic_id") or 0))
+            for item in known_origins
+            if item.get("source") == SOURCE_TELEGRAM
+        }
+        for policy in self.store.list_backup_policies(account_id=self.account_id):
+            if policy.get("source") != SOURCE_TELEGRAM or not policy.get("enabled"):
+                continue
+            origin_id = int(policy["origin_id"])
+            topic_id = int(policy.get("topic_id") or 0)
+            if not _origin_is_active(origin_id, topic_id, active_keys, known_keys):
+                continue
+            targets.append(CaptureTarget(origin_id, topic_id))
+        return _dedupe_capture_targets(targets)
+
+    def _chat_id_for_reaction_peer(self, peer_id: int) -> int | None:
+        for chat_id in _candidate_chat_ids(peer_id):
+            if self._has_enabled_policy_for_chat(chat_id):
+                return chat_id
         return None
 
     async def _store_message(self, message: Any, event_type: str) -> bool:
@@ -226,7 +224,7 @@ class TelegramArchiveService:
         self.store.upsert_message(record, event_type=event_type)
         if policy.get("download_media", False) and _message_media_downloadable(message):
             await self._download_message_media(message, record)
-        self._update_capture_cursor(chat_id, int(message.id), record.sent_at)
+        self._update_capture_cursor(chat_id, topic_id, int(message.id), record.sent_at)
         return True
 
 
@@ -297,18 +295,32 @@ class TelegramArchiveService:
             )
 
 
-    async def _backfill_configured_chats(self, chat_ids: list[int]) -> None:
-        if not self.backfill.enabled or not chat_ids:
+    async def _backfill_capture_targets(self, targets: list[CaptureTarget]) -> None:
+        if not self.backfill.enabled or not targets:
             return
         from telethon.tl.types import MessageService
 
-        for chat_id in chat_ids:
-            policy = self._policy_for(chat_id)
+        targets = _dedupe_capture_targets(targets)
+        root_chat_ids = {target.chat_id for target in targets if target.topic_id == 0}
+        for target in targets:
+            if target.topic_id and target.chat_id in root_chat_ids:
+                continue
+            policy = self._policy_for(target.chat_id, target.topic_id or None)
             if not policy.get("enabled", False):
-                self.logger.info("Skipping backfill for disabled origin %s/%s", self.account_id, chat_id)
+                self.logger.info(
+                    "Skipping backfill for disabled origin %s/%s/%s",
+                    self.account_id,
+                    target.chat_id,
+                    target.topic_id,
+                )
                 continue
             try:
-                cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, self.account_id, chat_id)
+                cursor = self.store.get_capture_cursor(
+                    SOURCE_TELEGRAM,
+                    self.account_id,
+                    target.chat_id,
+                    target.topic_id,
+                )
                 min_id = int(cursor["last_message_id"]) if cursor else 0
                 limit = self.backfill.catch_up_limit if min_id else self.backfill.initial_limit
                 limit_arg = None if limit <= 0 else limit
@@ -316,13 +328,17 @@ class TelegramArchiveService:
                 last_message_id = min_id
                 last_message_at = cursor.get("last_message_at") if cursor else None
                 self.logger.info(
-                    "Backfilling account=%s chat=%s min_id=%s limit=%s",
+                    "Backfilling account=%s chat=%s topic=%s min_id=%s limit=%s",
                     self.account_id,
-                    chat_id,
+                    target.chat_id,
+                    target.topic_id,
                     min_id,
                     limit_arg if limit_arg is not None else "unlimited",
                 )
-                async for message in self.client.iter_messages(chat_id, min_id=min_id, reverse=True, limit=limit_arg):
+                kwargs: dict[str, Any] = {"min_id": min_id, "reverse": True, "limit": limit_arg}
+                if target.topic_id:
+                    kwargs["reply_to"] = target.topic_id
+                async for message in self.client.iter_messages(target.chat_id, **kwargs):
                     if isinstance(message, MessageService):
                         continue
                     stored = await self._store_message(message, event_type="backfill")
@@ -334,28 +350,43 @@ class TelegramArchiveService:
                     CaptureCursorRecord(
                         source=SOURCE_TELEGRAM,
                         account_id=self.account_id,
-                        origin_id=chat_id,
+                        origin_id=target.chat_id,
+                        topic_id=target.topic_id,
                         last_message_id=last_message_id,
                         last_message_at=last_message_at,
                         last_backfill_at=utc_now_iso(),
                         updated_at=utc_now_iso(),
-                        raw_json=json.dumps({"count": count, "min_id": min_id, "limit": limit_arg}, ensure_ascii=False),
+                        raw_json=json.dumps(
+                            {"count": count, "min_id": min_id, "limit": limit_arg},
+                            ensure_ascii=False,
+                        ),
                     )
                 )
-                self.logger.info("Backfilled %s messages for account=%s chat=%s", count, self.account_id, chat_id)
-            except Exception as exc:
-                error = classify_telegram_exception(exc, default_code="backfill_failed", default_auth_state="authorized")
-                self.logger.warning(
-                    "Backfill failed for account=%s chat=%s: %s",
+                self.logger.info(
+                    "Backfilled %s messages for account=%s chat=%s topic=%s",
+                    count,
                     self.account_id,
-                    chat_id,
+                    target.chat_id,
+                    target.topic_id,
+                )
+            except Exception as exc:
+                error = classify_telegram_exception(
+                    exc,
+                    default_code="backfill_failed",
+                    default_auth_state="authorized",
+                )
+                self.logger.warning(
+                    "Backfill failed for account=%s chat=%s topic=%s: %s",
+                    self.account_id,
+                    target.chat_id,
+                    target.topic_id,
                     error.message,
                 )
                 self._record_operation(
                     "backfill",
                     "failed",
                     subject_type="origin",
-                    subject_id=str(chat_id),
+                    subject_id=_origin_subject_id(target),
                     error=error.to_public_dict(),
                 )
 
@@ -374,12 +405,41 @@ class TelegramArchiveService:
             "download_media": False,
         }
 
-    def _update_capture_cursor(self, chat_id: int, message_id: int, message_at: str | None) -> None:
+    def _has_enabled_policy_for_chat(self, chat_id: int) -> bool:
+        active_origins = self.store.list_origins(account_id=self.account_id)
+        known_origins = self.store.list_origins(account_id=self.account_id, include_archived=True)
+        active_keys = {
+            (int(item["origin_id"]), int(item.get("topic_id") or 0))
+            for item in active_origins
+            if item.get("source") == SOURCE_TELEGRAM
+        }
+        known_keys = {
+            (int(item["origin_id"]), int(item.get("topic_id") or 0))
+            for item in known_origins
+            if item.get("source") == SOURCE_TELEGRAM
+        }
+        for policy in self.store.list_backup_policies(account_id=self.account_id):
+            if policy.get("source") != SOURCE_TELEGRAM or not policy.get("enabled"):
+                continue
+            origin_id = int(policy["origin_id"])
+            topic_id = int(policy.get("topic_id") or 0)
+            if origin_id == chat_id and _origin_is_active(origin_id, topic_id, active_keys, known_keys):
+                return True
+        return False
+
+    def _update_capture_cursor(
+        self,
+        chat_id: int,
+        topic_id: int | None,
+        message_id: int,
+        message_at: str | None,
+    ) -> None:
         self.store.upsert_capture_cursor(
             CaptureCursorRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
                 origin_id=chat_id,
+                topic_id=topic_id or 0,
                 last_message_id=message_id,
                 last_message_at=message_at,
                 updated_at=utc_now_iso(),
@@ -450,9 +510,43 @@ def _topic_id(message: Any) -> int | None:
     reply_to = getattr(message, "reply_to", None)
     if not reply_to:
         return None
+    top_id = getattr(reply_to, "reply_to_top_id", None)
     if getattr(reply_to, "forum_topic", False):
-        return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
+        return top_id or getattr(reply_to, "reply_to_msg_id", None)
+    if top_id:
+        return int(top_id)
     return None
+
+
+def _candidate_chat_ids(peer_id: int) -> list[int]:
+    candidates = [int(peer_id)]
+    if peer_id > 0:
+        candidates.append(int(f"-100{peer_id}"))
+    return candidates
+
+
+def _origin_is_active(
+    origin_id: int,
+    topic_id: int,
+    active_keys: set[tuple[int, int]],
+    known_keys: set[tuple[int, int]],
+) -> bool:
+    key = (origin_id, topic_id)
+    parent_key = (origin_id, 0)
+    if key in known_keys and key not in active_keys:
+        return False
+    if topic_id and parent_key in known_keys and parent_key not in active_keys:
+        return False
+    return True
+
+
+def _dedupe_capture_targets(targets: list[CaptureTarget]) -> list[CaptureTarget]:
+    unique = {(int(target.chat_id), int(target.topic_id or 0)) for target in targets}
+    return [CaptureTarget(chat_id, topic_id) for chat_id, topic_id in sorted(unique)]
+
+
+def _origin_subject_id(target: CaptureTarget) -> str:
+    return f"{target.chat_id}/{target.topic_id}" if target.topic_id else str(target.chat_id)
 
 
 def _message_media_downloadable(message: Any) -> bool:

@@ -17,16 +17,12 @@ telegram:
       session_name: "main"
       session_dir: "./data/sessions"
       timezone: "Asia/Tokyo"
-      chats:
-        - id: -1001234567890
-          name: "Example Source Group"
     - account_id: "alt"
       api_id: 654321
       api_hash: "another_api_hash_here"
       session_name: "alt"
       session_dir: "./data/sessions"
       timezone: "Asia/Tokyo"
-      chats: []
 
 server:
   host: "127.0.0.1"

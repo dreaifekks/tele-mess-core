@@ -44,9 +44,9 @@ The first Telethon run may ask for Telegram login if no session file exists.
 See [docs/server-mode.md](docs/server-mode.md) for the devNuc-style deployment
 shape and client sync contract.
 
-Use `telegram.accounts[]` for multi-account capture. The older single-account
-`telegram.api_id` / `telegram.api_hash` / `telegram.chats` shape is still
-accepted and is mapped to `account_id: default`.
+Use `telegram.accounts[]` for multi-account auth/runtime configuration. Message
+capture sources are managed in SQLite through origin discovery plus backup
+policies; `telegram.chats` in config is no longer used.
 
 ## Sync API
 

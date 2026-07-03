@@ -12,9 +12,7 @@ from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.models import (
     AccountAuthRecord,
     AccountRecord,
-    BackupPolicyRecord,
     MessageRecord,
-    OriginRecord,
     SOURCE_TELEGRAM,
     utc_now_iso,
 )
@@ -156,29 +154,6 @@ def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
                 updated_at=now,
             )
         )
-        for chat in account.chats:
-            store.upsert_origin(
-                OriginRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=account.account_id,
-                    origin_id=chat.id,
-                    origin_type="configured_chat",
-                    title=chat.name,
-                    updated_at=now,
-                )
-            )
-            store.set_backup_policy(
-                BackupPolicyRecord(
-                    source=SOURCE_TELEGRAM,
-                    account_id=account.account_id,
-                    origin_id=chat.id,
-                    enabled=True,
-                    capture_text=True,
-                    capture_media_metadata=True,
-                    download_media=False,
-                    updated_at=now,
-                )
-            )
 
 
 def _telethon_session_exists(session_dir: Path, session_name: str) -> bool:

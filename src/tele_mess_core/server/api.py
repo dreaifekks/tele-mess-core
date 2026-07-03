@@ -832,7 +832,6 @@ def _account_config(
         session_name=str(stored.get("session_name") or account_id),
         session_dir=session_dir,
         timezone=template.timezone,
-        chats=[],
     )
 
 
@@ -1135,7 +1134,7 @@ def _console_html() -> str:
       <div class=\"property-bar\">
         <label>Search<input id=\"origin-search\" placeholder=\"Title, id, username\"></label>
         <label>Account<input id=\"origin-filter\" placeholder=\"Account filter\"></label>
-        <label>Type<select id=\"origin-type-filter\"><option value=\"\">Any type</option><option value=\"group\">Group</option><option value=\"channel\">Channel</option><option value=\"topic\">Topic</option><option value=\"configured_chat\">Configured</option><option value=\"private\">Private</option><option value=\"unknown\">Unknown</option></select></label>
+        <label>Type<select id=\"origin-type-filter\"><option value=\"\">Any type</option><option value=\"group\">Group</option><option value=\"channel\">Channel</option><option value=\"topic\">Topic</option><option value=\"private\">Private</option><option value=\"unknown\">Unknown</option></select></label>
         <label>Backup<select id=\"origin-backup-filter\"><option value=\"\">Any backup</option><option value=\"on\">On</option><option value=\"off\">Off</option></select></label>
         <label>Tags<input id=\"origin-tag-filter\" list=\"tag-suggestions\" placeholder=\"Tag filter\"></label>
         <label>Sort<select id=\"origin-sort\"><option value=\"last_desc\">Last message desc</option><option value=\"last_asc\">Last message asc</option><option value=\"title_asc\">Title A-Z</option><option value=\"account_asc\">Account A-Z</option><option value=\"type_asc\">Type A-Z</option><option value=\"backup_desc\">Backup first</option></select></label>
@@ -1397,6 +1396,7 @@ function originLastMessageValue(item) {
   return item.last_message_at || '';
 }
 function messageChatLabel(item) {
+  if (item.topic_id) return item.origin_title || item.chat_title || item.chat_id;
   return item.chat_title || item.chat_id;
 }
 function originTitle(accountId, originId, topicId=0) {

@@ -14,12 +14,6 @@ class StorageConfig:
 
 
 @dataclass(slots=True)
-class TelegramChatConfig:
-    id: int
-    name: str | None = None
-
-
-@dataclass(slots=True)
 class BackfillConfig:
     enabled: bool = True
     initial_limit: int = 1000
@@ -47,7 +41,6 @@ class TelegramAccountConfig:
     session_name: str
     session_dir: Path = Path("./data/sessions")
     timezone: str = "Asia/Tokyo"
-    chats: list[TelegramChatConfig] = field(default_factory=list)
 
 
 @dataclass(slots=True)
@@ -105,12 +98,6 @@ def load_config(path: str | Path) -> AppConfig:
     return AppConfig(storage=storage, telegram=telegram, server=server, logging=logging_config)
 
 
-def _parse_chat(item: Any) -> TelegramChatConfig:
-    if isinstance(item, dict):
-        return TelegramChatConfig(id=int(item["id"]), name=item.get("name"))
-    return TelegramChatConfig(id=int(item))
-
-
 def _parse_accounts(base_dir: Path, telegram_raw: dict[str, Any]) -> list[TelegramAccountConfig]:
     raw_accounts = telegram_raw.get("accounts")
     if raw_accounts:
@@ -123,7 +110,6 @@ def _parse_accounts(base_dir: Path, telegram_raw: dict[str, Any]) -> list[Telegr
             session_name=str(telegram_raw.get("session_name", "tele_mess_core")),
             session_dir=_resolve_path(base_dir, telegram_raw.get("session_dir", "./data/sessions")),
             timezone=str(telegram_raw.get("timezone", "Asia/Tokyo")),
-            chats=[_parse_chat(item) for item in telegram_raw.get("chats", [])],
         )
     ]
 
@@ -137,7 +123,6 @@ def _parse_account(base_dir: Path, item: dict[str, Any], index: int) -> Telegram
         session_name=str(item.get("session_name") or account_id),
         session_dir=_resolve_path(base_dir, item.get("session_dir", "./data/sessions")),
         timezone=str(item.get("timezone", "Asia/Tokyo")),
-        chats=[_parse_chat(chat) for chat in item.get("chats", [])],
     )
 
 

@@ -106,7 +106,6 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
             api_id=1,
             api_hash="hash",
             session_name="main",
-            chats=[],
         )
         self.service = FakeDiscoveryService(self.config, self.store)
 
