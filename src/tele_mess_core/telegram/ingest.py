@@ -459,6 +459,8 @@ def _message_media_downloadable(message: Any) -> bool:
     media = getattr(message, "media", None)
     if media is None:
         return False
+    if _message_media_is_sticker_like(message):
+        return False
     media_type = type(media).__name__
     downloadable_types = {
         "MessageMediaPhoto",
@@ -477,6 +479,31 @@ def _message_media_downloadable(message: Any) -> bool:
     if type(webpage).__name__ != "WebPage":
         return False
     return bool(getattr(webpage, "document", None) or getattr(webpage, "photo", None))
+
+
+def _message_media_is_sticker_like(message: Any) -> bool:
+    sticker = getattr(message, "sticker", None)
+    if sticker:
+        return True
+    media = getattr(message, "media", None)
+    if media is None:
+        return False
+    if type(media).__name__ == "Document" and _document_has_sticker_attribute(media):
+        return True
+    document = getattr(media, "document", None)
+    if _document_has_sticker_attribute(document):
+        return True
+    webpage = getattr(media, "webpage", None)
+    if type(webpage).__name__ == "WebPage":
+        return _document_has_sticker_attribute(getattr(webpage, "document", None))
+    return False
+
+
+def _document_has_sticker_attribute(document: Any) -> bool:
+    if document is None:
+        return False
+    sticker_attribute_types = {"DocumentAttributeSticker", "DocumentAttributeCustomEmoji"}
+    return any(type(attribute).__name__ in sticker_attribute_types for attribute in getattr(document, "attributes", []) or [])
 
 
 def _forward_from_id(message: Any) -> str | None:
