@@ -3,12 +3,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
 import threading
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.models import (
@@ -138,15 +139,17 @@ class SyncApiServer:
                 elif path == "/sync/events":
                     self._json(store.list_events(after=_int_param(params, "after", 0), limit=_int_param(params, "limit", 500)))
                 elif path == "/sync/messages":
+                    include_media = _bool_param(params, "include_media", False)
                     if _bool_param(params, "latest", False):
-                        self._json(store.list_latest_messages(limit=_int_param(params, "limit", 50)))
+                        payload = store.list_latest_messages(limit=_int_param(params, "limit", 50))
                     else:
-                        self._json(
-                            store.list_messages_after(
-                                after_event_seq=_int_param(params, "after", 0),
-                                limit=_int_param(params, "limit", 500),
-                            )
+                        payload = store.list_messages_after(
+                            after_event_seq=_int_param(params, "after", 0),
+                            limit=_int_param(params, "limit", 500),
                         )
+                    if include_media:
+                        _attach_message_media(store, payload)
+                    self._json(payload)
                 elif path == "/sync/chats":
                     self._json({"items": store.list_chats()})
                 elif path == "/sync/accounts":
@@ -156,16 +159,29 @@ class SyncApiServer:
                     if not query:
                         self._json({"items": []})
                     else:
-                        self._json({"items": store.search_messages(query, limit=_int_param(params, "limit", 50))})
+                        payload = {"items": store.search_messages(query, limit=_int_param(params, "limit", 50))}
+                        if _bool_param(params, "include_media", False):
+                            _attach_message_media(store, payload)
+                        self._json(payload)
+                elif path == "/sync/media-files/content":
+                    item = store.get_media_file(
+                        source=_str_param(params, "source", SOURCE_TELEGRAM),
+                        account_id=_str_param(params, "account_id", ""),
+                        chat_id=_int_param(params, "chat_id", 0),
+                        message_id=_int_param(params, "message_id", 0),
+                        file_index=_int_param(params, "file_index", 0),
+                    )
+                    self._media_file(item)
                 elif path == "/sync/media-files":
+                    items = store.list_media_files(
+                        account_id=_optional_str_param(params, "account_id"),
+                        chat_id=_optional_int_param(params, "chat_id"),
+                        message_id=_optional_int_param(params, "message_id"),
+                        limit=_int_param(params, "limit", 500),
+                    )
                     self._json(
                         {
-                            "items": store.list_media_files(
-                                account_id=_optional_str_param(params, "account_id"),
-                                chat_id=_optional_int_param(params, "chat_id"),
-                                message_id=_optional_int_param(params, "message_id"),
-                                limit=_int_param(params, "limit", 500),
-                            )
+                            "items": [_media_public_item(item) for item in items]
                         }
                     )
                 elif path == "/manage/capabilities":
@@ -195,13 +211,14 @@ class SyncApiServer:
                 elif path == "/manage/capture-cursors":
                     self._json({"items": store.list_capture_cursors(account_id=_optional_str_param(params, "account_id"))})
                 elif path == "/manage/operation-events":
+                    items = store.list_operation_events(
+                        account_id=_optional_str_param(params, "account_id"),
+                        status=_optional_str_param(params, "status"),
+                        limit=_int_param(params, "limit", 100),
+                    )
                     self._json(
                         {
-                            "items": store.list_operation_events(
-                                account_id=_optional_str_param(params, "account_id"),
-                                status=_optional_str_param(params, "status"),
-                                limit=_int_param(params, "limit", 100),
-                            )
+                            "items": [_operation_event_public_item(item) for item in items]
                         }
                     )
                 else:
@@ -254,6 +271,9 @@ class SyncApiServer:
                 elif path == "/manage/participants/refresh" and method == "POST":
                     item = _refresh_participants(config, store, payload)
                     self._json({"item": item})
+                elif path == "/manage/operation-events" and method == "DELETE":
+                    item = _delete_operation_events(store, payload)
+                    self._json({"item": item})
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -289,13 +309,46 @@ class SyncApiServer:
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _media_file(self, item: dict[str, Any] | None) -> None:
+                if item is None:
+                    self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                path = Path(str(item["file_path"])).expanduser()
+                if not path.is_file():
+                    self._json({"error": "not_found", "detail": "media file is missing"}, status=HTTPStatus.NOT_FOUND)
+                    return
+                content_type = _media_content_type(item)
+                disposition = _content_disposition_filename(path.name)
+                self.send_response(int(HTTPStatus.OK))
+                self.send_header("Content-Type", content_type)
+                self.send_header("Content-Length", str(path.stat().st_size))
+                self.send_header("Content-Disposition", f'inline; filename="{disposition}"')
+                self.send_header("Cache-Control", "private, max-age=3600")
+                self.end_headers()
+                with path.open("rb") as f:
+                    while True:
+                        chunk = f.read(1024 * 256)
+                        if not chunk:
+                            break
+                        self.wfile.write(chunk)
+
         return Handler
 
 
 def _capabilities() -> dict[str, Any]:
     return {
         "mode": "single-user-multi-telegram-account",
-        "sync": ["state", "events", "messages", "accounts", "chats", "search", "media_files"],
+        "sync": [
+            "state",
+            "events",
+            "messages",
+            "accounts",
+            "chats",
+            "search",
+            "media_files",
+            "media_file_content",
+            "message_media_files",
+        ],
         "management": [
             "account_status",
             "account_auth_state",
@@ -307,6 +360,8 @@ def _capabilities() -> dict[str, Any]:
             "live_participant_refresh",
             "live_account_auth",
             "operation_events",
+            "operation_event_delete",
+            "detailed_operation_events",
             "web_console",
         ],
         "auth_flow": {
@@ -314,6 +369,161 @@ def _capabilities() -> dict[str, Any]:
             "note": "Remote clients can request a Telegram login code, submit it, and provide a 2FA password when Telegram requires one.",
         },
     }
+
+
+def _attach_message_media(store: ArchiveStore, payload: dict[str, Any]) -> None:
+    items = payload.get("items") or []
+    media_by_message = store.list_media_files_for_messages(items)
+    for item in items:
+        key = (
+            item.get("source"),
+            item.get("account_id"),
+            item.get("chat_id"),
+            item.get("message_id"),
+        )
+        media = [_media_public_item(media_item) for media_item in media_by_message.get(key, [])]
+        item["media_files"] = media
+        item["media_count"] = len(media)
+
+
+def _media_public_item(item: dict[str, Any]) -> dict[str, Any]:
+    public = dict(item)
+    content_type = _media_content_type(public)
+    access_url = _media_access_url(public)
+    public["content_type"] = content_type
+    public["preview_kind"] = _media_preview_kind(content_type)
+    public["access_url"] = access_url
+    public["download_url"] = access_url
+    return public
+
+
+def _media_access_url(item: dict[str, Any]) -> str:
+    return "/sync/media-files/content?" + urlencode(
+        {
+            "source": item.get("source") or SOURCE_TELEGRAM,
+            "account_id": item.get("account_id") or "",
+            "chat_id": item.get("chat_id") or "",
+            "message_id": item.get("message_id") or "",
+            "file_index": item.get("file_index", 0),
+        }
+    )
+
+
+def _media_content_type(item: dict[str, Any]) -> str:
+    mime_type = item.get("mime_type")
+    if isinstance(mime_type, str) and mime_type:
+        return mime_type
+    guessed, _ = mimetypes.guess_type(str(item.get("file_path") or ""))
+    return guessed or "application/octet-stream"
+
+
+def _media_preview_kind(content_type: str) -> str:
+    if content_type.startswith("image/"):
+        return "image"
+    if content_type.startswith("video/"):
+        return "video"
+    if content_type.startswith("audio/"):
+        return "audio"
+    return "file"
+
+
+def _content_disposition_filename(filename: str) -> str:
+    cleaned = "".join("_" if char in {'"', "\\", "/", "\r", "\n"} else char for char in filename)
+    return cleaned or "media"
+
+
+def _operation_event_public_item(item: dict[str, Any]) -> dict[str, Any]:
+    public = dict(item)
+    error = _operation_event_error(public)
+    subject = _operation_event_subject(public)
+    public["error"] = error
+    public["error_type"] = error.get("type")
+    public["auth_state"] = error.get("auth_state")
+    public["subject"] = subject
+    public["subject_label"] = subject.get("label")
+    return public
+
+
+def _operation_event_error(item: dict[str, Any]) -> dict[str, Any]:
+    raw = item.get("raw_json")
+    error = dict(raw) if isinstance(raw, dict) else {}
+    if item.get("error_code") and not error.get("code"):
+        error["code"] = item["error_code"]
+    if item.get("message") and not error.get("message"):
+        error["message"] = item["message"]
+    if item.get("retry_after") is not None and not error.get("retry_after"):
+        error["retry_after"] = item["retry_after"]
+    return error
+
+
+def _operation_event_subject(item: dict[str, Any]) -> dict[str, Any]:
+    subject_type = item.get("subject_type")
+    subject_id = item.get("subject_id")
+    subject: dict[str, Any] = {
+        "type": subject_type,
+        "id": subject_id,
+        "account_id": item.get("account_id"),
+    }
+    if subject_type == "message":
+        chat_id, message_id = _parse_message_subject_id(subject_id)
+        subject.update(
+            {
+                "chat_id": item.get("subject_chat_id") or chat_id,
+                "message_id": item.get("subject_message_id") or message_id,
+                "topic_id": item.get("subject_topic_id"),
+                "chat_title": item.get("subject_chat_title"),
+                "sent_at": item.get("subject_sent_at"),
+                "media_kind": item.get("subject_media_kind"),
+                "text": item.get("subject_text"),
+            }
+        )
+        chat_label = item.get("subject_chat_title") or chat_id or subject_id
+        subject["label"] = f"{chat_label}/{message_id}" if message_id is not None else str(subject_id or "-")
+    elif subject_type == "origin":
+        origin_id = item.get("subject_origin_id") or _optional_int_value(subject_id)
+        subject.update(
+            {
+                "origin_id": origin_id,
+                "topic_id": item.get("subject_origin_topic_id"),
+                "origin_title": item.get("subject_origin_title"),
+                "origin_type": item.get("subject_origin_type"),
+            }
+        )
+        subject["label"] = str(item.get("subject_origin_title") or origin_id or subject_id or "-")
+    else:
+        subject["label"] = str(subject_id or "-")
+    return subject
+
+
+def _parse_message_subject_id(subject_id: Any) -> tuple[int | None, int | None]:
+    if not subject_id:
+        return None, None
+    left, sep, right = str(subject_id).partition("/")
+    if not sep:
+        return None, _optional_int_value(left)
+    return _optional_int_value(left), _optional_int_value(right)
+
+
+def _optional_int_value(value: Any) -> int | None:
+    try:
+        if value is None or value == "":
+            return None
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _delete_operation_events(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    raw_ids = payload.get("ids")
+    if raw_ids is None:
+        raw_ids = [payload.get("id")]
+    if not isinstance(raw_ids, list):
+        raise ValueError("ids must be a list")
+    ids = [int(item) for item in raw_ids if item is not None and item != ""]
+    if not ids:
+        raise ValueError("Missing required field: id")
+    deleted = store.delete_operation_events(ids)
+    return {"ids": ids, "deleted": deleted}
 
 
 def _create_management_account(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -794,6 +1004,12 @@ def _console_html() -> str:
     .origin-select { min-height: 16px; }
     .bulk-toolbar { border-left: 1px solid var(--line); padding-left: 8px; }
     .policy-row td { background: #fbfcfe; }
+    .media-cell { min-width: 170px; }
+    .media-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+    .media-preview { display: grid; gap: 6px; align-items: start; }
+    .media-preview img, .media-preview video { display: block; max-width: 220px; max-height: 140px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; }
+    .media-preview audio { width: 220px; max-width: 100%; }
+    .media-name { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
     .status.error { color: var(--danger); border-color: #f1b7b2; background: #fff5f5; }
@@ -835,18 +1051,22 @@ def _console_html() -> str:
 <main>
   <div id=\"status\" class=\"status\">Ready</div>
 
-  <section id=\"view-overview\" class=\"view stack\">
-    <div class=\"grid overview-grid\">
-      <div class=\"panel\" id=\"service-panel\">
-        <div class=\"panel-head\"><h2>Service</h2><button data-action=\"load\">Refresh</button></div>
-        <div id=\"summary\" class=\"stack\"></div>
+	  <section id=\"view-overview\" class=\"view stack\">
+	    <div class=\"grid overview-grid\">
+	      <div class=\"panel\" id=\"service-panel\">
+	        <div class=\"panel-head\"><h2>Service</h2><button data-action=\"load\">Refresh</button></div>
+	        <div id=\"summary\" class=\"stack\"></div>
       </div>
       <div class=\"panel messages-panel\" id=\"recent-panel\">
         <div class=\"panel-head\"><h2>Recent Messages</h2><button data-action=\"load-messages\">Load</button></div>
-        <div class=\"table-wrap\"><table><thead><tr><th>Seq</th><th>Account</th><th>Chat</th><th>Message</th><th>Text</th></tr></thead><tbody id=\"messages-body\"></tbody></table></div>
-      </div>
-    </div>
-  </section>
+	        <div class=\"table-wrap\"><table><thead><tr><th>Seq</th><th>Account</th><th>Chat</th><th>Message</th><th>Text</th><th>Media</th></tr></thead><tbody id=\"messages-body\"></tbody></table></div>
+	      </div>
+	    </div>
+	    <div class=\"panel\">
+	      <div class=\"panel-head\"><h2>Operation Events</h2><button data-action=\"load-operation-events\">Load</button></div>
+	      <div class=\"table-wrap\"><table><thead><tr><th>Time</th><th>Account</th><th>Operation</th><th>Status</th><th>Subject</th><th>Error</th><th>Actions</th></tr></thead><tbody id=\"operation-events-body\"></tbody></table></div>
+	    </div>
+	  </section>
 
   <section id=\"view-accounts\" class=\"view grid hidden\">
     <div class=\"panel\">
@@ -922,7 +1142,7 @@ def _console_html() -> str:
     </div>
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Media Files</h2><button data-action=\"load-media\">Load</button></div>
-      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Chat</th><th>Message</th><th>Kind</th><th>Path</th></tr></thead><tbody id=\"media-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Account</th><th>Chat</th><th>Message</th><th>Preview</th><th>Kind</th><th>Size</th><th>Path</th></tr></thead><tbody id=\"media-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -959,6 +1179,8 @@ let messageRefreshInFlight = false;
 let originSelectionAnchor = null;
 let originDragState = null;
 let ignoreNextOriginClick = false;
+const MEDIA_CONTENT_PATH = '/sync/media-files/content';
+const mediaObjectUrls = new Map();
 const $ = (id) => document.getElementById(id);
 const tokenInput = $('token');
 tokenInput.value = localStorage.getItem('teleMessToken') || '';
@@ -1140,6 +1362,106 @@ function cursorOriginLabel(item) {
 function mediaChatLabel(item) {
   return item.chat_title || originTitle(item.account_id, item.chat_id, 0);
 }
+function operationSubjectLabel(item) {
+  return item.subject?.label || item.subject_label || item.subject_id || '-';
+}
+function operationSubjectDetail(item) {
+  const subject = item.subject || {};
+  const details = [];
+  if (subject.type) details.push(subject.type);
+  if (subject.id) details.push(subject.id);
+  if (subject.chat_id && subject.message_id) details.push(`${subject.chat_id}/${subject.message_id}`);
+  if (subject.origin_type) details.push(subject.origin_type);
+  const textSnippet = subject.text ? String(subject.text).slice(0, 120) : '';
+  return `${details.map(text).join(' · ')}${textSnippet ? `<div class=\"muted\">${text(textSnippet)}</div>` : ''}`;
+}
+function operationErrorSummary(item) {
+  const error = item.error || {};
+  const parts = [error.code || item.error_code, error.type || item.error_type, error.auth_state || item.auth_state].filter(Boolean);
+  return parts.length ? parts.join(' / ') : item.message || '-';
+}
+function operationErrorDetail(item) {
+  const error = item.error || item.raw_json || {};
+  const message = error.message || item.message || '';
+  const summary = operationErrorSummary(item);
+  const raw = JSON.stringify(error, null, 2);
+  return `<details><summary>${text(summary)}</summary><div>${text(message)}</div><pre>${text(raw)}</pre></details>`;
+}
+function mediaKey(item) {
+  return [item.source, item.account_id, item.chat_id, item.message_id, item.file_index ?? 0].map(value => encodeURIComponent(String(value ?? ''))).join('|');
+}
+function allMediaItems() {
+  return [...state.media, ...state.messages.flatMap(item => item.media_files || [])];
+}
+function findMediaItem(key) {
+  return allMediaItems().find(item => mediaKey(item) === key);
+}
+function mediaFilename(item) {
+  const path = rawText(item.file_path);
+  const name = path.split(/[\\/]/).filter(Boolean).pop();
+  return name && name !== '-' ? name : `media-${item.message_id}-${item.file_index ?? 0}`;
+}
+function formatBytes(value) {
+  const size = Number(value);
+  if (!Number.isFinite(size) || size < 0) return '-';
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  if (size < 1024 * 1024 * 1024) return `${(size / 1024 / 1024).toFixed(1)} MB`;
+  return `${(size / 1024 / 1024 / 1024).toFixed(1)} GB`;
+}
+function mediaPreviewCell(item) {
+  const key = mediaKey(item);
+  const label = item.preview_kind === 'file' ? 'Open' : 'Preview';
+  return `<div class=\"media-preview\" data-media-preview=\"${attr(key)}\"><div class=\"media-actions\"><button data-action=\"preview-media\" data-media-key=\"${attr(key)}\">${label}</button><span class=\"muted\">${text(item.preview_kind || 'file')}</span></div></div>`;
+}
+function mediaAccessUrl(item) {
+  if (item.access_url) return item.access_url;
+  const params = new URLSearchParams({
+    source: item.source || 'telegram',
+    account_id: item.account_id || '',
+    chat_id: item.chat_id ?? '',
+    message_id: item.message_id ?? '',
+    file_index: item.file_index ?? 0,
+  });
+  return `${MEDIA_CONTENT_PATH}?${params.toString()}`;
+}
+function messageMediaCell(item) {
+  const media = item.media_files || [];
+  if (!media.length) return '<span class=\"muted\">-</span>';
+  return `<div class=\"media-actions\">${media.map(mediaPreviewCell).join('')}</div>`;
+}
+async function mediaObjectUrl(item) {
+  const key = mediaKey(item);
+  if (mediaObjectUrls.has(key)) return mediaObjectUrls.get(key);
+  const response = await fetch(mediaAccessUrl(item), { headers: headers() });
+  if (!response.ok) throw new Error(`${response.status} ${await response.text()}`);
+  const url = URL.createObjectURL(await response.blob());
+  mediaObjectUrls.set(key, url);
+  return url;
+}
+function mediaElementHtml(item, url) {
+  const name = mediaFilename(item);
+  if (item.preview_kind === 'image') return `<img src=\"${attr(url)}\" alt=\"${attr(name)}\" loading=\"lazy\"><div class=\"media-name muted\" title=\"${attr(name)}\">${text(name)}</div>`;
+  if (item.preview_kind === 'video') return `<video src=\"${attr(url)}\" controls preload=\"metadata\"></video><div class=\"media-name muted\" title=\"${attr(name)}\">${text(name)}</div>`;
+  if (item.preview_kind === 'audio') return `<audio src=\"${attr(url)}\" controls preload=\"metadata\"></audio><div class=\"media-name muted\" title=\"${attr(name)}\">${text(name)}</div>`;
+  return `<div class=\"media-actions\"><a href=\"${attr(url)}\" target=\"_blank\" rel=\"noopener\">Open</a><span class=\"media-name muted\" title=\"${attr(name)}\">${text(name)}</span></div>`;
+}
+async function previewMedia(button) {
+  const item = findMediaItem(button.dataset.mediaKey);
+  if (!item) throw new Error('Media record not found');
+  const container = button.closest('[data-media-preview]');
+  if (!container) throw new Error('Media preview container not found');
+  button.disabled = true;
+  button.textContent = 'Loading';
+  const url = await mediaObjectUrl(item);
+  container.innerHTML = mediaElementHtml(item, url);
+}
+async function openMedia(button) {
+  const item = findMediaItem(button.dataset.mediaKey);
+  if (!item) throw new Error('Media record not found');
+  const url = await mediaObjectUrl(item);
+  window.open(url, '_blank', 'noopener');
+}
 function syncOverviewHeights() {
   const service = $('service-panel');
   const recent = $('recent-panel');
@@ -1175,7 +1497,7 @@ async function loadAll() {
     const [service, accounts, origins, policies, participants, cursors, operationEvents, media, messages] = await Promise.all([
       api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
-      api('/sync/messages?latest=true&limit=100')
+      api('/sync/messages?latest=true&limit=100&include_media=true')
     ]);
     state.service = service;
     state.accounts = accounts.items || [];
@@ -1198,7 +1520,7 @@ async function loadMessages(options={}) {
   messageRefreshInFlight = true;
   const previousTop = state.messages[0]?.event_seq;
   try {
-    const data = await api('/sync/messages?latest=true&limit=100');
+    const data = await api('/sync/messages?latest=true&limit=100&include_media=true');
     state.messages = data.items || [];
     renderMessages(previousTop);
     if (!options.silent) setStatus('Messages loaded', 'ok');
@@ -1219,7 +1541,7 @@ function stopMessageAutoRefresh() {
   messageRefreshTimer = null;
 }
 function renderAll() {
-  renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderMedia(); renderRaw();
+  renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderParticipants(); renderCursors(); renderOperationEvents(); renderMedia(); renderRaw();
 }
 function renderSummary() {
   const html = [
@@ -1355,11 +1677,14 @@ function renderParticipants() {
 function renderCursors() {
   fillTable('cursors-body', state.cursors.map(item => `<tr><td>${text(item.account_id)}</td><td title=\"${attr(item.origin_id)}\">${text(cursorOriginLabel(item))}</td><td>${text(item.topic_id)}</td><td>${text(item.last_message_id)}</td><td>${text(item.last_backfill_at)}</td></tr>`), 5);
 }
+function renderOperationEvents() {
+  fillTable('operation-events-body', state.operationEvents.map(item => `<tr><td>${text(item.occurred_at)}</td><td>${text(item.account_id)}</td><td>${text(item.operation)}</td><td>${pill(item.status)}</td><td title=\"${attr(item.subject_id)}\"><div>${text(operationSubjectLabel(item))}</div><div class=\"muted\">${operationSubjectDetail(item)}</div></td><td>${operationErrorDetail(item)}</td><td class=\"actions\"><button class=\"danger\" data-action=\"delete-operation-event\" data-event-id=\"${attr(item.id)}\">Delete</button></td></tr>`), 7);
+}
 function renderMedia() {
-  fillTable('media-body', state.media.map(item => `<tr><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(mediaChatLabel(item))}</td><td>${text(item.message_id)}</td><td>${text(item.media_kind)}</td><td>${text(item.file_path)}</td></tr>`), 5);
+  fillTable('media-body', state.media.map(item => `<tr><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(mediaChatLabel(item))}</td><td>${text(item.message_id)}</td><td class=\"media-cell\">${mediaPreviewCell(item)}</td><td>${text(item.media_kind)}</td><td>${text(formatBytes(item.file_size))}</td><td title=\"${attr(item.file_path)}\">${text(item.file_path)}</td></tr>`), 7);
 }
 function renderMessages(previousTop) {
-  fillTable('messages-body', state.messages.map(item => `<tr><td>${text(item.event_seq)}</td><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(messageChatLabel(item))}</td><td>${text(item.message_id)}</td><td>${text((item.text || '').slice(0, 120))}</td></tr>`), 5);
+  fillTable('messages-body', state.messages.map(item => `<tr><td>${text(item.event_seq)}</td><td>${text(item.account_id)}</td><td title=\"${attr(item.chat_id)}\">${text(messageChatLabel(item))}</td><td>${text(item.message_id)}</td><td>${text((item.text || '').slice(0, 120))}</td><td class=\"media-cell\">${messageMediaCell(item)}</td></tr>`), 6);
   const nextTop = state.messages[0]?.event_seq;
   if (previousTop && nextTop && previousTop !== nextTop) {
     const wrap = $('messages-body').closest('.table-wrap');
@@ -1556,8 +1881,12 @@ document.addEventListener('click', async (event) => {
     else if (action === 'load-messages') await loadMessages();
     else if (action === 'load-participants') { const data = await api('/manage/participants'); state.participants = data.items || []; renderParticipants(); }
     else if (action === 'load-cursors') { const data = await api('/manage/capture-cursors'); state.cursors = data.items || []; renderCursors(); }
+    else if (action === 'load-operation-events') { const data = await api('/manage/operation-events'); state.operationEvents = data.items || []; renderOperationEvents(); }
     else if (action === 'load-media') { const data = await api('/sync/media-files'); state.media = data.items || []; renderMedia(); }
     else if (action === 'load-raw') renderRaw();
+    else if (action === 'preview-media') await previewMedia(target);
+    else if (action === 'open-media') await openMedia(target);
+    else if (action === 'delete-operation-event') { if (confirm(`Delete operation event ${target.dataset.eventId}?`)) await removeRecord('/manage/operation-events', { id: Number(target.dataset.eventId) }); }
     else if (action === 'select-account') { document.querySelector('#account-form [name=account_id]').value = target.dataset.account; document.querySelector('#origin-filter').value = target.dataset.account; await loadOrigins(); }
     else if (action === 'select-origin') { document.querySelector('#participant-refresh-form [name=account_id]').value = target.dataset.account; document.querySelector('#participant-refresh-form [name=origin_id]').value = target.dataset.origin; }
     else if (action === 'delete-account') { if (confirm(`Delete account ${target.dataset.account}? Stored messages are kept.`)) await removeRecord('/manage/accounts', { account_id: target.dataset.account }); }
@@ -1588,6 +1917,9 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
   requestAnimationFrame(syncOverviewHeights);
 }));
 window.addEventListener('resize', syncOverviewHeights);
+window.addEventListener('beforeunload', () => {
+  for (const url of mediaObjectUrls.values()) URL.revokeObjectURL(url);
+});
 $('account-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/accounts', formData(event.target)); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });

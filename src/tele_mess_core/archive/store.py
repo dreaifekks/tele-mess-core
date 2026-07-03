@@ -926,6 +926,96 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [_row_to_dict(row, json_fields={"raw_json"}) for row in rows]
 
+    def get_media_file(
+        self,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        message_id: int,
+        file_index: int = 0,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
+                       m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                       COALESCE(c.title, o.title) AS chat_title
+                FROM media_files m
+                LEFT JOIN chats c
+                  ON c.source = m.source
+                 AND c.account_id = m.account_id
+                 AND c.chat_id = m.chat_id
+                LEFT JOIN origins o
+                  ON o.source = m.source
+                 AND o.account_id = m.account_id
+                 AND o.origin_id = m.chat_id
+                 AND o.topic_id = 0
+                WHERE m.source = ?
+                  AND m.account_id = ?
+                  AND m.chat_id = ?
+                  AND m.message_id = ?
+                  AND m.file_index = ?
+                """,
+                (source, account_id, chat_id, message_id, file_index),
+            ).fetchone()
+        return _row_to_dict(row, json_fields={"raw_json"}) if row else None
+
+    def list_media_files_for_messages(
+        self,
+        messages: list[dict[str, Any]],
+    ) -> dict[tuple[str, str, int, int], list[dict[str, Any]]]:
+        keys: list[tuple[str, str, int, int]] = []
+        seen: set[tuple[str, str, int, int]] = set()
+        for message in messages:
+            try:
+                key = (
+                    str(message["source"]),
+                    str(message["account_id"]),
+                    int(message["chat_id"]),
+                    int(message["message_id"]),
+                )
+            except (KeyError, TypeError, ValueError):
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            keys.append(key)
+        if not keys:
+            return {}
+
+        clauses: list[str] = []
+        params: list[Any] = []
+        for source, account_id, chat_id, message_id in keys:
+            clauses.append("(m.source = ? AND m.account_id = ? AND m.chat_id = ? AND m.message_id = ?)")
+            params.extend([source, account_id, chat_id, message_id])
+
+        sql = f"""
+            SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
+                   m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                   COALESCE(c.title, o.title) AS chat_title
+            FROM media_files m
+            LEFT JOIN chats c
+              ON c.source = m.source
+             AND c.account_id = m.account_id
+             AND c.chat_id = m.chat_id
+            LEFT JOIN origins o
+              ON o.source = m.source
+             AND o.account_id = m.account_id
+             AND o.origin_id = m.chat_id
+             AND o.topic_id = 0
+            WHERE {" OR ".join(clauses)}
+            ORDER BY m.source, m.account_id, m.chat_id, m.message_id, m.file_index
+        """
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+
+        grouped: dict[tuple[str, str, int, int], list[dict[str, Any]]] = {key: [] for key in keys}
+        for row in rows:
+            item = _row_to_dict(row, json_fields={"raw_json"})
+            key = (item["source"], item["account_id"], item["chat_id"], item["message_id"])
+            grouped.setdefault(key, []).append(item)
+        return grouped
+
     def add_operation_event(self, event: OperationEventRecord) -> int:
         occurred_at = event.occurred_at or utc_now_iso()
         with self._lock:
@@ -961,25 +1051,75 @@ class ArchiveStore:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         sql = """
-            SELECT id, source, account_id, operation, status, subject_type, subject_id,
-                   error_code, message, retry_after, occurred_at, raw_json
-            FROM operation_events
+            SELECT e.id, e.source, e.account_id, e.operation, e.status, e.subject_type, e.subject_id,
+                   e.error_code, e.message, e.retry_after, e.occurred_at, e.raw_json,
+                   m.chat_id AS subject_chat_id,
+                   m.message_id AS subject_message_id,
+                   m.topic_id AS subject_topic_id,
+                   m.sent_at AS subject_sent_at,
+                   m.text AS subject_text,
+                   m.media_kind AS subject_media_kind,
+                   COALESCE(mc.title, mo.title) AS subject_chat_title,
+                   o.origin_id AS subject_origin_id,
+                   o.topic_id AS subject_origin_topic_id,
+                   o.title AS subject_origin_title,
+                   o.origin_type AS subject_origin_type
+            FROM operation_events e
+            LEFT JOIN messages m
+              ON e.subject_type = 'message'
+             AND instr(e.subject_id, '/') > 0
+             AND m.source = e.source
+             AND m.account_id = e.account_id
+             AND m.chat_id = CAST(substr(e.subject_id, 1, instr(e.subject_id, '/') - 1) AS INTEGER)
+             AND m.message_id = CAST(substr(e.subject_id, instr(e.subject_id, '/') + 1) AS INTEGER)
+            LEFT JOIN chats mc
+              ON mc.source = m.source
+             AND mc.account_id = m.account_id
+             AND mc.chat_id = m.chat_id
+            LEFT JOIN origins mo
+              ON mo.source = m.source
+             AND mo.account_id = m.account_id
+             AND mo.origin_id = m.chat_id
+             AND mo.topic_id = COALESCE(m.topic_id, 0)
+            LEFT JOIN origins o
+              ON e.subject_type = 'origin'
+             AND o.source = e.source
+             AND o.account_id = e.account_id
+             AND o.origin_id = CAST(e.subject_id AS INTEGER)
+             AND o.topic_id = 0
         """
         clauses: list[str] = []
         params: list[Any] = []
         if account_id is not None:
-            clauses.append("account_id = ?")
+            clauses.append("e.account_id = ?")
             params.append(account_id)
         if status is not None:
-            clauses.append("status = ?")
+            clauses.append("e.status = ?")
             params.append(status)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY id DESC LIMIT ?"
+        sql += " ORDER BY e.id DESC LIMIT ?"
         params.append(_bounded_limit(limit, max_limit=500))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [_row_to_dict(row, json_fields={"raw_json"}) for row in rows]
+
+    def delete_operation_events(self, ids: list[int]) -> int:
+        clean_ids: list[int] = []
+        for item in ids:
+            try:
+                event_id = int(item)
+            except (TypeError, ValueError):
+                continue
+            if event_id > 0:
+                clean_ids.append(event_id)
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        with self._lock:
+            cur = self._conn.execute(f"DELETE FROM operation_events WHERE id IN ({placeholders})", tuple(clean_ids))
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def state(self) -> dict[str, Any]:
         with self._lock:

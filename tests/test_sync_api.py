@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
+from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
 from tele_mess_core.archive import ArchiveStore
@@ -80,6 +81,12 @@ class SyncApiTest(unittest.TestCase):
         req = Request(f"http://127.0.0.1:{self.port}{path}")
         with urlopen(req, timeout=3) as resp:
             return resp.read().decode("utf-8")
+
+    def request_bytes(self, path: str) -> tuple[bytes, str]:
+        req = Request(f"http://127.0.0.1:{self.port}{path}")
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            return resp.read(), resp.headers.get("Content-Type", "")
 
     def test_state_requires_token_and_returns_json(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/sync/state")
@@ -163,10 +170,16 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn('id="service-panel"', html)
         self.assertIn("messages-panel", html)
         self.assertIn("syncOverviewHeights", html)
-        self.assertIn("/sync/messages?latest=true&limit=100", html)
+        self.assertIn("/sync/messages?latest=true&limit=100&include_media=true", html)
+        self.assertIn("/sync/media-files/content", html)
+        self.assertIn("previewMedia", html)
+        self.assertIn("mediaObjectUrl", html)
+        self.assertIn("media_files", html)
         self.assertIn("startMessageAutoRefresh", html)
         self.assertIn("stopMessageAutoRefresh", html)
         self.assertIn("operationEvents", html)
+        self.assertIn("renderOperationEvents", html)
+        self.assertIn('data-action="delete-operation-event"', html)
         self.assertIn("messageChatLabel", html)
         self.assertIn("data-tag-editor", html)
         self.assertIn("data-tag-remove", html)
@@ -197,38 +210,121 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("API token", html)
 
     def test_media_files_endpoint(self) -> None:
+        media_path = Path(self.tmp.name) / "api-media.jpg"
+        media_path.write_bytes(b"fake-jpeg")
         self.store.upsert_media_file(
             MediaFileRecord(
                 source=SOURCE_TELEGRAM,
                 account_id="default",
                 chat_id=-1001,
                 message_id=1,
-                file_path="/tmp/api-media.bin",
+                file_path=str(media_path),
                 media_kind="photo",
+                mime_type="image/jpeg",
+                file_size=9,
                 downloaded_at=utc_now_iso(),
             )
         )
 
         payload = self.request_json("/sync/media-files")
         self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
+        self.assertEqual(payload["items"][0]["content_type"], "image/jpeg")
+        self.assertEqual(payload["items"][0]["preview_kind"], "image")
+        self.assertIn("/sync/media-files/content?", payload["items"][0]["access_url"])
+        self.assertIn("message_id=1", payload["items"][0]["access_url"])
 
-    def test_operation_events_endpoint(self) -> None:
-        self.store.add_operation_event(
-            OperationEventRecord(
+    def test_media_file_content_endpoint_serves_registered_file(self) -> None:
+        media_path = Path(self.tmp.name) / "api-media.txt"
+        media_path.write_bytes(b"registered media")
+        self.store.upsert_media_file(
+            MediaFileRecord(
                 source=SOURCE_TELEGRAM,
-                account_id="main",
-                operation="media_download",
-                status="failed",
-                error_code="media_download_failed",
-                message="network down",
+                account_id="default",
+                chat_id=-1001,
+                message_id=1,
+                file_path=str(media_path),
+                media_kind="document",
+                mime_type="text/plain",
+                file_size=16,
+                downloaded_at=utc_now_iso(),
             )
         )
 
-        payload = self.request_json("/manage/operation-events?account_id=main&status=failed")
+        body, content_type = self.request_bytes(
+            "/sync/media-files/content?source=telegram&account_id=default&chat_id=-1001&message_id=1&file_index=0"
+        )
+
+        self.assertEqual(body, b"registered media")
+        self.assertEqual(content_type, "text/plain")
+
+    def test_media_file_content_endpoint_requires_token(self) -> None:
+        req = Request(
+            f"http://127.0.0.1:{self.port}/sync/media-files/content?source=telegram&account_id=default&chat_id=-1001&message_id=1&file_index=0"
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.assertEqual(caught.exception.code, 401)
+        caught.exception.close()
+
+    def test_messages_endpoint_can_include_media_files(self) -> None:
+        media_path = Path(self.tmp.name) / "api-media.bin"
+        media_path.write_bytes(b"payload")
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-1001,
+                message_id=1,
+                file_path=str(media_path),
+                media_kind="document",
+                file_size=7,
+                downloaded_at=utc_now_iso(),
+            )
+        )
+
+        payload = self.request_json("/sync/messages?latest=true&limit=1&include_media=true")
+
+        self.assertEqual(payload["items"][0]["media_count"], 1)
+        self.assertEqual(payload["items"][0]["media_files"][0]["message_id"], 1)
+        self.assertIn("/sync/media-files/content?", payload["items"][0]["media_files"][0]["access_url"])
+
+    def test_operation_events_endpoint(self) -> None:
+        event_id = self.store.add_operation_event(
+            OperationEventRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                operation="backfill",
+                status="failed",
+                subject_type="message",
+                subject_id="-1001/1",
+                error_code="access_denied",
+                message="private history",
+                raw_json=json.dumps(
+                    {
+                        "auth_state": "authorized",
+                        "code": "access_denied",
+                        "message": "private history",
+                        "type": "ChannelPrivateError",
+                    }
+                ),
+            )
+        )
+
+        payload = self.request_json("/manage/operation-events?account_id=default&status=failed")
 
         self.assertEqual(len(payload["items"]), 1)
-        self.assertEqual(payload["items"][0]["operation"], "media_download")
-        self.assertEqual(payload["items"][0]["error_code"], "media_download_failed")
+        self.assertEqual(payload["items"][0]["operation"], "backfill")
+        self.assertEqual(payload["items"][0]["error_code"], "access_denied")
+        self.assertEqual(payload["items"][0]["error"]["type"], "ChannelPrivateError")
+        self.assertEqual(payload["items"][0]["auth_state"], "authorized")
+        self.assertEqual(payload["items"][0]["subject"]["chat_title"], "API Chat")
+        self.assertEqual(payload["items"][0]["subject"]["message_id"], 1)
+        self.assertEqual(payload["items"][0]["subject"]["text"], "api payload")
+
+        deleted = self.request_json("/manage/operation-events", method="DELETE", payload={"id": event_id})["item"]
+
+        self.assertEqual(deleted["deleted"], 1)
+        self.assertEqual(self.request_json("/manage/operation-events?account_id=default&status=failed")["items"], [])
 
     def test_start_background_reports_bind_failure(self) -> None:
         second = SyncApiServer(self.store, "127.0.0.1", self.port, token="secret")
@@ -332,6 +428,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("origin_registry", capabilities["management"])
         self.assertIn("capture_cursors", capabilities["management"])
         self.assertIn("operation_events", capabilities["management"])
+        self.assertIn("operation_event_delete", capabilities["management"])
 
         archive = self.request_json(
             "/manage/origins/archive",

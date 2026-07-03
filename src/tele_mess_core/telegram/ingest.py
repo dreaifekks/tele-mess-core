@@ -224,7 +224,7 @@ class TelegramArchiveService:
             else None,
         )
         self.store.upsert_message(record, event_type=event_type)
-        if getattr(message, "media", None) and policy.get("download_media", False):
+        if policy.get("download_media", False) and _message_media_downloadable(message):
             await self._download_message_media(message, record)
         self._update_capture_cursor(chat_id, int(message.id), record.sent_at)
         return True
@@ -453,6 +453,30 @@ def _topic_id(message: Any) -> int | None:
     if getattr(reply_to, "forum_topic", False):
         return getattr(reply_to, "reply_to_top_id", None) or getattr(reply_to, "reply_to_msg_id", None)
     return None
+
+
+def _message_media_downloadable(message: Any) -> bool:
+    media = getattr(message, "media", None)
+    if media is None:
+        return False
+    media_type = type(media).__name__
+    downloadable_types = {
+        "MessageMediaPhoto",
+        "Photo",
+        "MessageMediaDocument",
+        "Document",
+        "MessageMediaContact",
+        "WebDocument",
+        "WebDocumentNoProxy",
+    }
+    if media_type in downloadable_types:
+        return True
+    if media_type != "MessageMediaWebPage":
+        return False
+    webpage = getattr(media, "webpage", None)
+    if type(webpage).__name__ != "WebPage":
+        return False
+    return bool(getattr(webpage, "document", None) or getattr(webpage, "photo", None))
 
 
 def _forward_from_id(message: Any) -> str | None:

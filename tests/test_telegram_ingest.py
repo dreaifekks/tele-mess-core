@@ -68,6 +68,25 @@ class FakeMessage:
         return {"id": self.id, "chat_id": self.chat_id, "text": self.text, "has_media": self.media is not None}
 
 
+class MessageMediaWebPage:
+    def __init__(self, webpage):
+        self.webpage = webpage
+
+
+class MessageMediaDocument:
+    pass
+
+
+class WebPage:
+    def __init__(self, document=None, photo=None):
+        self.document = document
+        self.photo = photo
+
+
+class WebPagePending:
+    pass
+
+
 class FakeBackfillIterator:
     def __init__(self, messages: list[FakeMessage] | None = None, error: Exception | None = None):
         self.messages = list(messages or [])
@@ -173,7 +192,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         )
 
-        stored = await self.service._store_message(FakeMessage(12, -1003, media=object()), event_type="new")
+        stored = await self.service._store_message(FakeMessage(12, -1003, media=MessageMediaDocument()), event_type="new")
         self.assertTrue(stored)
         files = self.store.list_media_files(account_id="main", chat_id=-1003, message_id=12)
         self.assertEqual(len(files), 1)
@@ -190,7 +209,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 download_media=True,
             )
         )
-        message = FakeMessage(13, -1004, media=object(), fail_download_times=1)
+        message = FakeMessage(13, -1004, media=MessageMediaDocument(), fail_download_times=1)
 
         stored = await self.service._store_message(message, event_type="new")
 
@@ -212,7 +231,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 download_media=True,
             )
         )
-        message = FakeMessage(14, -1005, media=object(), fail_download_times=3)
+        message = FakeMessage(14, -1005, media=MessageMediaDocument(), fail_download_times=3)
 
         stored = await self.service._store_message(message, event_type="new")
 
@@ -223,8 +242,46 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["operation"], "media_download")
         self.assertEqual(events[0]["error_code"], "media_download_failed")
 
+    async def test_pending_webpage_preview_does_not_attempt_media_download(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1006,
+                enabled=True,
+                download_media=True,
+            )
+        )
+        message = FakeMessage(16, -1006, media=MessageMediaWebPage(WebPagePending()))
+
+        stored = await self.service._store_message(message, event_type="new")
+
+        self.assertTrue(stored)
+        self.assertEqual(message.download_attempts, 0)
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=-1006, message_id=16), [])
+        self.assertEqual(self.store.list_operation_events(account_id="main"), [])
+
+    async def test_webpage_preview_with_file_media_still_downloads(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1007,
+                enabled=True,
+                download_media=True,
+            )
+        )
+        message = FakeMessage(17, -1007, media=MessageMediaWebPage(WebPage(photo=object())))
+
+        stored = await self.service._store_message(message, event_type="new")
+
+        self.assertTrue(stored)
+        self.assertEqual(message.download_attempts, 1)
+        files = self.store.list_media_files(account_id="main", chat_id=-1007, message_id=17)
+        self.assertEqual(len(files), 1)
+
     async def test_backfill_failure_records_operation_and_continues(self) -> None:
-        for chat_id in (-1007, -1008):
+        for chat_id in (-1008, -1009):
             self.store.set_backup_policy(
                 BackupPolicyRecord(
                     source=SOURCE_TELEGRAM,
@@ -236,18 +293,18 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.service.backfill = BackfillConfig(enabled=True, initial_limit=100, catch_up_limit=100)
         self.service.client = FakeBackfillClient(
             {
-                -1007: RuntimeError("private history"),
-                -1008: [FakeMessage(21, -1008, text="still captured")],
+                -1008: RuntimeError("private history"),
+                -1009: [FakeMessage(21, -1009, text="still captured")],
             }
         )
 
-        await self.service._backfill_configured_chats([-1007, -1008])
+        await self.service._backfill_configured_chats([-1008, -1009])
 
         self.assertEqual(self.store.state()["message_count"], 1)
         self.assertEqual(self.store.list_latest_messages()["items"][0]["text"], "still captured")
         events = self.store.list_operation_events(account_id="main", status="failed")
         self.assertEqual(events[0]["operation"], "backfill")
-        self.assertEqual(events[0]["subject_id"], "-1007")
+        self.assertEqual(events[0]["subject_id"], "-1008")
 
 
 if __name__ == "__main__":

@@ -357,7 +357,42 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(files[0]["chat_title"], "Media Chat")
 
+    def test_media_files_can_be_grouped_by_message(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1002,
+                message_id=22,
+                file_path="/tmp/media.bin",
+                media_kind="document",
+                downloaded_at=now,
+            )
+        )
+
+        grouped = self.store.list_media_files_for_messages(
+            [{"source": SOURCE_TELEGRAM, "account_id": "main", "chat_id": -1002, "message_id": 22}]
+        )
+
+        self.assertEqual(len(grouped[(SOURCE_TELEGRAM, "main", -1002, 22)]), 1)
+        self.assertEqual(grouped[(SOURCE_TELEGRAM, "main", -1002, 22)][0]["file_path"], "/tmp/media.bin")
+
     def test_operation_events_are_queryable_and_counted_in_state(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, account_id="main", chat_id=-1001, title="Error Chat"))
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1001,
+                message_id=10,
+                sent_at=now,
+                ingested_at=now,
+                text="failed media message",
+            ),
+            event_type="new",
+        )
         self.store.add_operation_event(
             OperationEventRecord(
                 source=SOURCE_TELEGRAM,
@@ -376,6 +411,15 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(events[0]["operation"], "media_download")
         self.assertEqual(events[0]["error_code"], "media_download_failed")
         self.assertEqual(self.store.state()["operation_error_count"], 1)
+        self.assertEqual(events[0]["subject_chat_title"], "Error Chat")
+        self.assertEqual(events[0]["subject_message_id"], 10)
+        self.assertEqual(events[0]["subject_text"], "failed media message")
+
+        deleted = self.store.delete_operation_events([events[0]["id"]])
+
+        self.assertEqual(deleted, 1)
+        self.assertEqual(self.store.list_operation_events(account_id="main", status="failed"), [])
+        self.assertEqual(self.store.state()["operation_error_count"], 0)
 
 
 class ArchiveMigrationTest(unittest.TestCase):
