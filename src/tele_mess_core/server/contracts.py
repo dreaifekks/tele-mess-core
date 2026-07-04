@@ -602,6 +602,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "timezone": {"type": "string", "nullable": True},
             "scope": {"type": "object"},
             "tags": {"type": "array", "items": {"type": "string"}},
+            "tags_csv": {"type": "string", "nullable": True},
             "important": {"type": "boolean"},
             "provider": {"type": "string", "nullable": True},
             "title": {"type": "string", "nullable": True},

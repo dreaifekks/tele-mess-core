@@ -130,6 +130,24 @@ def assign_origins_to_tag_groups(
     return {"groups": groups, "unmatched": remaining}
 
 
+def assign_origins_to_effective_tag_groups(origins: list[dict[str, Any]]) -> dict[str, Any]:
+    buckets: dict[tuple[str, ...], dict[str, Any]] = {}
+    order: list[tuple[str, ...]] = []
+    for origin in origins:
+        tags = parse_tags(origin.get("tags"))
+        normalized_tags = tuple(normalize_tag(tag) for tag in tags if normalize_tag(tag))
+        key = normalized_tags or ("untagged",)
+        if key not in buckets:
+            buckets[key] = {
+                "name": ",".join(tags) if tags else "untagged",
+                "tags": tags,
+                "origins": [],
+            }
+            order.append(key)
+        buckets[key]["origins"].append(origin)
+    return {"groups": [buckets[key] for key in order], "unmatched": []}
+
+
 def build_daily_package(
     store: ArchiveStore,
     config: AppConfig,
@@ -170,11 +188,19 @@ def build_daily_package(
         (output_root / "important-origins").mkdir(exist_ok=True)
         (output_root / "analysis").mkdir(exist_ok=True)
 
-        selected_origins = _select_package_origins(store, scope)
+        selected_origins = [
+            origin
+            for origin in _select_package_origins(store, scope)
+            if _origin_has_messages(store, origin, window_start_utc, window_end_utc)
+        ]
         important_origins = [origin for origin in selected_origins if origin.get("important")]
         normal_origins = [origin for origin in selected_origins if not origin.get("important")]
         tag_groups = parse_tag_groups(scope.get("tag_groups"))
-        grouped = assign_origins_to_tag_groups(normal_origins, tag_groups)
+        grouped = (
+            assign_origins_to_tag_groups(normal_origins, tag_groups)
+            if tag_groups
+            else assign_origins_to_effective_tag_groups(normal_origins)
+        )
 
         group_packages = []
         totals = {"origin_count": 0, "message_count": 0, "media_count": 0, "important_origin_count": len(important_origins)}
@@ -226,6 +252,7 @@ def build_daily_package(
                 {"name": group.name, "tags": list(group.tags), "normalized_tags": sorted(group.normalized_tags)}
                 for group in tag_groups
             ],
+            "auto_tag_groups": not bool(tag_groups),
             "normal_groups": group_packages,
             "important_origins": important_packages,
             "unmatched_origins": [_origin_summary(origin) for origin in grouped["unmatched"]],
@@ -335,7 +362,7 @@ def run_daily_summary(
             ),
             encoding="utf-8",
         )
-        summary_record = _build_summary_record(
+        summary_records = _build_summary_records(
             run_id=run_id,
             package_run_id=str(package_run_id),
             package_run=package_run,
@@ -346,7 +373,8 @@ def run_daily_summary(
             image_paths=image_paths,
             analysis=analysis,
         )
-        store.upsert_daily_summary_record(summary_record)
+        for summary_record in summary_records:
+            store.upsert_daily_summary_record(summary_record)
         return store.upsert_daily_summary_run(
             DailySummaryRunRecord(
                 run_id=run_id,
@@ -382,7 +410,41 @@ def run_daily_summary(
         )
 
 
-def _build_summary_record(
+def run_daily_package_and_summary(
+    store: ArchiveStore,
+    config: AppConfig,
+    *,
+    run_date: str | None = None,
+    timezone_name: str | None = None,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    package = build_daily_package(store, config, run_date=run_date, timezone_name=timezone_name, scope=scope)
+    result: dict[str, Any] = {
+        "status": package.get("status"),
+        "package_run_id": package.get("run_id"),
+        "summary_run_id": None,
+        "package": package,
+        "summary": None,
+        "error": package.get("error"),
+    }
+    if package.get("status") != "completed":
+        result["status"] = "failed"
+        result["error"] = package.get("error") or "Daily package did not complete"
+        return result
+
+    summary = run_daily_summary(store, config, package_run_id=str(package["run_id"]), scope=scope)
+    result.update(
+        {
+            "status": "completed" if summary.get("status") == "completed" else "failed",
+            "summary_run_id": summary.get("run_id"),
+            "summary": summary,
+            "error": summary.get("error"),
+        }
+    )
+    return result
+
+
+def _build_summary_records(
     *,
     run_id: str,
     package_run_id: str,
@@ -393,39 +455,165 @@ def _build_summary_record(
     summary_text: str,
     image_paths: list[str],
     analysis: dict[str, Any] | None = None,
-) -> DailySummaryRecord:
+) -> list[DailySummaryRecord]:
     stats = package_payload.get("stats") or {}
     now = utc_now_iso()
-    content_json = {
+    analysis = analysis or {}
+    date = str(package_run.get("date") or package_payload.get("date") or "")
+    timezone_name = str(package_run.get("timezone") or package_payload.get("timezone") or "")
+    scope_json = json.dumps(package_payload.get("scope") or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
+    records: list[DailySummaryRecord] = []
+
+    for artifact in analysis.get("normal_groups") or []:
+        metadata = artifact.get("metadata") or {}
+        group_name = str(metadata.get("group_name") or "untagged")
+        tags = parse_tags(metadata.get("group_tags"))
+        origin_refs = list(metadata.get("origin_refs") or [])
+        content = str(artifact.get("content") or "")
+        content_json = _summary_record_content_json(
+            package_run_id=package_run_id,
+            package_run=package_run,
+            record_type="tag_group",
+            tags=tags,
+            image_paths=image_paths,
+            artifact=artifact,
+            final_summary_path=summary_path,
+        )
+        records.append(
+            DailySummaryRecord(
+                summary_id=f"{run_id}--group--{_slug(group_name)}",
+                run_id=run_id,
+                package_run_id=package_run_id,
+                date=date or None,
+                timezone=timezone_name or None,
+                scope_json=scope_json,
+                tags_json=json.dumps(tags, ensure_ascii=False),
+                tags_csv=",".join(tags),
+                important=False,
+                provider=provider,
+                title=f"Daily Summary {date} - {group_name}" if date else f"Daily Summary - {group_name}",
+                content_md=content,
+                content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
+                summary_path=str(artifact.get("output_path") or summary_path),
+                origin_count=len(origin_refs),
+                group_count=1,
+                image_count=0,
+                content_length=len(content),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    for artifact in analysis.get("important_origins") or []:
+        metadata = artifact.get("metadata") or {}
+        origin = metadata.get("origin") or {}
+        tags = parse_tags(origin.get("tags"))
+        origin_ref = _origin_ref_from_summary(origin)
+        title = str(origin.get("title") or origin_ref or "important")
+        content = str(artifact.get("content") or "")
+        artifact_images = list(artifact.get("image_paths") or [])
+        content_json = _summary_record_content_json(
+            package_run_id=package_run_id,
+            package_run=package_run,
+            record_type="important_origin",
+            tags=tags,
+            image_paths=artifact_images,
+            artifact=artifact,
+            final_summary_path=summary_path,
+        )
+        records.append(
+            DailySummaryRecord(
+                summary_id=f"{run_id}--important--{_slug(origin_ref or title)}",
+                run_id=run_id,
+                package_run_id=package_run_id,
+                date=date or None,
+                timezone=timezone_name or None,
+                scope_json=scope_json,
+                tags_json=json.dumps(tags, ensure_ascii=False),
+                tags_csv=",".join(tags),
+                important=True,
+                provider=provider,
+                title=f"Important Summary {date} - {title}" if date else f"Important Summary - {title}",
+                content_md=content,
+                content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
+                summary_path=str(artifact.get("output_path") or summary_path),
+                origin_count=1,
+                group_count=0,
+                image_count=len(artifact_images),
+                content_length=len(content),
+                created_at=now,
+                updated_at=now,
+            )
+        )
+
+    if records:
+        return records
+
+    content_json = _summary_record_content_json(
+        package_run_id=package_run_id,
+        package_run=package_run,
+        record_type="final",
+        tags=_collect_summary_tags(package_payload),
+        image_paths=image_paths,
+        artifact=analysis.get("final") or {},
+        final_summary_path=summary_path,
+        full_analysis=analysis,
+    )
+    return [
+        DailySummaryRecord(
+            summary_id=run_id,
+            run_id=run_id,
+            package_run_id=package_run_id,
+            date=date or None,
+            timezone=timezone_name or None,
+            scope_json=scope_json,
+            tags_json=json.dumps(_collect_summary_tags(package_payload), ensure_ascii=False),
+            tags_csv=",".join(_collect_summary_tags(package_payload)),
+            important=bool(package_payload.get("important_origins") or stats.get("important_origin_count")),
+            provider=provider,
+            title=f"Daily Summary {date}" if date else "Daily Summary",
+            content_md=summary_text,
+            content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
+            summary_path=str(summary_path),
+            origin_count=int(stats.get("origin_count") or 0),
+            group_count=len(package_payload.get("normal_groups") or []),
+            image_count=len(image_paths),
+            content_length=len(summary_text),
+            created_at=now,
+            updated_at=now,
+        )
+    ]
+
+
+def _summary_record_content_json(
+    *,
+    package_run_id: str,
+    package_run: dict[str, Any],
+    record_type: str,
+    tags: list[str],
+    image_paths: list[str],
+    artifact: dict[str, Any],
+    final_summary_path: Path,
+    full_analysis: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    payload = {
+        "record_type": record_type,
         "package_run_id": package_run_id,
         "package_json_path": package_run.get("package_json_path"),
         "package_md_path": package_run.get("package_md_path"),
+        "final_summary_path": str(final_summary_path),
+        "tags": tags,
+        "tags_csv": ",".join(tags),
         "image_paths": image_paths,
-        "analysis": _analysis_record_payload(analysis or {}),
+        "artifact": _artifact_payload(artifact),
     }
-    date = str(package_run.get("date") or package_payload.get("date") or "")
-    timezone_name = str(package_run.get("timezone") or package_payload.get("timezone") or "")
-    return DailySummaryRecord(
-        summary_id=run_id,
-        run_id=run_id,
-        package_run_id=package_run_id,
-        date=date or None,
-        timezone=timezone_name or None,
-        scope_json=json.dumps(package_payload.get("scope") or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True),
-        tags_json=json.dumps(_collect_summary_tags(package_payload), ensure_ascii=False),
-        important=bool(package_payload.get("important_origins") or stats.get("important_origin_count")),
-        provider=provider,
-        title=f"Daily Summary {date}" if date else "Daily Summary",
-        content_md=summary_text,
-        content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
-        summary_path=str(summary_path),
-        origin_count=int(stats.get("origin_count") or 0),
-        group_count=len(package_payload.get("normal_groups") or []),
-        image_count=len(image_paths),
-        content_length=len(summary_text),
-        created_at=now,
-        updated_at=now,
-    )
+    if full_analysis is not None:
+        payload["analysis"] = _analysis_record_payload(full_analysis)
+    return payload
+
+
+def _origin_ref_from_summary(origin: dict[str, Any]) -> str:
+    return f"{origin.get('account_id')}/{origin.get('origin_id')}/{origin.get('topic_id') or 0}"
 
 
 def _collect_summary_tags(package_payload: dict[str, Any]) -> list[str]:
@@ -514,7 +702,7 @@ def _run_ai_analysis_pipeline(
     important_dir = stages_dir / "important-origins"
     for origin_payload in package_payload.get("important_origins") or []:
         origin_ref = _origin_ref(origin_payload)
-        image_paths = _origin_image_paths(origin_payload)
+        image_paths = _origin_image_paths(origin_payload, limit=None)
         prompt = _important_origin_analysis_prompt(origin_payload, media_artifacts)
         artifact = _run_ai_task(
             config,
@@ -567,6 +755,8 @@ def _analyze_package_media(
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: dict[str, dict[str, Any]] = {}
     for origin_payload in _iter_origin_payloads(package_payload):
+        if (origin_payload.get("origin") or {}).get("important"):
+            continue
         for message in origin_payload.get("messages") or []:
             for media in message.get("media_files") or []:
                 file_path = str(media.get("file_path") or "")
@@ -721,17 +911,40 @@ def _media_reference_markdown(descriptor: dict[str, Any]) -> str:
     )
 
 
+def _tag_specific_instruction(*tag_values: Any) -> str:
+    tags: list[str] = []
+    for value in tag_values:
+        tags.extend(parse_tags(value))
+    if "info" not in {normalize_tag(tag) for tag in tags}:
+        return ""
+    return (
+        "Tag-specific instruction for `info`:\n"
+        "这个 tag 表示当前分组/来源的核心目标是获取信息。请重点收集群组中的信息点并返回："
+        "事实、公告、事件、资源、链接、数值、时间、行动项、争议点和 source_refs。"
+        "不要只做闲聊氛围、情绪或泛泛摘要；低价值闲聊可以标为 noise，但有信息量的短句也要保留。\n"
+    )
+
+
 def _normal_origin_key_prompt(
     group: dict[str, Any],
     origin_payload: dict[str, Any],
     media_artifacts: dict[str, dict[str, Any]],
 ) -> str:
     payload = _compact_origin_for_analysis(origin_payload, media_artifacts)
+    tag_instruction = _tag_specific_instruction(
+        group.get("tags"),
+        (origin_payload.get("origin") or {}).get("tags"),
+    )
     return (
         "TASK: normal_origin_key_extraction\n"
         "你是 Telegram 每日归档的关键信息提取器。当前 origin 不是 important，属于 normal tag group。\n"
-        "请从这个 origin 的消息中提取可用于组内汇总的关键内容串，不要做最终总结。\n"
+        "请从这个 origin 的消息中整理可用于组内汇总的原始内容和关键内容，不要做最终总结。"
+        "若 origin 是按 parent tags 进入本组的 topic，请只处理本 topic 的消息，后续再与 parent/group 整合。\n"
+        "内容保留规则：当 `truncated_message_count` 为 0 时，输入消息不超过 200 条，必须按时间顺序保留全部消息文本、发言人、时间和 source_refs；"
+        "不要只抽几条重点。只有当消息超过 200 条并被截断时，才做重点段落/主题摘要。\n"
         "输出 Markdown，包含：\n"
+        "## Full Content Record\n"
+        "- 若未截断，逐条保留全部消息；若已截断，说明截断数量并保留代表性段落。\n"
         "## Key Information Strings\n"
         "- 每条是一句独立、可引用的事实/观点/事件/资源，保留 source_refs。\n"
         "## Suggested Tags\n"
@@ -740,12 +953,14 @@ def _normal_origin_key_prompt(
         "- 简述被忽略的闲聊/重复内容类型。\n\n"
         "Group metadata:\n"
         f"{json.dumps({'name': group.get('name'), 'tags': group.get('tags')}, ensure_ascii=False, indent=2)}\n\n"
+        f"{tag_instruction}\n"
         "Origin package:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
     )
 
 
 def _normal_group_analysis_prompt(group: dict[str, Any], origin_artifacts: list[dict[str, Any]]) -> str:
+    tag_instruction = _tag_specific_instruction(group.get("tags"))
     extracted = [
         {
             "origin": artifact.get("metadata", {}).get("origin"),
@@ -756,15 +971,20 @@ def _normal_group_analysis_prompt(group: dict[str, Any], origin_artifacts: list[
     return (
         "TASK: normal_group_analysis\n"
         "你是 Telegram 每日归档的 tag group 分析器。请基于组内多个 origin 的关键内容串，"
-        "总结这一组的分析结果和 tags。\n"
+        "总结这一组的分析结果和 tags。同一 parent 下按 parent tags 分入本组的 topics 要与 parent 作为一体整合。"
+        "如果 origin 提取结果包含 `Full Content Record`，说明该 origin 当天消息量不大，请把完整记录作为主要依据，"
+        "输出的信息密度要接近原始内容，不要压缩成一两句话。\n"
         "输出 Markdown，包含：\n"
         "## Group Analysis\n"
+        "## Full Content Digest\n"
+        "- 按 origin/topic 分块，保留主要原文事实、链接、资源名、数值、时间和 source_refs。\n"
         "## Key Threads\n"
         "## Derived Tags\n"
         "## Risks / Opportunities / Actions\n"
         "## Source Refs\n\n"
         "Group metadata:\n"
         f"{json.dumps({'name': group.get('name'), 'tags': group.get('tags'), 'origin_count': group.get('origin_count')}, ensure_ascii=False, indent=2)}\n\n"
+        f"{tag_instruction}\n"
         "Origin key extractions:\n"
         f"{json.dumps(extracted, ensure_ascii=False, indent=2)}\n"
     )
@@ -774,18 +994,24 @@ def _important_origin_analysis_prompt(
     origin_payload: dict[str, Any],
     media_artifacts: dict[str, dict[str, Any]],
 ) -> str:
-    payload = _compact_origin_for_analysis(origin_payload, media_artifacts)
+    payload = _compact_origin_for_analysis(origin_payload, media_artifacts, message_limit=None)
+    tag_instruction = _tag_specific_instruction((origin_payload.get("origin") or {}).get("tags"))
     return (
         "TASK: important_origin_analysis\n"
         "你是 Telegram 每日归档的 important origin 分析器。这个 origin 需要单独分析，不能只并入普通 tag group。\n"
-        "请先整理一份完整记录，再总结重点部分。图片上下文中若包含 OCR，则把 OCR 文字并入记录；"
-        "若是图像信息为主，则把图片路径或 Markdown 图片引用作为内容插入；PDF/视频等长内容只保留路径和文件名。\n"
+        "important origin 永远按全量消息处理：输入中的 messages 已包含查询时间窗内全部消息，"
+        "必须按时间顺序把全部消息文本、发言人、时间和 source_refs 写入 `Complete Important Record`，不要做 200 条截断摘要。\n"
+        "请先做 `Segment Importance Scan`：按时间段/讨论段落判断重要度，再根据 media 所在消息或前后上下文的重要度决定是否处理 media。"
+        "只有重要上下文中的图片才需要 OCR/视觉事实提取并插入记录；低重要度 media 只列出路径和跳过原因。"
+        "PDF/视频等长内容只保留路径和文件名，除非上下文显示它是重要信息源。\n"
         "输出 Markdown，包含：\n"
         "## Complete Important Record\n"
+        "## Segment Importance Scan\n"
         "## Important Analysis\n"
         "## Tags\n"
         "## Media Handling\n"
         "## Source Refs\n\n"
+        f"{tag_instruction}\n"
         "Important origin package:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
     )
@@ -833,7 +1059,8 @@ def _final_daily_summary_prompt(
         "输出最终 Markdown 总结。\n"
         "要求：\n"
         "1. 先给出 Important Highlights，并保留 important 和 tag 分析结果。\n"
-        "2. 再按 tag group 输出 normal content 的分析、机会、风险和行动项。\n"
+        "2. 再按 tag group 输出 normal content 的分析、机会、风险和行动项；当组内分析包含 Full Content Digest 时，"
+        "最终总结也要保留足够细节，不要压缩成极短摘要。\n"
         "3. 把图片 OCR/图像分析作为内容依据引用；PDF/视频只引用路径和文件名，不编造内容。\n"
         "4. 每个结论尽量保留 source_refs，引用 origin title/message_id/file_path。\n"
         "5. 输出应是可直接阅读的 Markdown，不要返回 JSON。\n\n"
@@ -845,9 +1072,14 @@ def _final_daily_summary_prompt(
 def _compact_origin_for_analysis(
     origin_payload: dict[str, Any],
     media_artifacts: dict[str, dict[str, Any]],
+    *,
+    message_limit: int | None = 200,
 ) -> dict[str, Any]:
     messages = []
-    for message in (origin_payload.get("messages") or [])[:200]:
+    raw_messages = origin_payload.get("messages") or []
+    included_messages = raw_messages if message_limit is None else raw_messages[:message_limit]
+    truncated_message_count = 0 if message_limit is None else max(0, len(raw_messages) - message_limit)
+    for message in included_messages:
         media_files = []
         for media in message.get("media_files") or []:
             file_path = str(media.get("file_path") or "")
@@ -874,8 +1106,14 @@ def _compact_origin_for_analysis(
     return {
         "origin": origin_payload.get("origin"),
         "package_meta": origin_payload.get("package_meta"),
+        "message_count": len(raw_messages),
+        "full_content_policy": (
+            "all_messages_included"
+            if truncated_message_count == 0
+            else f"first_{message_limit}_messages_included"
+        ),
         "messages": messages,
-        "truncated_message_count": max(0, len(origin_payload.get("messages") or []) - 200),
+        "truncated_message_count": truncated_message_count,
     }
 
 
@@ -884,14 +1122,14 @@ def _origin_ref(origin_payload: dict[str, Any]) -> str:
     return f"{origin.get('account_id')}/{origin.get('origin_id')}/{origin.get('topic_id') or 0}"
 
 
-def _origin_image_paths(origin_payload: dict[str, Any], limit: int = 20) -> list[str]:
+def _origin_image_paths(origin_payload: dict[str, Any], limit: int | None = 20) -> list[str]:
     paths: list[str] = []
     for message in origin_payload.get("messages") or []:
         for media in message.get("media_files") or []:
             file_path = str(media.get("file_path") or "")
             if _is_image_media(media) and file_path and Path(file_path).is_file():
                 paths.append(file_path)
-                if len(paths) >= limit:
+                if limit is not None and len(paths) >= limit:
                     return paths
     return paths
 
@@ -1047,11 +1285,13 @@ def read_run_content(store: ArchiveStore, run_type: str, run_id: str, content_fo
         item = store.get_daily_summary_run(run_id)
         if item is None:
             raise ValueError("Unknown daily summary run")
-        record = store.get_daily_summary_record(run_id=run_id)
-        if record is not None and record.get("content_md") is not None:
-            return str(record["content_md"]), "text/markdown; charset=utf-8"
         path = item.get("summary_path")
         content_format = "md"
+        if path and Path(str(path)).is_file():
+            return Path(str(path)).read_text(encoding="utf-8"), "text/markdown; charset=utf-8"
+        record = store.get_daily_summary_record(summary_id=run_id)
+        if record is not None and record.get("content_md") is not None:
+            return str(record["content_md"]), "text/markdown; charset=utf-8"
     else:
         raise ValueError("Unknown run type")
     if not path:
@@ -1066,6 +1306,11 @@ def read_run_content(store: ArchiveStore, run_type: str, run_id: str, content_fo
 def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[dict[str, Any]]:
     account_id = scope.get("account_id")
     origins = store.list_origins(account_id=str(account_id) if account_id else None, include_archived=False)
+    parent_lookup = {
+        _parent_lookup_key(origin): origin
+        for origin in origins
+        if int(origin.get("topic_id") or 0) == 0
+    }
     selected: list[dict[str, Any]] = []
     required_tags = {normalize_tag(tag) for tag in parse_tags(scope.get("tags"))}
     origin_id = scope.get("origin_id")
@@ -1080,14 +1325,72 @@ def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[
             continue
         if topic_id not in (None, "") and int(origin.get("topic_id") or 0) != int(topic_id):
             continue
-        tags = parse_tags(policy.get("tags"))
-        normalized = {normalize_tag(tag) for tag in tags}
+        local_tags = parse_tags(policy.get("tags"))
+        tags = local_tags
+        topic_grouping = "origin"
+        parent_tags: list[str] = []
+        parent_important = False
+        if int(origin.get("topic_id") or 0):
+            parent = parent_lookup.get(_parent_lookup_key(origin))
+            parent_policy = (parent or {}).get("backup_policy") or {}
+            parent_tags = parse_tags(parent_policy.get("tags"))
+            parent_important = bool((parent or {}).get("important"))
+            local_normalized = _normalized_tag_set(local_tags)
+            parent_normalized = _normalized_tag_set(parent_tags)
+            topic_has_own_grouping = bool(origin.get("important")) or (
+                bool(local_normalized) and local_normalized != parent_normalized
+            )
+            if topic_has_own_grouping:
+                topic_grouping = "topic"
+            else:
+                tags = parent_tags
+                topic_grouping = "parent"
+        normalized = _normalized_tag_set(tags)
         if required_tags and not required_tags.issubset(normalized):
             continue
         item = dict(origin)
         item["tags"] = tags
+        item["local_tags"] = local_tags
+        if parent_tags:
+            item["parent_tags"] = parent_tags
+        if topic_grouping != "origin":
+            item["tag_grouping"] = topic_grouping
+        if parent_important and topic_grouping == "parent":
+            item["important"] = True
+            item["parent_important"] = True
         selected.append(item)
     return selected
+
+
+def _parent_lookup_key(origin: dict[str, Any]) -> tuple[str, str, int]:
+    return (
+        str(origin.get("source") or SOURCE_TELEGRAM),
+        str(origin.get("account_id") or ""),
+        int(origin.get("origin_id") or 0),
+    )
+
+
+def _normalized_tag_set(tags: Any) -> frozenset[str]:
+    return frozenset(normalize_tag(tag) for tag in parse_tags(tags) if normalize_tag(tag))
+
+
+def _origin_has_messages(
+    store: ArchiveStore,
+    origin: dict[str, Any],
+    window_start_utc: datetime,
+    window_end_utc: datetime,
+) -> bool:
+    return bool(
+        store.list_messages_for_origin_window(
+            str(origin.get("source") or SOURCE_TELEGRAM),
+            str(origin["account_id"]),
+            int(origin["origin_id"]),
+            topic_id=int(origin.get("topic_id") or 0),
+            window_start=window_start_utc.isoformat(),
+            window_end=window_end_utc.isoformat(),
+            limit=1,
+        )
+    )
 
 
 def _package_origin(
@@ -1135,7 +1438,7 @@ def _package_origin(
 
 
 def _origin_summary(origin: dict[str, Any]) -> dict[str, Any]:
-    return {
+    summary = {
         "source": origin.get("source"),
         "account_id": origin.get("account_id"),
         "origin_id": origin.get("origin_id"),
@@ -1147,6 +1450,15 @@ def _origin_summary(origin: dict[str, Any]) -> dict[str, Any]:
         "important": bool(origin.get("important")),
         "last_message_at": origin.get("last_message_at"),
     }
+    if "local_tags" in origin:
+        summary["local_tags"] = parse_tags(origin.get("local_tags"))
+    if "parent_tags" in origin:
+        summary["parent_tags"] = parse_tags(origin.get("parent_tags"))
+    if origin.get("tag_grouping"):
+        summary["tag_grouping"] = origin.get("tag_grouping")
+    if origin.get("parent_important"):
+        summary["parent_important"] = True
+    return summary
 
 
 def _package_message(message: dict[str, Any], media_files: list[dict[str, Any]], local_tz: ZoneInfo) -> dict[str, Any]:
@@ -1387,14 +1699,14 @@ def _systemd_service(config: AppConfig) -> str:
             shlex.quote(config.daily.cli_path),
             "--config",
             shlex.quote(config_path),
-            "daily-package",
+            "daily-run",
             "--scheduled",
         ]
     )
     return "\n".join(
         [
             "[Unit]",
-            "Description=tele-mess-core daily package run",
+            "Description=tele-mess-core daily package and summary run",
             "After=network-online.target",
             "Wants=network-online.target",
             "",
@@ -1402,6 +1714,7 @@ def _systemd_service(config: AppConfig) -> str:
             "Type=oneshot",
             f"WorkingDirectory={shlex.quote(str(Path(config_path).parent))}",
             "Environment=PYTHONUNBUFFERED=1",
+            "TimeoutStartSec=0",
             f"ExecStart={exec_start}",
             "",
         ]
@@ -1414,7 +1727,7 @@ def _systemd_timer(time_of_day: str, timezone_name: str) -> str:
     return "\n".join(
         [
             "[Unit]",
-            "Description=Run tele-mess-core daily package",
+            "Description=Run tele-mess-core daily package and summary",
             "",
             "[Timer]",
             f"OnCalendar=*-*-* {time_of_day}:00 {timezone_name}",

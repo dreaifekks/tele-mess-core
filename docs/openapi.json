@@ -810,6 +810,10 @@
             },
             "type": "array"
           },
+          "tags_csv": {
+            "nullable": true,
+            "type": "string"
+          },
           "timezone": {
             "nullable": true,
             "type": "string"
@@ -2057,7 +2061,7 @@
   "info": {
     "title": "tele-mess-core API",
     "version": "2026-07-03.3",
-    "x-contract-hash": "1975e0cadf569537"
+    "x-contract-hash": "17089891060961e6"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -31,7 +31,8 @@ daily package and AI analysis details.
 - Server daemon mode for devNuc-style always-on deployment.
 - Daily package generation by origin, tag group, timezone, and local date.
 - Local Codex-backed daily summary runs with configurable AI command templates.
-- System-managed daily package scheduling through user-level systemd timer files.
+- System-managed daily package and summary scheduling through user-level systemd
+  timer files.
 - Optional raw Telegram JSON retention cleanup for keeping the SQLite archive
   compact while preserving structured message rows.
 
@@ -164,9 +165,14 @@ if they still fail.
 
 Daily packages are generated from already archived messages. The run selects
 enabled, non-removed backup origins by account, origin, topic, tag intersection,
-or tag groups. Tag groups are assigned from most-specific to least-specific so a
-`web3,it,info` origin is removed from broader `web3,info` processing after it is
-assigned.
+or tag groups, then skips origins with no messages in the selected daily
+window. Parent origins and forum topics are grouped together by the parent's
+tags unless a topic has explicit different tags or is marked important.
+When no ad hoc tag group scope is supplied, origins are grouped by their
+effective CSV tag set, so `web3,info` and `ai,info` become separate summary
+records. Explicit tag groups are still assigned from most-specific to
+least-specific so a `web3,it,info` origin is removed from broader `web3,info`
+processing after it is assigned.
 
 Origin rows can be marked `important`; important origins are packaged separately
 and analyzed per origin before the final rollup. Summary runs use a staged AI
@@ -181,7 +187,7 @@ pipeline:
 
 Package and summary artifacts are written under the configured daily output
 directory, while SQLite stores run status, paths, counts, errors, and completed
-summary Markdown for API lookup/filtering.
+group-level summary Markdown for API lookup/filtering.
 
 The default AI provider is a configurable local `codex exec` command template
 using `--output-last-message`. Templates can use `{output}`, `{images}`, and

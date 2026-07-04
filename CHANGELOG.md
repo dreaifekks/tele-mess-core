@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.2 - 2026-07-04
+
+- Changed the daily systemd job to run package generation and Codex-backed summary generation together.
+- Added tag-set based daily summary grouping with stored `tags_csv` metadata and multiple summary records per run.
+- Updated parent/topic tag handling so topics inherit parent grouping unless they have distinct tags or are important.
+- Skipped origins with no messages in the daily window before grouping and summary generation.
+- Expanded daily summary prompts to preserve full normal-origin content up to 200 messages, handle important origins at full length, and add an `info` tag instruction focused on information collection.
+
 ## 0.2.1 - 2026-07-03
 
 - Added raw Telegram JSON retention cleanup for message rows.

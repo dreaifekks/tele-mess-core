@@ -226,12 +226,13 @@ CREATE TABLE IF NOT EXISTS daily_summary_runs (
 
 CREATE TABLE IF NOT EXISTS daily_summary_records (
   summary_id TEXT PRIMARY KEY,
-  run_id TEXT NOT NULL UNIQUE,
+  run_id TEXT NOT NULL,
   package_run_id TEXT,
   date TEXT,
   timezone TEXT,
   scope_json TEXT,
   tags_json TEXT,
+  tags_csv TEXT,
   important INTEGER NOT NULL DEFAULT 0,
   provider TEXT,
   title TEXT,

@@ -3,7 +3,7 @@
 This file is generated from `tele_mess_core.server.contracts`.
 
 - Contract version: `2026-07-03.3`
-- Contract hash: `1975e0cadf569537`
+- Contract hash: `17089891060961e6`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1050,6 +1050,7 @@ Response: `ParticipantRefreshResultResponse`
 | `timezone` | `string` | no |
 | `scope` | `object` | no |
 | `tags` | `array` | no |
+| `tags_csv` | `string` | no |
 | `important` | `boolean` | no |
 | `provider` | `string` | no |
 | `title` | `string` | no |

@@ -527,19 +527,41 @@ class ArchiveStoreTest(unittest.TestCase):
                 group_count=1,
             )
         )
+        self.store.upsert_daily_summary_record(
+            DailySummaryRecord(
+                summary_id="sum_a_group_ai",
+                run_id="sum_a",
+                package_run_id="pkg_a",
+                date="2026-07-03",
+                timezone="UTC",
+                tags_json='["ai", "info"]',
+                important=False,
+                provider="disabled",
+                title="Daily Summary 2026-07-03 - ai,info",
+                content_md="# Daily Summary\n\nai alpha",
+                content_json='{"source":"test","record_type":"tag_group"}',
+                summary_path="/tmp/summary-ai.md",
+                origin_count=1,
+                group_count=1,
+            )
+        )
 
         listed = self.store.list_daily_summary_records(tags=["web3", "info"], important=True)
 
         self.assertEqual(len(listed), 1)
         self.assertEqual(listed[0]["summary_id"], "sum_a")
         self.assertEqual(listed[0]["tags"], ["web3", "info"])
+        self.assertEqual(listed[0]["tags_csv"], "web3,info")
         self.assertNotIn("content_md", listed[0])
         self.assertIn("web3 alpha", listed[0]["content_preview"])
 
         fetched = self.store.get_daily_summary_record(run_id="sum_a")
         assert fetched is not None
-        self.assertEqual(fetched["content_md"], "# Daily Summary\n\nweb3 alpha")
-        self.assertEqual(fetched["content_json"]["source"], "test")
+        self.assertIn(fetched["content_md"], {"# Daily Summary\n\nweb3 alpha", "# Daily Summary\n\nai alpha"})
+        self.assertEqual(fetched["run_id"], "sum_a")
+
+        run_records = self.store.list_daily_summary_records(run_id="sum_a")
+        self.assertEqual(len(run_records), 2)
 
         self.assertEqual(self.store.list_daily_summary_records(tags=["web3", "ai"]), [])
 

@@ -62,6 +62,17 @@ def main(argv: list[str] | None = None) -> int:
     daily_summary_parser.add_argument("--tags", help="Comma-separated tags when building a package first")
     daily_summary_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
 
+    daily_run_parser = sub.add_parser("daily-run", help="Generate a daily package and then run its AI summary")
+    add_config_arg(daily_run_parser)
+    daily_run_parser.add_argument("--date", help="Local package date in YYYY-MM-DD. Defaults to yesterday in the target timezone.")
+    daily_run_parser.add_argument("--timezone", help="Timezone for the local day window")
+    daily_run_parser.add_argument("--account-id", help="Filter to one account")
+    daily_run_parser.add_argument("--origin-id", type=int, help="Filter to one origin")
+    daily_run_parser.add_argument("--topic-id", type=int, help="Filter to one topic")
+    daily_run_parser.add_argument("--tags", help="Comma-separated tags that all selected origins must have")
+    daily_run_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
+    daily_run_parser.add_argument("--scheduled", action="store_true", help="Use saved daily package schedule scope/timezone")
+
     daily_schedule_parser = sub.add_parser("daily-schedule", help="Install or remove the system daily package timer")
     add_config_arg(daily_schedule_parser)
     daily_schedule_sub = daily_schedule_parser.add_subparsers(dest="daily_schedule_command", required=True)
@@ -131,6 +142,8 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "daily-summary":
             _daily_summary(config, store, args)
             return 0
+        if args.command == "daily-run":
+            return _daily_run(config, store, args)
         if args.command == "daily-schedule":
             _daily_schedule(config, store, args)
             return 0
@@ -334,6 +347,24 @@ def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namesp
         scope=scope,
     )
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+
+
+def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> int:
+    from tele_mess_core.daily import run_daily_package_and_summary
+
+    schedule = store.get_daily_package_schedule() if args.scheduled else {}
+    scope = dict(schedule.get("scope") or {}) if args.scheduled else {}
+    scope.update(_daily_scope_from_args(args))
+    timezone_name = args.timezone or schedule.get("timezone") or scope.get("timezone")
+    item = run_daily_package_and_summary(
+        store,
+        config,
+        run_date=args.date,
+        timezone_name=timezone_name,
+        scope=scope,
+    )
+    print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+    return 0 if item.get("status") == "completed" else 1
 
 
 def _daily_schedule(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:

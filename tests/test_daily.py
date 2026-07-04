@@ -114,12 +114,19 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("AI provider is disabled", Path(summary["summary_path"]).read_text(encoding="utf-8"))
         records = self.store.list_daily_summary_records(package_run_id=package["run_id"], tags=["ai", "info"], important=True)
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["summary_id"], summary["run_id"])
+        self.assertEqual(records[0]["run_id"], summary["run_id"])
+        self.assertIn("--important--", records[0]["summary_id"])
         self.assertIn("AI provider is disabled", records[0]["content_preview"])
         record = self.store.get_daily_summary_record(run_id=summary["run_id"])
         assert record is not None
         self.assertIn("AI provider is disabled", record["content_md"])
-        self.assertEqual(record["tags"], ["web3", "info", "it", "ai"])
+        self.assertTrue(set(record["tags"]).issubset({"web3", "info", "it", "ai"}))
+        all_records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
+        self.assertEqual(len(all_records), 4)
+        self.assertEqual(
+            {tuple(item["tags"]) for item in all_records},
+            {("web3", "it", "info"), ("web3", "info"), ("ai", "info")},
+        )
 
         fake_provider = self.root / "fake_provider.py"
         fake_log = self.root / "fake_provider_calls.jsonl"
@@ -157,20 +164,132 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("# Fake final_daily_summary", fake_text)
         calls = [json.loads(line) for line in fake_log.read_text(encoding="utf-8").splitlines()]
         tasks = [call["task"] for call in calls]
-        self.assertIn("media_image_analysis", tasks)
+        self.assertNotIn("media_image_analysis", tasks)
         self.assertIn("normal_origin_key_extraction", tasks)
         self.assertIn("normal_group_analysis", tasks)
         self.assertIn("important_origin_analysis", tasks)
         self.assertIn("final_daily_summary", tasks)
-        media_call = next(call for call in calls if call["task"] == "media_image_analysis")
-        self.assertIn("--image", media_call["args"])
-        self.assertIn(str(media_path), media_call["args"])
+        important_call = next(call for call in calls if call["task"] == "important_origin_analysis")
+        self.assertIn("--image", important_call["args"])
+        self.assertIn(str(media_path), important_call["args"])
         summary_payload = json.loads((Path(fake_summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
-        self.assertTrue(any(item["task"] == "media_file_reference" for item in summary_payload["analysis"]["media"]))
-        self.assertIn(str(pdf_path), json.dumps(summary_payload["analysis"], ensure_ascii=False))
+        self.assertEqual(summary_payload["analysis"]["media"], [])
+        important_prompt_path = Path(summary_payload["analysis"]["important_origins"][0]["prompt_path"])
+        self.assertIn(str(pdf_path), important_prompt_path.read_text(encoding="utf-8"))
         fake_record = self.store.get_daily_summary_record(run_id=fake_summary["run_id"])
         assert fake_record is not None
-        self.assertEqual(fake_record["content_json"]["analysis"]["final"]["task"], "final_daily_summary")
+        self.assertIn(fake_record["content_json"]["record_type"], {"tag_group", "important_origin"})
+
+    def test_default_daily_package_groups_by_origin_tag_sets(self) -> None:
+        self._origin(-5001, "Web3 One", "web3,info")
+        self._origin(-5002, "Web3 Two", "web3,info")
+        self._origin(-5003, "AI", "ai,info")
+        for chat_id, text in (
+            (-5001, "web3 one"),
+            (-5002, "web3 two"),
+            (-5003, "ai one"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=chat_id,
+                    message_id=1,
+                    sent_at="2026-07-03T01:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=text,
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        groups = {group["name"]: group for group in payload["normal_groups"]}
+        self.assertTrue(payload["auto_tag_groups"])
+        self.assertEqual(set(groups), {"web3,info", "ai,info"})
+        self.assertEqual(groups["web3,info"]["origin_count"], 2)
+        self.assertEqual(groups["ai,info"]["origin_count"], 1)
+
+        summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
+        records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
+        self.assertEqual(len(records), 2)
+        self.assertEqual({tuple(item["tags"]) for item in records}, {("web3", "info"), ("ai", "info")})
+        self.assertEqual({item["tags_csv"] for item in records}, {"web3,info", "ai,info"})
+        group_prompt = Path(summary["output_dir"]) / "stages" / "normal-groups" / "web3-info.prompt.md"
+        self.assertIn("Tag-specific instruction for `info`", group_prompt.read_text(encoding="utf-8"))
+
+    def test_important_origin_prompt_includes_all_messages_past_normal_limit(self) -> None:
+        self._origin(-7001, "Important Full", "trade,info", important=True)
+        for index in range(205):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-7001,
+                    message_id=index + 1,
+                    sent_at=f"2026-07-03T01:{index % 60:02d}:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=f"important payload {index + 1}",
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
+
+        prompt_files = list((Path(summary["output_dir"]) / "stages" / "important-origins").glob("*.prompt.md"))
+        self.assertEqual(len(prompt_files), 1)
+        prompt_text = prompt_files[0].read_text(encoding="utf-8")
+        self.assertIn("important origin 永远按全量消息处理", prompt_text)
+        self.assertIn('"message_count": 205', prompt_text)
+        self.assertIn('"truncated_message_count": 0', prompt_text)
+        self.assertIn("important payload 205", prompt_text)
+        self.assertIn("Segment Importance Scan", prompt_text)
+
+    def test_daily_package_skips_origins_without_messages_in_window(self) -> None:
+        self._origin(-6001, "Active Web3", "web3,info")
+        self._origin(-6002, "Silent Web3", "web3,info")
+        self._origin(-6003, "Silent Important", "trade,info", important=True)
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-6001,
+                message_id=1,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="active payload",
+            ),
+            event_type="new",
+        )
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-6002,
+                message_id=1,
+                sent_at="2026-07-01T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="old payload",
+            ),
+            event_type="new",
+        )
+
+        package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(payload["stats"]["origin_count"], 1)
+        self.assertEqual(payload["stats"]["message_count"], 1)
+        self.assertEqual(payload["important_origins"], [])
+        groups = {group["name"]: group for group in payload["normal_groups"]}
+        self.assertEqual(list(groups), ["web3,info"])
+        self.assertEqual([origin["origin"]["origin_id"] for origin in groups["web3,info"]["origins"]], [-6001])
+
+        summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
+        self.assertEqual(summary["group_count"], 1)
+        records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["tags_csv"], "web3,info")
 
     def test_schedule_update_writes_systemd_user_timer_files(self) -> None:
         schedule = update_daily_package_schedule(
@@ -189,7 +308,98 @@ class DailyPackagingTest(unittest.TestCase):
         timer = self.root / "systemd-user" / "tele-mess-core-daily-package.timer"
         service = self.root / "systemd-user" / "tele-mess-core-daily-package.service"
         self.assertIn("OnCalendar=*-*-* 09:15:00 UTC", timer.read_text(encoding="utf-8"))
-        self.assertIn("daily-package", service.read_text(encoding="utf-8"))
+        service_text = service.read_text(encoding="utf-8")
+        self.assertIn("daily-run", service_text)
+        self.assertIn("TimeoutStartSec=0", service_text)
+
+    def test_topics_group_with_parent_tags_unless_explicitly_different_or_important(self) -> None:
+        self._origin(-2001, "Parent Group", "web3,info")
+        for topic_id, title, tags, important in (
+            (10, "Blank Topic", None, False),
+            (11, "Same Topic", "web3,info", False),
+            (12, "AI Topic", "ai,info", False),
+            (13, "Important Topic", None, True),
+        ):
+            self.store.upsert_origin(
+                OriginRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=-2001,
+                    topic_id=topic_id,
+                    parent_origin_id=-2001,
+                    origin_type="topic",
+                    title=title,
+                    important=important,
+                )
+            )
+            self.store.set_backup_policy(
+                BackupPolicyRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=-2001,
+                    topic_id=topic_id,
+                    enabled=True,
+                    tags=tags,
+                )
+            )
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-2001,
+                    topic_id=topic_id,
+                    message_id=topic_id,
+                    sent_at="2026-07-03T01:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=f"{title} payload",
+                ),
+                event_type="new",
+            )
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-2001,
+                message_id=1,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="parent payload",
+            ),
+            event_type="new",
+        )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tag_groups": ["web3 info", "ai info"]},
+        )
+
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        groups = {group["name"]: group for group in payload["normal_groups"]}
+        web3_origins = {
+            (origin["origin"]["origin_id"], origin["origin"]["topic_id"])
+            for origin in groups["web3 info"]["origins"]
+        }
+        ai_origins = {
+            (origin["origin"]["origin_id"], origin["origin"]["topic_id"])
+            for origin in groups["ai info"]["origins"]
+        }
+        self.assertEqual(web3_origins, {(-2001, 0), (-2001, 10), (-2001, 11)})
+        self.assertEqual(ai_origins, {(-2001, 12)})
+        blank_topic = next(
+            origin["origin"]
+            for origin in groups["web3 info"]["origins"]
+            if origin["origin"]["topic_id"] == 10
+        )
+        self.assertEqual(blank_topic["tags"], ["web3", "info"])
+        self.assertEqual(blank_topic["local_tags"], [])
+        self.assertEqual(blank_topic["tag_grouping"], "parent")
+        self.assertEqual(
+            [(origin["origin"]["origin_id"], origin["origin"]["topic_id"]) for origin in payload["important_origins"]],
+            [(-2001, 13)],
+        )
 
     def test_cli_daily_package_and_summary_commands_run(self) -> None:
         self._origin(-3001, "CLI Daily", "cli,info")
@@ -241,6 +451,15 @@ daily:
         self.assertEqual(code, 0)
         summary = json.loads(stdout.getvalue())
         self.assertEqual(summary["status"], "completed")
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main(["--config", str(config_path), "daily-run", "--date", "2026-07-03", "--timezone", "UTC", "--account-id", "main"])
+        self.assertEqual(code, 0)
+        run = json.loads(stdout.getvalue())
+        self.assertEqual(run["status"], "completed")
+        self.assertEqual(run["package"]["status"], "completed")
+        self.assertEqual(run["summary"]["status"], "completed")
 
     def _origin(self, origin_id: int, title: str, tags: str, important: bool = False) -> None:
         self.store.upsert_origin(

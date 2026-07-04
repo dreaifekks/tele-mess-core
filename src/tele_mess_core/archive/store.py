@@ -1348,16 +1348,17 @@ class ArchiveStore:
         now = record.updated_at or utc_now_iso()
         created_at = record.created_at or now
         content_length = record.content_length or len(record.content_md)
+        tags_csv = record.tags_csv if record.tags_csv is not None else _tags_csv_from_json(record.tags_json)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO daily_summary_records(
                   summary_id, run_id, package_run_id, date, timezone, scope_json,
-                  tags_json, important, provider, title, content_md, content_json,
+                  tags_json, tags_csv, important, provider, title, content_md, content_json,
                   summary_path, origin_count, group_count, image_count, content_length,
                   created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                   run_id = excluded.run_id,
                   package_run_id = excluded.package_run_id,
@@ -1365,6 +1366,7 @@ class ArchiveStore:
                   timezone = excluded.timezone,
                   scope_json = excluded.scope_json,
                   tags_json = excluded.tags_json,
+                  tags_csv = excluded.tags_csv,
                   important = excluded.important,
                   provider = excluded.provider,
                   title = excluded.title,
@@ -1385,6 +1387,7 @@ class ArchiveStore:
                     record.timezone,
                     record.scope_json,
                     record.tags_json,
+                    tags_csv,
                     int(record.important),
                     record.provider,
                     record.title,
@@ -1425,11 +1428,14 @@ class ArchiveStore:
             row = self._conn.execute(
                 """
                 SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
-                       tags_json, important, provider, title, content_md, content_json,
+                       tags_json, tags_csv, important, provider, title, content_md, content_json,
                        summary_path, origin_count, group_count, image_count, content_length,
                        created_at, updated_at
                 FROM daily_summary_records
-                WHERE """ + " AND ".join(clauses),
+                WHERE """ + " AND ".join(clauses) + """
+                ORDER BY created_at DESC, summary_id DESC
+                LIMIT 1
+                """,
                 tuple(params),
             ).fetchone()
         if row is None:
@@ -1454,7 +1460,7 @@ class ArchiveStore:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
-                   tags_json, important, provider, title, content_md, content_json,
+                   tags_json, tags_csv, important, provider, title, content_md, content_json,
                    summary_path, origin_count, group_count, image_count, content_length,
                    created_at, updated_at
             FROM daily_summary_records
@@ -1863,8 +1869,80 @@ class ArchiveStore:
             self._conn.execute("ALTER TABLE origins ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
+        if self._daily_summary_records_run_id_is_unique():
+            self._migrate_daily_summary_records_run_id_unique()
+        if self._has_table("daily_summary_records") and not self._has_column("daily_summary_records", "tags_csv"):
+            self._conn.execute("ALTER TABLE daily_summary_records ADD COLUMN tags_csv TEXT")
+            self._conn.execute(
+                """
+                UPDATE daily_summary_records
+                SET tags_csv = (
+                  SELECT group_concat(value, ',')
+                  FROM json_each(daily_summary_records.tags_json)
+                )
+                WHERE tags_json IS NOT NULL AND tags_json != ''
+                """
+            )
         if self._has_table("messages"):
             self._ensure_message_fts_triggers()
+
+    def _daily_summary_records_run_id_is_unique(self) -> bool:
+        if not self._has_table("daily_summary_records"):
+            return False
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'daily_summary_records'"
+        ).fetchone()
+        return bool(row and row["sql"] and "run_id TEXT NOT NULL UNIQUE" in str(row["sql"]))
+
+    def _migrate_daily_summary_records_run_id_unique(self) -> None:
+        self._conn.executescript(
+            """
+            ALTER TABLE daily_summary_records RENAME TO daily_summary_records_old_unique;
+            CREATE TABLE daily_summary_records (
+              summary_id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              package_run_id TEXT,
+              date TEXT,
+              timezone TEXT,
+              scope_json TEXT,
+              tags_json TEXT,
+              tags_csv TEXT,
+              important INTEGER NOT NULL DEFAULT 0,
+              provider TEXT,
+              title TEXT,
+              content_md TEXT NOT NULL,
+              content_json TEXT,
+              summary_path TEXT,
+              origin_count INTEGER NOT NULL DEFAULT 0,
+              group_count INTEGER NOT NULL DEFAULT 0,
+              image_count INTEGER NOT NULL DEFAULT 0,
+              content_length INTEGER NOT NULL DEFAULT 0,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            INSERT INTO daily_summary_records(
+              summary_id, run_id, package_run_id, date, timezone, scope_json,
+              tags_json, tags_csv, important, provider, title, content_md, content_json,
+              summary_path, origin_count, group_count, image_count, content_length,
+              created_at, updated_at
+            )
+            SELECT
+              summary_id, run_id, package_run_id, date, timezone, scope_json,
+              tags_json,
+              (
+                SELECT group_concat(value, ',')
+                FROM json_each(daily_summary_records_old_unique.tags_json)
+              ),
+              important, provider, title, content_md, content_json,
+              summary_path, origin_count, group_count, image_count, content_length,
+              created_at, updated_at
+            FROM daily_summary_records_old_unique;
+            DROP TABLE daily_summary_records_old_unique;
+            CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
+            CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
+            """
+        )
 
     def _ensure_message_fts_triggers(self) -> None:
         self._conn.executescript(
@@ -2007,6 +2085,8 @@ def _summary_record_from_row(row: sqlite3.Row, *, include_content: bool) -> dict
     data = _row_to_dict(row, json_fields={"scope_json", "tags_json", "content_json"}, bool_fields={"important"})
     data["scope"] = data.pop("scope_json") or {}
     data["tags"] = data.pop("tags_json") or []
+    if not data.get("tags_csv"):
+        data["tags_csv"] = ",".join(str(tag) for tag in data["tags"])
     content = str(data.get("content_md") or "")
     data["content_preview"] = content[:240]
     data["content_length"] = int(data.get("content_length") or len(content))
@@ -2014,6 +2094,18 @@ def _summary_record_from_row(row: sqlite3.Row, *, include_content: bool) -> dict
         data.pop("content_md", None)
         data.pop("content_json", None)
     return data
+
+
+def _tags_csv_from_json(tags_json: str | None) -> str | None:
+    if not tags_json:
+        return None
+    try:
+        value = json.loads(tags_json)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(value, list):
+        return None
+    return ",".join(str(tag).strip() for tag in value if str(tag).strip())
 
 
 def _normalize_tag(tag: Any) -> str:

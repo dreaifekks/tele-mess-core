@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tele-mess-core"
-version = "0.2.1"
+version = "0.2.2"
 description = "Telegram message archive core with SQLite storage and sync API"
 readme = "README.md"
 requires-python = ">=3.11"

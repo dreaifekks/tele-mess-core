@@ -221,6 +221,7 @@ class DailySummaryRecord:
     timezone: str | None = None
     scope_json: str | None = None
     tags_json: str | None = None
+    tags_csv: str | None = None
     important: bool = False
     provider: str | None = None
     title: str | None = None
