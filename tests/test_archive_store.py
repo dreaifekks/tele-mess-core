@@ -12,6 +12,7 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailySummaryJobRecord,
     DailySummaryRecord,
     MediaFileRecord,
     MessageRecord,
@@ -565,6 +566,48 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(self.store.list_daily_summary_records(tags=["web3", "ai"]), [])
 
+        changed = self.store.set_daily_summary_records_deleted(["sum_a", "sum_a_group_ai"], deleted=True)
+        self.assertEqual(changed, 2)
+        self.assertEqual(self.store.list_daily_summary_records(run_id="sum_a"), [])
+        deleted_records = self.store.list_daily_summary_records(run_id="sum_a", deleted=True)
+        self.assertEqual(len(deleted_records), 2)
+        self.assertTrue(all(item["deleted"] for item in deleted_records))
+        self.assertIsNone(self.store.get_daily_summary_record(summary_id="sum_a"))
+        deleted_record = self.store.get_daily_summary_record(summary_id="sum_a", include_deleted=True)
+        assert deleted_record is not None
+        self.assertTrue(deleted_record["deleted"])
+
+        restored = self.store.set_daily_summary_records_deleted(["sum_a"], deleted=False)
+        self.assertEqual(restored, 1)
+        self.assertEqual(len(self.store.list_daily_summary_records(run_id="sum_a")), 1)
+
+    def test_daily_summary_jobs_track_progress_and_cancel_request(self) -> None:
+        self.store.upsert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_a",
+                status="running",
+                date="2026-07-03",
+                timezone="UTC",
+                scope_json='{"tags":"web3"}',
+                package_run_id="pkg_a",
+                provider="disabled",
+                progress_total=4,
+                progress_current=1,
+                progress_label="packaging",
+                progress_json='{"stage":"package","current":1,"total":4}',
+            )
+        )
+
+        job = self.store.get_daily_summary_job("job_a")
+        assert job is not None
+        self.assertEqual(job["progress"]["stage"], "package")
+        self.assertEqual(job["scope"], {"tags": "web3"})
+
+        canceled = self.store.request_daily_summary_job_cancel("job_a")
+        assert canceled is not None
+        self.assertEqual(canceled["status"], "cancel_requested")
+        self.assertIsNotNone(canceled["cancel_requested_at"])
+
 
 class ArchiveMigrationTest(unittest.TestCase):
     def test_v1_database_migrates_to_account_aware_schema(self) -> None:
@@ -611,7 +654,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "10")
+                self.assertEqual(store.state()["schema_version"], "12")
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")

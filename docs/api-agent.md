@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-07-03.3`
-- Contract hash: `17089891060961e6`
+- Contract version: `2026-07-04.2`
+- Contract hash: `914f4499ab500f2c`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -37,6 +37,10 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `PATCH /manage/daily-package-schedule` body `DailyPackageScheduleInput` - Update the daily package system schedule.
 - `POST /manage/daily-packages` body `DailyPackageRunInput` - Generate a daily package immediately.
 - `POST /manage/daily-summaries` body `DailySummaryRunInput` - Run a daily summary immediately.
+- `POST /manage/daily-summary-jobs` body `DailySummaryRunInput` - Start a background daily package and summary job.
+- `PATCH /manage/daily-summary-jobs/cancel` body `DailySummaryJobCancelInput` - Request cancellation of a running daily summary job.
+- `PATCH /manage/daily-summary-records` body `DailySummaryRecordDeleteInput` - Soft-delete or restore one or more stored daily summary records.
+- `DELETE /manage/daily-summary-records` body `DailySummaryRecordDeleteInput` - Soft-delete one or more stored daily summary records.
 - `POST /manage/discover-origins` body `DiscoveryInput` - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` body `ParticipantRefreshInput` - Refresh participants for a Telegram origin.
 

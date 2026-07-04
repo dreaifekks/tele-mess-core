@@ -187,6 +187,10 @@ class DailyPackageRunRecord:
     message_count: int = 0
     media_count: int = 0
     important_origin_count: int = 0
+    progress_total: int = 0
+    progress_current: int = 0
+    progress_label: str | None = None
+    progress_json: str | None = None
     error: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
@@ -206,9 +210,34 @@ class DailySummaryRunRecord:
     origin_count: int = 0
     group_count: int = 0
     image_count: int = 0
+    progress_total: int = 0
+    progress_current: int = 0
+    progress_label: str | None = None
+    progress_json: str | None = None
     error: str | None = None
     started_at: str | None = None
     finished_at: str | None = None
+
+
+@dataclass(slots=True)
+class DailySummaryJobRecord:
+    job_id: str
+    status: str
+    date: str | None = None
+    timezone: str | None = None
+    scope_json: str | None = None
+    package_run_id: str | None = None
+    summary_run_id: str | None = None
+    provider: str | None = None
+    progress_total: int = 0
+    progress_current: int = 0
+    progress_label: str | None = None
+    progress_json: str | None = None
+    cancel_requested_at: str | None = None
+    error: str | None = None
+    started_at: str | None = None
+    finished_at: str | None = None
+    updated_at: str | None = None
 
 
 @dataclass(slots=True)
@@ -231,6 +260,7 @@ class DailySummaryRecord:
     group_count: int = 0
     image_count: int = 0
     content_length: int = 0
+    deleted_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
 

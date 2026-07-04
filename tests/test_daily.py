@@ -4,6 +4,7 @@ import json
 import io
 import sys
 import tempfile
+import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -11,7 +12,7 @@ from pathlib import Path
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
 from tele_mess_core.config import AppConfig, DailyAiConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
-from tele_mess_core.daily import build_daily_package, run_daily_summary, update_daily_package_schedule
+from tele_mess_core.daily import build_daily_package, cancel_daily_summary_job, run_daily_summary, start_daily_summary_job, update_daily_package_schedule
 from tele_mess_core.models import BackupPolicyRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
 
@@ -100,6 +101,10 @@ class DailyPackagingTest(unittest.TestCase):
         )
 
         self.assertEqual(package["status"], "completed")
+        self.assertEqual(package["progress_current"], package["progress_total"])
+        self.assertEqual(package["progress_label"], "completed")
+        self.assertEqual(package["progress"]["normal_group_count"], 3)
+        self.assertEqual(package["progress"]["important_origin_count"], 1)
         payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
         groups = {group["name"]: group for group in payload["normal_groups"]}
         self.assertEqual([origin["origin"]["origin_id"] for origin in groups["web3 it info"]["origins"]], [-1002])
@@ -111,6 +116,10 @@ class DailyPackagingTest(unittest.TestCase):
 
         summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
         self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["progress_current"], summary["progress_total"])
+        self.assertEqual(summary["progress_label"], "completed")
+        self.assertEqual(summary["progress"]["normal_group_count"], 3)
+        self.assertEqual(summary["progress"]["important_origin_count"], 1)
         self.assertIn("AI provider is disabled", Path(summary["summary_path"]).read_text(encoding="utf-8"))
         records = self.store.list_daily_summary_records(package_run_id=package["run_id"], tags=["ai", "info"], important=True)
         self.assertEqual(len(records), 1)
@@ -460,6 +469,75 @@ daily:
         self.assertEqual(run["status"], "completed")
         self.assertEqual(run["package"]["status"], "completed")
         self.assertEqual(run["summary"]["status"], "completed")
+
+    def test_daily_summary_job_can_cancel_running_provider_process(self) -> None:
+        self._origin(-1001, "Cancelable Daily", "web3,info")
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1001,
+                message_id=1,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="cancel me",
+            ),
+            event_type="new",
+        )
+        slow_provider = self.root / "slow_provider.py"
+        slow_provider.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "import time\n"
+            "sys.stdin.read()\n"
+            "time.sleep(5)\n"
+            "Path(sys.argv[1]).write_text('# done', encoding='utf-8')\n",
+            encoding="utf-8",
+        )
+        slow_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                systemd_user_dir=self.config.daily.systemd_user_dir,
+                ai=DailyAiConfig(
+                    provider="fake",
+                    command=[sys.executable, str(slow_provider), "{output}", "{task}"],
+                    timeout_seconds=10,
+                ),
+            ),
+            config_path=self.config.config_path,
+        )
+
+        job = start_daily_summary_job(
+            self.store,
+            slow_config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        deadline = time.time() + 3
+        current = job
+        while time.time() < deadline:
+            current = self.store.get_daily_summary_job(job["job_id"])
+            assert current is not None
+            if (current.get("progress") or {}).get("pid"):
+                break
+            time.sleep(0.05)
+
+        canceled = cancel_daily_summary_job(self.store, job["job_id"])
+        self.assertIn(canceled["status"], {"cancel_requested", "canceled"})
+        deadline = time.time() + 3
+        while time.time() < deadline:
+            current = self.store.get_daily_summary_job(job["job_id"])
+            assert current is not None
+            if current["status"] == "canceled":
+                break
+            time.sleep(0.05)
+        self.assertEqual(current["status"], "canceled")
+        self.assertEqual(current["progress_label"], "canceled")
 
     def _origin(self, origin_id: int, title: str, tags: str, important: bool = False) -> None:
         self.store.upsert_origin(

@@ -584,6 +584,19 @@
             "nullable": true,
             "type": "string"
           },
+          "progress": {
+            "type": "object"
+          },
+          "progress_current": {
+            "type": "integer"
+          },
+          "progress_label": {
+            "nullable": true,
+            "type": "string"
+          },
+          "progress_total": {
+            "type": "integer"
+          },
           "run_id": {
             "type": "string"
           },
@@ -749,6 +762,113 @@
         ],
         "type": "object"
       },
+      "DailySummaryJob": {
+        "properties": {
+          "cancel_requested_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "date": {
+            "nullable": true,
+            "type": "string"
+          },
+          "error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "finished_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "job_id": {
+            "type": "string"
+          },
+          "package_run_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "progress": {
+            "type": "object"
+          },
+          "progress_current": {
+            "type": "integer"
+          },
+          "progress_label": {
+            "nullable": true,
+            "type": "string"
+          },
+          "progress_total": {
+            "type": "integer"
+          },
+          "provider": {
+            "nullable": true,
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          },
+          "started_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "status": {
+            "type": "string"
+          },
+          "summary_run_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "timezone": {
+            "nullable": true,
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id",
+          "status"
+        ],
+        "type": "object"
+      },
+      "DailySummaryJobCancelInput": {
+        "properties": {
+          "job_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "job_id"
+        ],
+        "type": "object"
+      },
+      "DailySummaryJobListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DailySummaryJob"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DailySummaryJobResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailySummaryJob"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
       "DailySummaryRecord": {
         "properties": {
           "content_json": {
@@ -768,6 +888,13 @@
             "type": "string"
           },
           "date": {
+            "nullable": true,
+            "type": "string"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "deleted_at": {
             "nullable": true,
             "type": "string"
           },
@@ -833,6 +960,63 @@
         ],
         "type": "object"
       },
+      "DailySummaryRecordDeleteInput": {
+        "properties": {
+          "deleted": {
+            "default": true,
+            "type": "boolean"
+          },
+          "ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "summary_id": {
+            "type": "string"
+          },
+          "summary_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "type": "object"
+      },
+      "DailySummaryRecordDeleteResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailySummaryRecordDeleteResult"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailySummaryRecordDeleteResult": {
+        "properties": {
+          "changed_rows": {
+            "type": "integer"
+          },
+          "deleted": {
+            "type": "boolean"
+          },
+          "summary_ids": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "summary_ids",
+          "deleted",
+          "changed_rows"
+        ],
+        "type": "object"
+      },
       "DailySummaryRecordListResponse": {
         "properties": {
           "items": {
@@ -888,6 +1072,19 @@
           "package_run_id": {
             "nullable": true,
             "type": "string"
+          },
+          "progress": {
+            "type": "object"
+          },
+          "progress_current": {
+            "type": "integer"
+          },
+          "progress_label": {
+            "nullable": true,
+            "type": "string"
+          },
+          "progress_total": {
+            "type": "integer"
           },
           "provider": {
             "nullable": true,
@@ -2060,8 +2257,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-03.3",
-    "x-contract-hash": "17089891060961e6"
+    "version": "2026-07-04.2",
+    "x-contract-hash": "914f4499ab500f2c"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3670,7 +3867,299 @@
         ]
       }
     },
+    "/manage/daily-summary-jobs": {
+      "get": {
+        "operationId": "get_manage_daily_summary_jobs",
+        "parameters": [
+          {
+            "description": "Filter by job ID.",
+            "in": "query",
+            "name": "job_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by job status.",
+            "in": "query",
+            "name": "status",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Maximum rows to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryJobListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List background daily package and summary jobs.",
+        "tags": [
+          "management"
+        ]
+      },
+      "post": {
+        "operationId": "post_manage_daily_summary_jobs",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryRunInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryJobResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Start a background daily package and summary job.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-jobs/cancel": {
+      "patch": {
+        "operationId": "patch_manage_daily_summary_jobs_cancel",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryJobCancelInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryJobResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Request cancellation of a running daily summary job.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
     "/manage/daily-summary-records": {
+      "delete": {
+        "operationId": "delete_manage_daily_summary_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryRecordDeleteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRecordDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Soft-delete one or more stored daily summary records.",
+        "tags": [
+          "management"
+        ]
+      },
       "get": {
         "operationId": "get_manage_daily_summary_records",
         "parameters": [
@@ -3774,6 +4263,25 @@
             }
           },
           {
+            "description": "Include soft-deleted summaries.",
+            "in": "query",
+            "name": "include_deleted",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by soft-deleted state.",
+            "in": "query",
+            "name": "deleted",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
             "description": "Include full Markdown content in list items.",
             "in": "query",
             "name": "include_content",
@@ -3848,6 +4356,73 @@
         "tags": [
           "management"
         ]
+      },
+      "patch": {
+        "operationId": "patch_manage_daily_summary_records",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryRecordDeleteInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryRecordDeleteResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Soft-delete or restore one or more stored daily summary records.",
+        "tags": [
+          "management"
+        ]
       }
     },
     "/manage/daily-summary-records/item": {
@@ -3870,6 +4445,16 @@
             "required": false,
             "schema": {
               "type": "string"
+            }
+          },
+          {
+            "description": "Allow returning a soft-deleted record.",
+            "in": "query",
+            "name": "include_deleted",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
             }
           }
         ],

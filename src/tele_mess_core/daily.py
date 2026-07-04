@@ -2,16 +2,19 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import os
 import re
 import shlex
+import signal
 import subprocess
 import threading
+import time as time_module
 import uuid
 from dataclasses import dataclass
 from datetime import date as date_type
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from tele_mess_core.archive import ArchiveStore
@@ -19,6 +22,7 @@ from tele_mess_core.config import AppConfig
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
+    DailySummaryJobRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
     SOURCE_TELEGRAM,
@@ -27,6 +31,55 @@ from tele_mess_core.models import (
 
 
 DAILY_SYSTEMD_BASENAME = "tele-mess-core-daily-package"
+
+
+class DailyJobCancelled(RuntimeError):
+    pass
+
+
+class _DailyJobRuntime:
+    def __init__(self) -> None:
+        self.cancel_requested = threading.Event()
+        self.process: subprocess.Popen[str] | None = None
+
+
+_JOB_RUNTIME_LOCK = threading.RLock()
+_JOB_RUNTIMES: dict[str, _DailyJobRuntime] = {}
+
+
+def _register_job_runtime(job_id: str) -> _DailyJobRuntime:
+    runtime = _DailyJobRuntime()
+    with _JOB_RUNTIME_LOCK:
+        _JOB_RUNTIMES[job_id] = runtime
+    return runtime
+
+
+def _get_job_runtime(job_id: str) -> _DailyJobRuntime | None:
+    with _JOB_RUNTIME_LOCK:
+        return _JOB_RUNTIMES.get(job_id)
+
+
+def _unregister_job_runtime(job_id: str) -> None:
+    with _JOB_RUNTIME_LOCK:
+        _JOB_RUNTIMES.pop(job_id, None)
+
+
+def _set_runtime_process(runtime: _DailyJobRuntime, process: subprocess.Popen[str] | None) -> None:
+    with _JOB_RUNTIME_LOCK:
+        runtime.process = process
+    if process is not None and runtime.cancel_requested.is_set() and process.poll() is None:
+        _terminate_process(process)
+
+
+def _request_runtime_cancel(job_id: str) -> bool:
+    runtime = _get_job_runtime(job_id)
+    if runtime is None:
+        return False
+    runtime.cancel_requested.set()
+    process = runtime.process
+    if process is not None and process.poll() is None:
+        _terminate_process(process)
+    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -156,6 +209,8 @@ def build_daily_package(
     timezone_name: str | None = None,
     scope: dict[str, Any] | None = None,
     run_id: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     scope = dict(scope or {})
     timezone_name = timezone_name or str(scope.get("timezone") or "Asia/Tokyo")
@@ -170,18 +225,39 @@ def build_daily_package(
     package_json_path = output_root / "package.json"
     package_md_path = output_root / "package.md"
     scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
+    progress_state: dict[str, Any] = {"current": 0, "total": 0, "label": "starting"}
 
-    store.upsert_daily_package_run(
-        DailyPackageRunRecord(
-            run_id=run_id,
-            status="running",
-            date=package_date.isoformat(),
-            timezone=timezone_name,
-            scope_json=scope_json,
-            output_dir=str(output_root),
-            started_at=utc_now_iso(),
+    def update_progress(
+        current: int,
+        total: int,
+        label: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        if cancel_check:
+            cancel_check()
+        progress_state.clear()
+        progress_state.update({"stage": "package", "current": current, "total": total, "label": label, **(extra or {})})
+        store.upsert_daily_package_run(
+            DailyPackageRunRecord(
+                run_id=run_id,
+                status="running",
+                date=package_date.isoformat(),
+                timezone=timezone_name,
+                scope_json=scope_json,
+                output_dir=str(output_root),
+                package_json_path=str(package_json_path),
+                package_md_path=str(package_md_path),
+                progress_total=total,
+                progress_current=current,
+                progress_label=label,
+                progress_json=json.dumps(progress_state, ensure_ascii=False, sort_keys=True),
+                started_at=utc_now_iso(),
+            )
         )
-    )
+        if progress_callback:
+            progress_callback(dict(progress_state))
+
+    update_progress(0, 0, "selecting origins")
     try:
         output_root.mkdir(parents=True, exist_ok=True)
         (output_root / "normal-groups").mkdir(exist_ok=True)
@@ -193,6 +269,8 @@ def build_daily_package(
             for origin in _select_package_origins(store, scope)
             if _origin_has_messages(store, origin, window_start_utc, window_end_utc)
         ]
+        if cancel_check:
+            cancel_check()
         important_origins = [origin for origin in selected_origins if origin.get("important")]
         normal_origins = [origin for origin in selected_origins if not origin.get("important")]
         tag_groups = parse_tag_groups(scope.get("tag_groups"))
@@ -201,10 +279,31 @@ def build_daily_package(
             if tag_groups
             else assign_origins_to_effective_tag_groups(normal_origins)
         )
+        package_units = len(grouped["groups"]) + len(important_origins)
+        package_current = 0
+        update_progress(
+            package_current,
+            package_units,
+            "packaging",
+            {
+                "normal_group_count": len(grouped["groups"]),
+                "important_origin_count": len(important_origins),
+                "selected_origin_count": len(selected_origins),
+                "unmatched_origin_count": len(grouped["unmatched"]),
+            },
+        )
 
         group_packages = []
         totals = {"origin_count": 0, "message_count": 0, "media_count": 0, "important_origin_count": len(important_origins)}
         for group in grouped["groups"]:
+            update_progress(
+                package_current,
+                package_units,
+                f"packaging group {group['name']}",
+                {"current_group": group["name"], "unit_type": "normal_group"},
+            )
+            if cancel_check:
+                cancel_check()
             origin_packages = [
                 _package_origin(store, origin, window_start_utc, window_end_utc, tz)
                 for origin in group["origins"]
@@ -226,9 +325,25 @@ def build_daily_package(
             totals["origin_count"] += len(origin_packages)
             totals["message_count"] += group_payload["message_count"]
             totals["media_count"] += group_payload["media_count"]
+            package_current += 1
+            update_progress(
+                package_current,
+                package_units,
+                f"packaged group {group['name']}",
+                {"current_group": group["name"], "unit_type": "normal_group"},
+            )
 
         important_packages = []
         for origin in important_origins:
+            origin_label = _origin_ref({"origin": origin})
+            update_progress(
+                package_current,
+                package_units,
+                f"packaging important {origin_label}",
+                {"current_origin": origin_label, "unit_type": "important_origin"},
+            )
+            if cancel_check:
+                cancel_check()
             payload = _package_origin(store, origin, window_start_utc, window_end_utc, tz)
             important_packages.append(payload)
             name = _origin_file_stem(origin)
@@ -237,6 +352,13 @@ def build_daily_package(
             totals["origin_count"] += 1
             totals["message_count"] += payload["package_meta"]["message_count"]
             totals["media_count"] += payload["package_meta"]["media_count"]
+            package_current += 1
+            update_progress(
+                package_current,
+                package_units,
+                f"packaged important {origin_label}",
+                {"current_origin": origin_label, "unit_type": "important_origin"},
+            )
 
         package_payload = {
             "run_id": run_id,
@@ -276,7 +398,47 @@ def build_daily_package(
                 message_count=totals["message_count"],
                 media_count=totals["media_count"],
                 important_origin_count=totals["important_origin_count"],
+                progress_total=package_units,
+                progress_current=package_units,
+                progress_label="completed",
+                progress_json=json.dumps(
+                    {
+                        "stage": "package",
+                        "current": package_units,
+                        "total": package_units,
+                        "label": "completed",
+                        "normal_group_count": len(grouped["groups"]),
+                        "important_origin_count": len(important_origins),
+                        "selected_origin_count": len(selected_origins),
+                        "unmatched_origin_count": len(grouped["unmatched"]),
+                    },
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 finished_at=finished,
+            )
+        )
+    except DailyJobCancelled as exc:
+        return store.upsert_daily_package_run(
+            DailyPackageRunRecord(
+                run_id=run_id,
+                status="canceled",
+                date=package_date.isoformat(),
+                timezone=timezone_name,
+                scope_json=scope_json,
+                output_dir=str(output_root),
+                package_json_path=str(package_json_path),
+                package_md_path=str(package_md_path),
+                progress_total=int(progress_state.get("total") or 0),
+                progress_current=int(progress_state.get("current") or 0),
+                progress_label="canceled",
+                progress_json=json.dumps(
+                    {**progress_state, "label": "canceled", "error": str(exc) or "canceled"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                error=str(exc) or "canceled",
+                finished_at=utc_now_iso(),
             )
         )
     except Exception as exc:
@@ -290,10 +452,57 @@ def build_daily_package(
                 output_dir=str(output_root),
                 package_json_path=str(package_json_path),
                 package_md_path=str(package_md_path),
+                progress_total=int(progress_state.get("total") or 0),
+                progress_current=int(progress_state.get("current") or 0),
+                progress_label="failed",
+                progress_json=json.dumps(
+                    {**progress_state, "label": "failed", "error": str(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 error=str(exc),
                 finished_at=utc_now_iso(),
             )
         )
+
+
+def _summary_progress_counts(package_payload: dict[str, Any]) -> dict[str, int]:
+    normal_group_count = len(package_payload.get("normal_groups") or [])
+    normal_origin_count = sum(len(group.get("origins") or []) for group in package_payload.get("normal_groups") or [])
+    important_origin_count = len(package_payload.get("important_origins") or [])
+    media_count = len(_collect_media_analysis_targets(package_payload))
+    final_count = 1
+    return {
+        "media_count": media_count,
+        "normal_origin_count": normal_origin_count,
+        "normal_group_count": normal_group_count,
+        "important_origin_count": important_origin_count,
+        "final_count": final_count,
+        "total": media_count + normal_origin_count + normal_group_count + important_origin_count + final_count,
+    }
+
+
+def _summary_progress_payload(
+    counts: dict[str, int],
+    *,
+    current: int,
+    label: str,
+    phase: str,
+    extra: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    return {
+        "stage": "summary",
+        "current": current,
+        "total": int(counts.get("total") or 0),
+        "label": label,
+        "phase": phase,
+        "media_count": int(counts.get("media_count") or 0),
+        "normal_origin_count": int(counts.get("normal_origin_count") or 0),
+        "normal_group_count": int(counts.get("normal_group_count") or 0),
+        "important_origin_count": int(counts.get("important_origin_count") or 0),
+        "final_count": int(counts.get("final_count") or 0),
+        **(extra or {}),
+    }
 
 
 def run_daily_summary(
@@ -305,6 +514,9 @@ def run_daily_summary(
     timezone_name: str | None = None,
     scope: dict[str, Any] | None = None,
     run_id: str | None = None,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> dict[str, Any]:
     package_run = store.get_daily_package_run(package_run_id) if package_run_id else None
     if package_run is None:
@@ -317,26 +529,57 @@ def run_daily_summary(
         raise ValueError(f"Package JSON is missing for run: {package_run_id}")
 
     package_payload = json.loads(package_json_path.read_text(encoding="utf-8"))
+    progress_counts = _summary_progress_counts(package_payload)
+    image_count_estimate = len(_collect_image_paths(package_payload))
     run_id = run_id or _new_run_id("sum")
     output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
     summary_path = output_root / "summary.md"
     prompt_path = output_root / "prompt.md"
     output_root.mkdir(parents=True, exist_ok=True)
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
-    store.upsert_daily_summary_run(
-        DailySummaryRunRecord(
-            run_id=run_id,
-            status="running",
-            package_run_id=str(package_run_id),
-            date=package_run.get("date"),
-            timezone=package_run.get("timezone"),
-            scope_json=scope_json,
-            output_dir=str(output_root),
-            summary_path=str(summary_path),
-            provider=config.daily.ai.provider,
-            started_at=utc_now_iso(),
+    progress_state = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
+
+    def update_progress(
+        current: int,
+        label: str,
+        phase: str,
+        extra: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal progress_state
+        if cancel_check:
+            cancel_check()
+        progress_state = _summary_progress_payload(
+            progress_counts,
+            current=current,
+            label=label,
+            phase=phase,
+            extra=extra,
         )
-    )
+        store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id=run_id,
+                status="running",
+                package_run_id=str(package_run_id),
+                date=package_run.get("date"),
+                timezone=package_run.get("timezone"),
+                scope_json=scope_json,
+                output_dir=str(output_root),
+                summary_path=str(summary_path),
+                provider=config.daily.ai.provider,
+                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                group_count=len(package_payload.get("normal_groups") or []),
+                image_count=image_count_estimate,
+                progress_total=int(progress_counts.get("total") or 0),
+                progress_current=current,
+                progress_label=label,
+                progress_json=json.dumps(progress_state, ensure_ascii=False, sort_keys=True),
+                started_at=utc_now_iso(),
+            )
+        )
+        if progress_callback:
+            progress_callback(dict(progress_state))
+
+    update_progress(0, "starting summary", "starting")
     try:
         analysis = _run_ai_analysis_pipeline(
             config,
@@ -344,6 +587,9 @@ def run_daily_summary(
             output_root,
             final_summary_path=summary_path,
             final_prompt_path=prompt_path,
+            progress_callback=update_progress,
+            cancel_check=cancel_check,
+            process_callback=process_callback,
         )
         image_paths = _collect_image_paths(package_payload)
         summary_text = str((analysis.get("final") or {}).get("content") or "")
@@ -389,6 +635,46 @@ def run_daily_summary(
                 origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
                 group_count=len(package_payload.get("normal_groups") or []),
                 image_count=len(image_paths),
+                progress_total=int(progress_counts.get("total") or 0),
+                progress_current=int(progress_counts.get("total") or 0),
+                progress_label="completed",
+                progress_json=json.dumps(
+                    _summary_progress_payload(
+                        progress_counts,
+                        current=int(progress_counts.get("total") or 0),
+                        label="completed",
+                        phase="completed",
+                    ),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                finished_at=utc_now_iso(),
+            )
+        )
+    except DailyJobCancelled as exc:
+        return store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id=run_id,
+                status="canceled",
+                package_run_id=str(package_run_id),
+                date=package_run.get("date"),
+                timezone=package_run.get("timezone"),
+                scope_json=scope_json,
+                output_dir=str(output_root),
+                summary_path=str(summary_path),
+                provider=config.daily.ai.provider,
+                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                group_count=len(package_payload.get("normal_groups") or []),
+                image_count=image_count_estimate,
+                progress_total=int(progress_counts.get("total") or 0),
+                progress_current=int(progress_state.get("current") or 0),
+                progress_label="canceled",
+                progress_json=json.dumps(
+                    {**progress_state, "label": "canceled", "phase": "canceled", "error": str(exc) or "canceled"},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
+                error=str(exc) or "canceled",
                 finished_at=utc_now_iso(),
             )
         )
@@ -404,6 +690,17 @@ def run_daily_summary(
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
                 provider=config.daily.ai.provider,
+                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                group_count=len(package_payload.get("normal_groups") or []),
+                image_count=image_count_estimate,
+                progress_total=int(progress_counts.get("total") or 0),
+                progress_current=int(progress_state.get("current") or 0),
+                progress_label="failed",
+                progress_json=json.dumps(
+                    {**progress_state, "label": "failed", "phase": "failed", "error": str(exc)},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                ),
                 error=str(exc),
                 finished_at=utc_now_iso(),
             )
@@ -442,6 +739,213 @@ def run_daily_package_and_summary(
         }
     )
     return result
+
+
+def start_daily_summary_job(
+    store: ArchiveStore,
+    config: AppConfig,
+    *,
+    package_run_id: str | None = None,
+    run_date: str | None = None,
+    timezone_name: str | None = None,
+    scope: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    scope = dict(scope or {})
+    job_id = _new_run_id("job")
+    runtime = _register_job_runtime(job_id)
+    scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
+    started_at = utc_now_iso()
+
+    def write_job(
+        *,
+        status: str,
+        progress: dict[str, Any],
+        package_run_id_value: str | None = None,
+        summary_run_id_value: str | None = None,
+        error: str | None = None,
+        finished_at: str | None = None,
+    ) -> dict[str, Any]:
+        current = store.get_daily_summary_job(job_id) or {}
+        if runtime.cancel_requested.is_set() and status == "running":
+            status = "cancel_requested"
+        return store.upsert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id=job_id,
+                status=status,
+                date=str(progress.get("date") or run_date or current.get("date") or "") or None,
+                timezone=str(progress.get("timezone") or timezone_name or current.get("timezone") or "") or None,
+                scope_json=scope_json,
+                package_run_id=package_run_id_value or current.get("package_run_id"),
+                summary_run_id=summary_run_id_value or current.get("summary_run_id"),
+                provider=config.daily.ai.provider,
+                progress_total=int(progress.get("total") or 0),
+                progress_current=int(progress.get("current") or 0),
+                progress_label=str(progress.get("label") or status),
+                progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
+                error=error,
+                started_at=started_at,
+                finished_at=finished_at,
+                updated_at=utc_now_iso(),
+            )
+        )
+
+    def check_cancel() -> None:
+        if runtime.cancel_requested.is_set():
+            raise DailyJobCancelled("canceled")
+
+    def progress_callback(progress: dict[str, Any]) -> None:
+        write_job(status="running", progress=progress)
+
+    def process_callback(process: subprocess.Popen[str] | None, task_name: str) -> None:
+        _set_runtime_process(runtime, process)
+        progress = (store.get_daily_summary_job(job_id) or {}).get("progress") or {}
+        if process is not None:
+            progress = {**progress, "task": task_name, "pid": process.pid}
+        else:
+            progress = {**progress, "task": task_name, "pid": None}
+        write_job(status="running", progress=progress)
+
+    initial_progress = {
+        "stage": "queued",
+        "phase": "queued",
+        "current": 0,
+        "total": 0,
+        "label": "queued",
+        "package_run_id": package_run_id,
+        "date": run_date,
+        "timezone": timezone_name,
+    }
+    item = write_job(status="running", progress=initial_progress, package_run_id_value=package_run_id)
+
+    def worker() -> None:
+        package: dict[str, Any] | None = None
+        summary: dict[str, Any] | None = None
+        try:
+            check_cancel()
+            package = store.get_daily_package_run(package_run_id) if package_run_id else None
+            if package is None:
+                planned_package_run_id = _new_run_id("pkg")
+                write_job(
+                    status="running",
+                    package_run_id_value=planned_package_run_id,
+                    progress={**initial_progress, "stage": "package", "phase": "queued", "label": "package queued"},
+                )
+                package = build_daily_package(
+                    store,
+                    config,
+                    run_date=run_date,
+                    timezone_name=timezone_name,
+                    scope=scope,
+                    run_id=planned_package_run_id,
+                    progress_callback=progress_callback,
+                    cancel_check=check_cancel,
+                )
+            if package.get("status") != "completed":
+                if package.get("status") == "canceled":
+                    raise DailyJobCancelled("canceled")
+                raise RuntimeError(package.get("error") or "Daily package did not complete")
+            write_job(
+                status="running",
+                package_run_id_value=str(package["run_id"]),
+                progress={
+                    "stage": "package",
+                    "phase": "completed",
+                    "current": int(package.get("progress_current") or 0),
+                    "total": int(package.get("progress_total") or 0),
+                    "label": "package completed",
+                    "date": package.get("date"),
+                    "timezone": package.get("timezone"),
+                },
+            )
+            check_cancel()
+            planned_summary_run_id = _new_run_id("sum")
+            write_job(
+                status="running",
+                package_run_id_value=str(package["run_id"]),
+                summary_run_id_value=planned_summary_run_id,
+                progress={
+                    "stage": "summary",
+                    "phase": "queued",
+                    "current": 0,
+                    "total": 0,
+                    "label": "summary queued",
+                    "date": package.get("date"),
+                    "timezone": package.get("timezone"),
+                },
+            )
+            summary = run_daily_summary(
+                store,
+                config,
+                package_run_id=str(package["run_id"]),
+                scope=scope,
+                run_id=planned_summary_run_id,
+                progress_callback=progress_callback,
+                cancel_check=check_cancel,
+                process_callback=process_callback,
+            )
+            if summary.get("status") != "completed":
+                if summary.get("status") == "canceled":
+                    raise DailyJobCancelled("canceled")
+                raise RuntimeError(summary.get("error") or "Daily summary did not complete")
+            write_job(
+                status="completed",
+                package_run_id_value=str(package["run_id"]),
+                summary_run_id_value=str(summary["run_id"]),
+                progress={
+                    "stage": "summary",
+                    "phase": "completed",
+                    "current": int(summary.get("progress_current") or 0),
+                    "total": int(summary.get("progress_total") or 0),
+                    "label": "completed",
+                    "date": summary.get("date"),
+                    "timezone": summary.get("timezone"),
+                },
+                finished_at=utc_now_iso(),
+            )
+        except DailyJobCancelled as exc:
+            write_job(
+                status="canceled",
+                package_run_id_value=str((package or {}).get("run_id") or package_run_id or "") or None,
+                summary_run_id_value=str((summary or {}).get("run_id") or "") or None,
+                progress={
+                    **((store.get_daily_summary_job(job_id) or {}).get("progress") or {}),
+                    "label": "canceled",
+                    "phase": "canceled",
+                },
+                error=str(exc) or "canceled",
+                finished_at=utc_now_iso(),
+            )
+        except Exception as exc:
+            write_job(
+                status="failed",
+                package_run_id_value=str((package or {}).get("run_id") or package_run_id or "") or None,
+                summary_run_id_value=str((summary or {}).get("run_id") or "") or None,
+                progress={
+                    **((store.get_daily_summary_job(job_id) or {}).get("progress") or {}),
+                    "label": "failed",
+                    "phase": "failed",
+                },
+                error=str(exc),
+                finished_at=utc_now_iso(),
+            )
+        finally:
+            _set_runtime_process(runtime, None)
+            _unregister_job_runtime(job_id)
+
+    thread = threading.Thread(target=worker, name=f"daily-summary-job-{job_id}", daemon=True)
+    thread.start()
+    return item
+
+
+def cancel_daily_summary_job(store: ArchiveStore, job_id: str) -> dict[str, Any]:
+    item = store.request_daily_summary_job_cancel(job_id)
+    if item is None:
+        raise ValueError("Unknown daily summary job")
+    _request_runtime_cancel(job_id)
+    refreshed = store.get_daily_summary_job(job_id)
+    if refreshed is None:
+        raise ValueError("Unknown daily summary job")
+    return refreshed
 
 
 def _build_summary_records(
@@ -650,9 +1154,34 @@ def _run_ai_analysis_pipeline(
     *,
     final_summary_path: Path,
     final_prompt_path: Path,
+    progress_callback: Callable[[int, str, str, dict[str, Any] | None], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> dict[str, Any]:
+    completed = 0
+
+    def mark_started(label: str, phase: str, extra: dict[str, Any] | None = None) -> None:
+        if progress_callback:
+            progress_callback(completed, label, phase, extra)
+
+    def mark_completed(label: str, phase: str, extra: dict[str, Any] | None = None) -> None:
+        nonlocal completed
+        completed += 1
+        if progress_callback:
+            progress_callback(completed, label, phase, extra)
+
     stages_dir = output_root / "stages"
-    media_artifacts = _analyze_package_media(config, package_payload, stages_dir / "media")
+    if cancel_check:
+        cancel_check()
+    mark_started("analyzing media", "media")
+    media_artifacts = _analyze_package_media(
+        config,
+        package_payload,
+        stages_dir / "media",
+        progress_done=mark_completed,
+        cancel_check=cancel_check,
+        process_callback=process_callback,
+    )
 
     normal_origin_artifacts: list[dict[str, Any]] = []
     normal_origin_by_ref: dict[str, dict[str, Any]] = {}
@@ -661,6 +1190,13 @@ def _run_ai_analysis_pipeline(
         group_name = str(group.get("name") or "group")
         for origin_payload in group.get("origins") or []:
             origin_ref = _origin_ref(origin_payload)
+            mark_started(
+                f"analyzing origin {origin_ref}",
+                "normal_origin",
+                {"group_name": group_name, "origin_ref": origin_ref},
+            )
+            if cancel_check:
+                cancel_check()
             prompt = _normal_origin_key_prompt(group, origin_payload, media_artifacts)
             artifact = _run_ai_task(
                 config,
@@ -673,9 +1209,16 @@ def _run_ai_analysis_pipeline(
                     "group_tags": group.get("tags") or [],
                     "origin": origin_payload.get("origin") or {},
                 },
+                cancel_check=cancel_check,
+                process_callback=process_callback,
             )
             normal_origin_artifacts.append(artifact)
             normal_origin_by_ref[origin_ref] = artifact
+            mark_completed(
+                f"analyzed origin {origin_ref}",
+                "normal_origin",
+                {"group_name": group_name, "origin_ref": origin_ref},
+            )
 
     normal_group_artifacts: list[dict[str, Any]] = []
     group_dir = stages_dir / "normal-groups"
@@ -683,6 +1226,13 @@ def _run_ai_analysis_pipeline(
         group_name = str(group.get("name") or "group")
         origin_refs = [_origin_ref(origin_payload) for origin_payload in group.get("origins") or []]
         origin_artifacts = [normal_origin_by_ref[ref] for ref in origin_refs if ref in normal_origin_by_ref]
+        mark_started(
+            f"analyzing group {group_name}",
+            "normal_group",
+            {"group_name": group_name, "origin_count": len(origin_refs)},
+        )
+        if cancel_check:
+            cancel_check()
         prompt = _normal_group_analysis_prompt(group, origin_artifacts)
         artifact = _run_ai_task(
             config,
@@ -695,14 +1245,28 @@ def _run_ai_analysis_pipeline(
                 "group_tags": group.get("tags") or [],
                 "origin_refs": origin_refs,
             },
+            cancel_check=cancel_check,
+            process_callback=process_callback,
         )
         normal_group_artifacts.append(artifact)
+        mark_completed(
+            f"analyzed group {group_name}",
+            "normal_group",
+            {"group_name": group_name, "origin_count": len(origin_refs)},
+        )
 
     important_artifacts: list[dict[str, Any]] = []
     important_dir = stages_dir / "important-origins"
     for origin_payload in package_payload.get("important_origins") or []:
         origin_ref = _origin_ref(origin_payload)
         image_paths = _origin_image_paths(origin_payload, limit=None)
+        mark_started(
+            f"analyzing important {origin_ref}",
+            "important_origin",
+            {"origin_ref": origin_ref, "image_count": len(image_paths)},
+        )
+        if cancel_check:
+            cancel_check()
         prompt = _important_origin_analysis_prompt(origin_payload, media_artifacts)
         artifact = _run_ai_task(
             config,
@@ -714,9 +1278,19 @@ def _run_ai_analysis_pipeline(
                 "origin": origin_payload.get("origin") or {},
                 "image_paths": image_paths,
             },
+            cancel_check=cancel_check,
+            process_callback=process_callback,
         )
         important_artifacts.append(artifact)
+        mark_completed(
+            f"analyzed important {origin_ref}",
+            "important_origin",
+            {"origin_ref": origin_ref, "image_count": len(image_paths)},
+        )
 
+    mark_started("writing final summary", "final")
+    if cancel_check:
+        cancel_check()
     final_prompt = _final_daily_summary_prompt(
         package_payload,
         normal_group_artifacts=normal_group_artifacts,
@@ -735,7 +1309,10 @@ def _run_ai_analysis_pipeline(
             "date": package_payload.get("date"),
             "timezone": package_payload.get("timezone"),
         },
+        cancel_check=cancel_check,
+        process_callback=process_callback,
     )
+    mark_completed("wrote final summary", "final")
     analysis = {
         "media": list(media_artifacts.values()),
         "normal_origins": normal_origin_artifacts,
@@ -751,43 +1328,54 @@ def _analyze_package_media(
     config: AppConfig,
     package_payload: dict[str, Any],
     output_dir: Path,
+    *,
+    progress_done: Callable[[str, str, dict[str, Any] | None], None] | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> dict[str, dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: dict[str, dict[str, Any]] = {}
-    for origin_payload in _iter_origin_payloads(package_payload):
-        if (origin_payload.get("origin") or {}).get("important"):
-            continue
-        for message in origin_payload.get("messages") or []:
-            for media in message.get("media_files") or []:
-                file_path = str(media.get("file_path") or "")
-                if not file_path or file_path in artifacts:
-                    continue
-                descriptor = _media_descriptor(origin_payload, message, media)
-                stem = _slug(f"{descriptor['account_id']}-{descriptor['origin_id']}-{descriptor['message_id']}-{descriptor['file_index']}")
-                output_path = output_dir / f"{stem}.md"
-                if _is_image_media(media) and Path(file_path).is_file():
-                    prompt = _media_image_analysis_prompt(descriptor)
-                    artifacts[file_path] = _run_ai_task(
-                        config,
-                        "media_image_analysis",
-                        prompt,
-                        output_path,
-                        image_paths=[file_path],
-                        metadata=descriptor,
-                    )
-                else:
-                    content = _media_reference_markdown(descriptor)
-                    output_path.write_text(content, encoding="utf-8")
-                    artifacts[file_path] = {
-                        "task": "media_file_reference",
-                        "id": stem,
-                        "output_path": str(output_path),
-                        "prompt_path": None,
-                        "content": content,
-                        "image_paths": [],
-                        "generated_by_ai": False,
-                        "metadata": descriptor,
-                    }
+    for target in _collect_media_analysis_targets(package_payload):
+        if cancel_check:
+            cancel_check()
+        origin_payload = target["origin_payload"]
+        message = target["message"]
+        media = target["media"]
+        file_path = str(media.get("file_path") or "")
+        descriptor = _media_descriptor(origin_payload, message, media)
+        stem = _slug(f"{descriptor['account_id']}-{descriptor['origin_id']}-{descriptor['message_id']}-{descriptor['file_index']}")
+        output_path = output_dir / f"{stem}.md"
+        if _is_image_media(media) and Path(file_path).is_file():
+            prompt = _media_image_analysis_prompt(descriptor)
+            artifacts[file_path] = _run_ai_task(
+                config,
+                "media_image_analysis",
+                prompt,
+                output_path,
+                image_paths=[file_path],
+                metadata=descriptor,
+                cancel_check=cancel_check,
+                process_callback=process_callback,
+            )
+        else:
+            content = _media_reference_markdown(descriptor)
+            output_path.write_text(content, encoding="utf-8")
+            artifacts[file_path] = {
+                "task": "media_file_reference",
+                "id": stem,
+                "output_path": str(output_path),
+                "prompt_path": None,
+                "content": content,
+                "image_paths": [],
+                "generated_by_ai": False,
+                "metadata": descriptor,
+            }
+        if progress_done:
+            progress_done(
+                f"analyzed media {Path(file_path).name}",
+                "media",
+                {"file_path": file_path, "media_kind": media.get("media_kind")},
+            )
     return artifacts
 
 
@@ -800,12 +1388,24 @@ def _run_ai_task(
     image_paths: list[str],
     metadata: dict[str, Any],
     prompt_path: Path | None = None,
+    cancel_check: Callable[[], None] | None = None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> dict[str, Any]:
+    if cancel_check:
+        cancel_check()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path = prompt_path or output_path.with_suffix(".prompt.md")
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt, encoding="utf-8")
-    content = _run_summary_provider(config, prompt, output_path, image_paths, task_name=task_name)
+    content = _run_summary_provider(
+        config,
+        prompt,
+        output_path,
+        image_paths,
+        task_name=task_name,
+        cancel_check=cancel_check,
+        process_callback=process_callback,
+    )
     if output_path.exists():
         content = output_path.read_text(encoding="utf-8")
     else:
@@ -1162,6 +1762,10 @@ def start_daily_summary_thread(
     summary_path = output_root / "summary.md"
     output_root.mkdir(parents=True, exist_ok=True)
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
+    package_json_path = Path(str(package_run.get("package_json_path") or ""))
+    package_payload = json.loads(package_json_path.read_text(encoding="utf-8")) if package_json_path.is_file() else {}
+    progress_counts = _summary_progress_counts(package_payload) if package_payload else {"total": 0}
+    progress = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
     item = store.upsert_daily_summary_run(
         DailySummaryRunRecord(
             run_id=run_id,
@@ -1173,6 +1777,13 @@ def start_daily_summary_thread(
             output_dir=str(output_root),
             summary_path=str(summary_path),
             provider=config.daily.ai.provider,
+            origin_count=int((package_payload.get("stats") or {}).get("origin_count") or 0),
+            group_count=len(package_payload.get("normal_groups") or []),
+            image_count=len(_collect_image_paths(package_payload)) if package_payload else 0,
+            progress_total=int(progress_counts.get("total") or 0),
+            progress_current=0,
+            progress_label="queued",
+            progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
             started_at=utc_now_iso(),
         )
     )
@@ -1503,30 +2114,79 @@ def _run_summary_provider(
     image_paths: list[str],
     *,
     task_name: str = "summary",
+    cancel_check: Callable[[], None] | None = None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> str:
+    if cancel_check:
+        cancel_check()
     if config.daily.ai.provider == "disabled":
         text = f"# AI Task Disabled\n\nTask: `{task_name}`\n\nAI provider is disabled for this run.\n"
         output_path.write_text(text, encoding="utf-8")
         return text
     command = _expand_command(config.daily.ai.command, output_path, image_paths, task_name=task_name)
     config.storage.data_dir.mkdir(parents=True, exist_ok=True)
-    completed = subprocess.run(
+    process = subprocess.Popen(
         command,
-        input=prompt,
-        capture_output=True,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
         text=True,
-        timeout=config.daily.ai.timeout_seconds,
         cwd=str(config.storage.data_dir),
+        start_new_session=(os.name != "nt"),
     )
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip() or f"exit code {completed.returncode}"
+    if process_callback:
+        process_callback(process, task_name)
+    deadline = time_module.monotonic() + max(1, int(config.daily.ai.timeout_seconds))
+    input_text: str | None = prompt
+    try:
+        while True:
+            if cancel_check:
+                cancel_check()
+            timeout = max(0.1, min(0.5, deadline - time_module.monotonic()))
+            try:
+                stdout, stderr = process.communicate(input=input_text, timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                input_text = None
+                if time_module.monotonic() >= deadline:
+                    _terminate_process(process)
+                    raise RuntimeError(f"AI provider timed out after {config.daily.ai.timeout_seconds} seconds")
+    except DailyJobCancelled:
+        _terminate_process(process)
+        raise
+    finally:
+        if process_callback:
+            process_callback(None, task_name)
+    if cancel_check:
+        cancel_check()
+    if process.returncode != 0:
+        detail = stderr.strip() or stdout.strip() or f"exit code {process.returncode}"
         raise RuntimeError(f"AI provider failed: {detail}")
     if output_path.exists():
         return output_path.read_text(encoding="utf-8")
-    if completed.stdout.strip():
-        output_path.write_text(completed.stdout, encoding="utf-8")
-        return completed.stdout
+    if stdout.strip():
+        output_path.write_text(stdout, encoding="utf-8")
+        return stdout
     raise RuntimeError("AI provider completed without writing a summary")
+
+
+def _terminate_process(process: subprocess.Popen[str]) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        if os.name == "nt":
+            process.terminate()
+        else:
+            os.killpg(process.pid, signal.SIGTERM)
+        process.wait(timeout=3)
+    except Exception:
+        try:
+            if os.name == "nt":
+                process.kill()
+            else:
+                os.killpg(process.pid, signal.SIGKILL)
+        except Exception:
+            pass
 
 
 def _expand_command(command: list[str], output_path: Path, image_paths: list[str], *, task_name: str = "summary") -> list[str]:
@@ -1616,6 +2276,22 @@ def _collect_image_paths(package_payload: dict[str, Any], limit: int = 20) -> li
                     if len(paths) >= limit:
                         return paths
     return paths
+
+
+def _collect_media_analysis_targets(package_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    targets: list[dict[str, Any]] = []
+    seen_paths: set[str] = set()
+    for origin_payload in _iter_origin_payloads(package_payload):
+        if (origin_payload.get("origin") or {}).get("important"):
+            continue
+        for message in origin_payload.get("messages") or []:
+            for media in message.get("media_files") or []:
+                file_path = str(media.get("file_path") or "")
+                if not file_path or file_path in seen_paths:
+                    continue
+                seen_paths.add(file_path)
+                targets.append({"origin_payload": origin_payload, "message": message, "media": media})
+    return targets
 
 
 def _iter_origin_payloads(package_payload: dict[str, Any]) -> list[dict[str, Any]]:

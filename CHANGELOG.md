@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.3 - 2026-07-04
+
+- Added daily package/summary progress counters and soft-deletable summary records with batch management APIs.
+- Added background daily summary jobs that run package plus summary end to end and support cancellation of active provider processes.
+
 ## 0.2.2 - 2026-07-04
 
 - Changed the daily systemd job to run package generation and Codex-backed summary generation together.

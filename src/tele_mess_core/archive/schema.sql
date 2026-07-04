@@ -201,6 +201,10 @@ CREATE TABLE IF NOT EXISTS daily_package_runs (
   message_count INTEGER NOT NULL DEFAULT 0,
   media_count INTEGER NOT NULL DEFAULT 0,
   important_origin_count INTEGER NOT NULL DEFAULT 0,
+  progress_total INTEGER NOT NULL DEFAULT 0,
+  progress_current INTEGER NOT NULL DEFAULT 0,
+  progress_label TEXT,
+  progress_json TEXT,
   error TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT
@@ -219,9 +223,33 @@ CREATE TABLE IF NOT EXISTS daily_summary_runs (
   origin_count INTEGER NOT NULL DEFAULT 0,
   group_count INTEGER NOT NULL DEFAULT 0,
   image_count INTEGER NOT NULL DEFAULT 0,
+  progress_total INTEGER NOT NULL DEFAULT 0,
+  progress_current INTEGER NOT NULL DEFAULT 0,
+  progress_label TEXT,
+  progress_json TEXT,
   error TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS daily_summary_jobs (
+  job_id TEXT PRIMARY KEY,
+  status TEXT NOT NULL,
+  date TEXT,
+  timezone TEXT,
+  scope_json TEXT,
+  package_run_id TEXT,
+  summary_run_id TEXT,
+  provider TEXT,
+  progress_total INTEGER NOT NULL DEFAULT 0,
+  progress_current INTEGER NOT NULL DEFAULT 0,
+  progress_label TEXT,
+  progress_json TEXT,
+  cancel_requested_at TEXT,
+  error TEXT,
+  started_at TEXT NOT NULL,
+  finished_at TEXT,
+  updated_at TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS daily_summary_records (
@@ -243,6 +271,7 @@ CREATE TABLE IF NOT EXISTS daily_summary_records (
   group_count INTEGER NOT NULL DEFAULT 0,
   image_count INTEGER NOT NULL DEFAULT 0,
   content_length INTEGER NOT NULL DEFAULT 0,
+  deleted_at TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );

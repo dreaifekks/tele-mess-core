@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-03.3`
-- Contract hash: `17089891060961e6`
+- Contract version: `2026-07-04.2`
+- Contract hash: `914f4499ab500f2c`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -58,10 +58,15 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /manage/daily-package-runs` (management, token) - List daily package runs.
 - `GET /manage/daily-package-runs/content` (management, token) - Return daily package run content.
 - `POST /manage/daily-summaries` (management, token) - Run a daily summary immediately.
+- `POST /manage/daily-summary-jobs` (management, token) - Start a background daily package and summary job.
+- `GET /manage/daily-summary-jobs` (management, token) - List background daily package and summary jobs.
+- `PATCH /manage/daily-summary-jobs/cancel` (management, token) - Request cancellation of a running daily summary job.
 - `GET /manage/daily-summary-runs` (management, token) - List daily summary runs.
 - `GET /manage/daily-summary-runs/content` (management, token) - Return daily summary run content.
 - `GET /manage/daily-summary-records` (management, token) - List stored daily summary contents.
 - `GET /manage/daily-summary-records/item` (management, token) - Return one stored daily summary content record.
+- `PATCH /manage/daily-summary-records` (management, token) - Soft-delete or restore one or more stored daily summary records.
+- `DELETE /manage/daily-summary-records` (management, token) - Soft-delete one or more stored daily summary records.
 - `POST /manage/discover-origins` (management, token) - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` (management, token) - Refresh participants for a Telegram origin.
 
@@ -662,6 +667,48 @@ Request body: `DailySummaryRunInput`
 
 Response: `DailySummaryRunResponse`
 
+### POST /manage/daily-summary-jobs
+
+Start a background daily package and summary job.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `201`
+
+Request body: `DailySummaryRunInput`
+
+Response: `DailySummaryJobResponse`
+
+### GET /manage/daily-summary-jobs
+
+List background daily package and summary jobs.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `job_id` (`string`, optional) - Filter by job ID.
+- `status` (`string`, optional) - Filter by job status.
+- `limit` (`integer`, optional, default `500`) - Maximum rows to return.
+
+Request body: none
+
+Response: `DailySummaryJobListResponse`
+
+### PATCH /manage/daily-summary-jobs/cancel
+
+Request cancellation of a running daily summary job.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `DailySummaryJobCancelInput`
+
+Response: `DailySummaryJobResponse`
+
 ### GET /manage/daily-summary-runs
 
 List daily summary runs.
@@ -717,6 +764,8 @@ Query parameters:
 - `tag` (`string`, optional) - Required tag. Repeatable; all tags must match.
 - `tags` (`string`, optional) - Comma-separated required tags; all tags must match.
 - `q` (`string`, optional) - Filter by title or Markdown content substring.
+- `include_deleted` (`boolean`, optional, default `False`) - Include soft-deleted summaries.
+- `deleted` (`boolean`, optional) - Filter by soft-deleted state.
 - `include_content` (`boolean`, optional, default `False`) - Include full Markdown content in list items.
 - `limit` (`integer`, optional, default `500`) - Maximum rows to return.
 
@@ -736,10 +785,35 @@ Query parameters:
 
 - `summary_id` (`string`, optional) - Summary content ID.
 - `run_id` (`string`, optional) - Summary run ID.
+- `include_deleted` (`boolean`, optional, default `False`) - Allow returning a soft-deleted record.
 
 Request body: none
 
 Response: `DailySummaryRecordResponse`
+
+### PATCH /manage/daily-summary-records
+
+Soft-delete or restore one or more stored daily summary records.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `DailySummaryRecordDeleteInput`
+
+Response: `DailySummaryRecordDeleteResponse`
+
+### DELETE /manage/daily-summary-records
+
+Soft-delete one or more stored daily summary records.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `DailySummaryRecordDeleteInput`
+
+Response: `DailySummaryRecordDeleteResponse`
 
 ### POST /manage/discover-origins
 
@@ -979,6 +1053,10 @@ Response: `ParticipantRefreshResultResponse`
 | `message_count` | `integer` | no |
 | `media_count` | `integer` | no |
 | `important_origin_count` | `integer` | no |
+| `progress_total` | `integer` | no |
+| `progress_current` | `integer` | no |
+| `progress_label` | `string` | no |
+| `progress` | `object` | no |
 | `error` | `string` | no |
 | `started_at` | `string` | no |
 | `finished_at` | `string` | no |
@@ -1039,6 +1117,46 @@ Response: `ParticipantRefreshResultResponse`
 | --- | --- | --- |
 | `item` | `DailyPackageSchedule` | yes |
 
+### DailySummaryJob
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `job_id` | `string` | yes |
+| `status` | `string` | yes |
+| `date` | `string` | no |
+| `timezone` | `string` | no |
+| `scope` | `object` | no |
+| `package_run_id` | `string` | no |
+| `summary_run_id` | `string` | no |
+| `provider` | `string` | no |
+| `progress_total` | `integer` | no |
+| `progress_current` | `integer` | no |
+| `progress_label` | `string` | no |
+| `progress` | `object` | no |
+| `cancel_requested_at` | `string` | no |
+| `error` | `string` | no |
+| `started_at` | `string` | no |
+| `finished_at` | `string` | no |
+| `updated_at` | `string` | no |
+
+### DailySummaryJobCancelInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `job_id` | `string` | yes |
+
+### DailySummaryJobListResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `items` | `array<DailySummaryJob>` | yes |
+
+### DailySummaryJobResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailySummaryJob` | yes |
+
 ### DailySummaryRecord
 
 | Field | Type | Required |
@@ -1062,8 +1180,33 @@ Response: `ParticipantRefreshResultResponse`
 | `group_count` | `integer` | no |
 | `image_count` | `integer` | no |
 | `content_length` | `integer` | no |
+| `deleted` | `boolean` | no |
+| `deleted_at` | `string` | no |
 | `created_at` | `string` | no |
 | `updated_at` | `string` | no |
+
+### DailySummaryRecordDeleteInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `summary_id` | `string` | no |
+| `summary_ids` | `array` | no |
+| `ids` | `array` | no |
+| `deleted` | `boolean` | no |
+
+### DailySummaryRecordDeleteResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailySummaryRecordDeleteResult` | yes |
+
+### DailySummaryRecordDeleteResult
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `summary_ids` | `array` | yes |
+| `deleted` | `boolean` | yes |
+| `changed_rows` | `integer` | yes |
 
 ### DailySummaryRecordListResponse
 
@@ -1093,6 +1236,10 @@ Response: `ParticipantRefreshResultResponse`
 | `origin_count` | `integer` | no |
 | `group_count` | `integer` | no |
 | `image_count` | `integer` | no |
+| `progress_total` | `integer` | no |
+| `progress_current` | `integer` | no |
+| `progress_label` | `string` | no |
+| `progress` | `object` | no |
 | `error` | `string` | no |
 | `started_at` | `string` | no |
 | `finished_at` | `string` | no |

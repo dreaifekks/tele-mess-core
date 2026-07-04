@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-03.3"
+API_CONTRACT_VERSION = "2026-07-04.2"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -553,6 +553,10 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "message_count": {"type": "integer"},
             "media_count": {"type": "integer"},
             "important_origin_count": {"type": "integer"},
+            "progress_total": {"type": "integer"},
+            "progress_current": {"type": "integer"},
+            "progress_label": {"type": "string", "nullable": True},
+            "progress": {"type": "object"},
             "error": {"type": "string", "nullable": True},
             "started_at": {"type": "string", "nullable": True},
             "finished_at": {"type": "string", "nullable": True},
@@ -587,11 +591,43 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "origin_count": {"type": "integer"},
             "group_count": {"type": "integer"},
             "image_count": {"type": "integer"},
+            "progress_total": {"type": "integer"},
+            "progress_current": {"type": "integer"},
+            "progress_label": {"type": "string", "nullable": True},
+            "progress": {"type": "object"},
             "error": {"type": "string", "nullable": True},
             "started_at": {"type": "string", "nullable": True},
             "finished_at": {"type": "string", "nullable": True},
         },
         required=["run_id", "status"],
+    ),
+    "DailySummaryJob": _object(
+        {
+            "job_id": {"type": "string"},
+            "status": {"type": "string"},
+            "date": {"type": "string", "nullable": True},
+            "timezone": {"type": "string", "nullable": True},
+            "scope": {"type": "object"},
+            "package_run_id": {"type": "string", "nullable": True},
+            "summary_run_id": {"type": "string", "nullable": True},
+            "provider": {"type": "string", "nullable": True},
+            "progress_total": {"type": "integer"},
+            "progress_current": {"type": "integer"},
+            "progress_label": {"type": "string", "nullable": True},
+            "progress": {"type": "object"},
+            "cancel_requested_at": {"type": "string", "nullable": True},
+            "error": {"type": "string", "nullable": True},
+            "started_at": {"type": "string", "nullable": True},
+            "finished_at": {"type": "string", "nullable": True},
+            "updated_at": {"type": "string", "nullable": True},
+        },
+        required=["job_id", "status"],
+    ),
+    "DailySummaryJobCancelInput": _object(
+        {
+            "job_id": {"type": "string"},
+        },
+        required=["job_id"],
     ),
     "DailySummaryRecord": _object(
         {
@@ -614,10 +650,29 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "group_count": {"type": "integer"},
             "image_count": {"type": "integer"},
             "content_length": {"type": "integer"},
+            "deleted": {"type": "boolean"},
+            "deleted_at": {"type": "string", "nullable": True},
             "created_at": {"type": "string"},
             "updated_at": {"type": "string"},
         },
         required=["summary_id", "run_id", "content_preview"],
+    ),
+    "DailySummaryRecordDeleteInput": _object(
+        {
+            "summary_id": {"type": "string"},
+            "summary_ids": {"type": "array", "items": {"type": "string"}},
+            "ids": {"type": "array", "items": {"type": "string"}},
+            "deleted": {"type": "boolean", "default": True},
+        },
+    ),
+    "DailySummaryRecordDeleteResponse": _item_response("DailySummaryRecordDeleteResult"),
+    "DailySummaryRecordDeleteResult": _object(
+        {
+            "summary_ids": {"type": "array", "items": {"type": "string"}},
+            "deleted": {"type": "boolean"},
+            "changed_rows": {"type": "integer"},
+        },
+        required=["summary_ids", "deleted", "changed_rows"],
     ),
     "AccountListResponse": _items_response("Account"),
     "OriginListResponse": _items_response("Origin"),
@@ -630,6 +685,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "DailyPackageRunResponse": _item_response("DailyPackageRun"),
     "DailySummaryRunListResponse": _items_response("DailySummaryRun"),
     "DailySummaryRunResponse": _item_response("DailySummaryRun"),
+    "DailySummaryJobListResponse": _items_response("DailySummaryJob"),
+    "DailySummaryJobResponse": _item_response("DailySummaryJob"),
     "DailySummaryRecordListResponse": _items_response("DailySummaryRecord"),
     "DailySummaryRecordResponse": _item_response("DailySummaryRecord"),
     "ChatListResponse": _items_response("Chat"),
@@ -890,6 +947,35 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
     ),
     ApiEndpoint("POST", "/manage/daily-summaries", "management", "Run a daily summary immediately.", body_schema="DailySummaryRunInput", response_schema="DailySummaryRunResponse", status=201),
     ApiEndpoint(
+        "POST",
+        "/manage/daily-summary-jobs",
+        "management",
+        "Start a background daily package and summary job.",
+        body_schema="DailySummaryRunInput",
+        response_schema="DailySummaryJobResponse",
+        status=201,
+    ),
+    ApiEndpoint(
+        "GET",
+        "/manage/daily-summary-jobs",
+        "management",
+        "List background daily package and summary jobs.",
+        query=(
+            ApiParam("job_id", description="Filter by job ID."),
+            ApiParam("status", description="Filter by job status."),
+            COMMON_LIMIT_PARAM,
+        ),
+        response_schema="DailySummaryJobListResponse",
+    ),
+    ApiEndpoint(
+        "PATCH",
+        "/manage/daily-summary-jobs/cancel",
+        "management",
+        "Request cancellation of a running daily summary job.",
+        body_schema="DailySummaryJobCancelInput",
+        response_schema="DailySummaryJobResponse",
+    ),
+    ApiEndpoint(
         "GET",
         "/manage/daily-summary-runs",
         "management",
@@ -927,6 +1013,8 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
             ApiParam("tag", description="Required tag. Repeatable; all tags must match."),
             ApiParam("tags", description="Comma-separated required tags; all tags must match."),
             ApiParam("q", description="Filter by title or Markdown content substring."),
+            ApiParam("include_deleted", type="boolean", default=False, description="Include soft-deleted summaries."),
+            ApiParam("deleted", type="boolean", description="Filter by soft-deleted state."),
             ApiParam("include_content", type="boolean", default=False, description="Include full Markdown content in list items."),
             COMMON_LIMIT_PARAM,
         ),
@@ -940,8 +1028,25 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
         query=(
             ApiParam("summary_id", description="Summary content ID."),
             ApiParam("run_id", description="Summary run ID."),
+            ApiParam("include_deleted", type="boolean", default=False, description="Allow returning a soft-deleted record."),
         ),
         response_schema="DailySummaryRecordResponse",
+    ),
+    ApiEndpoint(
+        "PATCH",
+        "/manage/daily-summary-records",
+        "management",
+        "Soft-delete or restore one or more stored daily summary records.",
+        body_schema="DailySummaryRecordDeleteInput",
+        response_schema="DailySummaryRecordDeleteResponse",
+    ),
+    ApiEndpoint(
+        "DELETE",
+        "/manage/daily-summary-records",
+        "management",
+        "Soft-delete one or more stored daily summary records.",
+        body_schema="DailySummaryRecordDeleteInput",
+        response_schema="DailySummaryRecordDeleteResponse",
     ),
     ApiEndpoint("POST", "/manage/discover-origins", "management", "Discover Telegram dialogs and topics for an authenticated account.", body_schema="DiscoveryInput", response_schema="DiscoveryResultResponse"),
     ApiEndpoint("POST", "/manage/participants/refresh", "management", "Refresh participants for a Telegram origin.", body_schema="ParticipantRefreshInput", response_schema="ParticipantRefreshResultResponse"),

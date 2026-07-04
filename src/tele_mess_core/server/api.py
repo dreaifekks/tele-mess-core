@@ -103,7 +103,7 @@ class SyncApiServer:
         config = self.config
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.2.2"
+            server_version = "tele-mess-core/0.2.3"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
@@ -271,6 +271,16 @@ class SyncApiServer:
                             )
                         }
                     )
+                elif path == "/manage/daily-summary-jobs":
+                    self._json(
+                        {
+                            "items": store.list_daily_summary_jobs(
+                                job_id=_optional_str_param(params, "job_id"),
+                                status=_optional_str_param(params, "status"),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
                 elif path == "/manage/daily-summary-runs/content":
                     from tele_mess_core.daily import read_run_content
 
@@ -295,6 +305,8 @@ class SyncApiServer:
                                 important=_optional_bool_param(params, "important"),
                                 tags=_tags_param(params),
                                 q=_optional_str_param(params, "q"),
+                                include_deleted=_bool_param(params, "include_deleted", False),
+                                deleted=_optional_bool_param(params, "deleted"),
                                 include_content=_bool_param(params, "include_content", False),
                                 limit=_int_param(params, "limit", 100),
                             )
@@ -304,6 +316,7 @@ class SyncApiServer:
                     item = store.get_daily_summary_record(
                         summary_id=_optional_str_param(params, "summary_id"),
                         run_id=_optional_str_param(params, "run_id"),
+                        include_deleted=_bool_param(params, "include_deleted", False),
                     )
                     if item is None:
                         raise ValueError("Unknown daily summary record")
@@ -373,6 +386,18 @@ class SyncApiServer:
                 elif path == "/manage/daily-summaries" and method == "POST":
                     item = _create_daily_summary(config, store, payload)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/daily-summary-jobs" and method == "POST":
+                    item = _create_daily_summary_job(config, store, payload)
+                    self._json({"item": item}, status=HTTPStatus.CREATED)
+                elif path == "/manage/daily-summary-jobs/cancel" and method == "PATCH":
+                    item = _cancel_daily_summary_job(store, payload)
+                    self._json({"item": item})
+                elif path == "/manage/daily-summary-records" and method == "PATCH":
+                    item = _set_daily_summary_records_deleted(store, payload)
+                    self._json({"item": item})
+                elif path == "/manage/daily-summary-records" and method == "DELETE":
+                    item = _set_daily_summary_records_deleted(store, {**payload, "deleted": True})
+                    self._json({"item": item})
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
@@ -642,6 +667,34 @@ def _delete_operation_events(store: ArchiveStore, payload: dict[str, Any]) -> di
         raise ValueError("Missing required field: id")
     deleted = store.delete_operation_events(ids)
     return {"ids": ids, "deleted": deleted}
+
+
+def _summary_record_ids(payload: dict[str, Any]) -> list[str]:
+    raw_ids = payload.get("summary_ids")
+    if raw_ids is None:
+        raw_ids = payload.get("ids")
+    if raw_ids is None:
+        raw_ids = [payload.get("summary_id")]
+    if not isinstance(raw_ids, list):
+        raise ValueError("summary_ids must be a list")
+    ids: list[str] = []
+    seen: set[str] = set()
+    for item in raw_ids:
+        summary_id = str(item or "").strip()
+        if not summary_id or summary_id in seen:
+            continue
+        seen.add(summary_id)
+        ids.append(summary_id)
+    if not ids:
+        raise ValueError("Missing required field: summary_id")
+    return ids
+
+
+def _set_daily_summary_records_deleted(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    summary_ids = _summary_record_ids(payload)
+    deleted = _payload_bool(payload, "deleted", True)
+    changed_rows = store.set_daily_summary_records_deleted(summary_ids, deleted=deleted)
+    return {"summary_ids": summary_ids, "deleted": deleted, "changed_rows": changed_rows}
 
 
 def _create_management_account(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -956,6 +1009,32 @@ def _create_daily_summary(
     )
 
 
+def _create_daily_summary_job(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily summary jobs")
+    from tele_mess_core.daily import start_daily_summary_job
+
+    scope = _daily_scope(payload)
+    return start_daily_summary_job(
+        store,
+        config,
+        package_run_id=_optional_payload_str(payload, "package_run_id"),
+        run_date=_optional_payload_str(payload, "date"),
+        timezone_name=_optional_payload_str(payload, "timezone"),
+        scope=scope,
+    )
+
+
+def _cancel_daily_summary_job(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+    from tele_mess_core.daily import cancel_daily_summary_job
+
+    return cancel_daily_summary_job(store, _required_str(payload, "job_id"))
+
+
 def _daily_scope(payload: dict[str, Any]) -> dict[str, Any]:
     raw_scope = payload.get("scope") or {}
     if not isinstance(raw_scope, dict):
@@ -1209,7 +1288,7 @@ def _console_html() -> str:
     th { color: var(--muted); font-weight: 650; background: #fafbfc; }
     td.actions { width: 1%; white-space: nowrap; }
     td.actions button + button { margin-left: 6px; }
-    tr.removed-row { color: var(--muted); }
+    tr.removed-row, tr.deleted-row { color: var(--muted); }
     .origin-table .origin-manage-row { user-select: none; }
     .origin-table .origin-manage-row td { cursor: pointer; }
     .origin-table .origin-manage-row td.actions, .origin-table .origin-manage-row td:has(.origin-select) { cursor: auto; }
@@ -1363,17 +1442,28 @@ def _console_html() -> str:
         <label class=\"check\"><input type=\"checkbox\" name=\"background\" checked> Background</label>
         <button type=\"submit\">Run summary</button>
       </form>
+      <h3>Run package + summary job</h3>
+      <form id=\"daily-summary-job-form\" class=\"form-grid\">
+        <label>Date<input name=\"date\" placeholder=\"YYYY-MM-DD\"></label>
+        <label>Timezone<input name=\"timezone\" placeholder=\"Asia/Tokyo\"></label>
+        <label>Account<input name=\"account_id\"></label>
+        <label>Tags<input name=\"tags\" placeholder=\"web3,info\"></label>
+        <label>Tag groups<input name=\"tag_groups\" placeholder=\"web3 it info; web3 info; ai info\"></label>
+        <button class=\"primary\" type=\"submit\">Start job</button>
+      </form>
     </div>
     <div class=\"panel\">
       <div class=\"panel-head\"><h2>Daily Runs</h2><button data-action=\"load-daily\">Refresh</button></div>
       <h3>Schedule</h3>
       <pre id=\"daily-schedule-raw\"></pre>
+      <h3>Summary jobs</h3>
+      <div class=\"table-wrap\"><table><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Package</th><th>Summary</th><th>Actions</th></tr></thead><tbody id=\"daily-summary-jobs-body\"></tbody></table></div>
       <h3>Package runs</h3>
-      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Date</th><th>Origins</th><th>Messages</th><th>Output</th></tr></thead><tbody id=\"daily-package-runs-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Date</th><th>Progress</th><th>Origins</th><th>Messages</th><th>Output</th></tr></thead><tbody id=\"daily-package-runs-body\"></tbody></table></div>
       <h3>Summary runs</h3>
-      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Package</th><th>Provider</th><th>Images</th><th>Output</th></tr></thead><tbody id=\"daily-summary-runs-body\"></tbody></table></div>
-      <h3>Summary records</h3>
-      <div class=\"table-wrap\"><table><thead><tr><th>Summary</th><th>Date</th><th>Tags</th><th>Important</th><th>Content</th><th>Path</th></tr></thead><tbody id=\"daily-summary-records-body\"></tbody></table></div>
+      <div class=\"table-wrap\"><table><thead><tr><th>Run</th><th>Status</th><th>Package</th><th>Provider</th><th>Progress</th><th>Groups</th><th>Images</th><th>Output</th></tr></thead><tbody id=\"daily-summary-runs-body\"></tbody></table></div>
+      <div class=\"panel-head\"><h3>Summary records</h3><div class=\"toolbar\"><label class=\"check\"><input id=\"show-deleted-summaries\" type=\"checkbox\"> Deleted</label><button data-action=\"toggle-summary-manage\">Manage</button><span id=\"summary-bulk\" class=\"toolbar bulk-toolbar hidden\"><button data-action=\"select-visible-summaries\">Select visible</button><button data-action=\"clear-summary-selection\">Clear</button><button data-action=\"bulk-delete-summaries\">Delete selected</button><button data-action=\"bulk-restore-summaries\">Restore selected</button><span id=\"summary-selection\" class=\"muted\">0 selected</span></span></div></div>
+      <div class=\"table-wrap\"><table><thead id=\"daily-summary-records-head\"></thead><tbody id=\"daily-summary-records-body\"></tbody></table></div>
     </div>
   </section>
 
@@ -1440,8 +1530,9 @@ def _console_html() -> str:
 <datalist id=\"tag-suggestions\"></datalist>
 
 <script>
-const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {} };
+const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailySummaryJobs: [], dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {}, manageSummaries: false, selectedSummaries: {} };
 let messageRefreshTimer = null;
+let dailyRefreshTimer = null;
 let messageRefreshInFlight = false;
 let originSelectionAnchor = null;
 let originDragState = null;
@@ -1762,6 +1853,12 @@ function originPath() {
   const suffix = params.toString();
   return suffix ? `/manage/origins?${suffix}` : '/manage/origins';
 }
+function summaryRecordsPath() {
+  const params = new URLSearchParams();
+  if ($('show-deleted-summaries')?.checked) params.set('include_deleted', 'true');
+  const suffix = params.toString();
+  return suffix ? `/manage/daily-summary-records?${suffix}` : '/manage/daily-summary-records';
+}
 async function loadOrigins() {
   const data = await api(originPath());
   state.origins = data.items || [];
@@ -1774,11 +1871,11 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
       api('/manage/api-manifest'), api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
       api('/sync/messages?latest=true&limit=100&include_media=true'), api('/manage/daily-package-schedule'),
-      api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api('/manage/daily-summary-records')
+      api('/manage/daily-summary-jobs'), api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api(summaryRecordsPath())
     ]);
     const contractWarning = updateApiManifest(apiManifest);
     state.service = service;
@@ -1792,12 +1889,15 @@ async function loadAll() {
     state.media = media.items || [];
     state.messages = messages.items || [];
     state.dailySchedule = dailySchedule.item || null;
+    state.dailySummaryJobs = summaryJobs.items || [];
     state.dailyPackageRuns = packageRuns.items || [];
     state.dailySummaryRuns = summaryRuns.items || [];
     state.dailySummaryRecords = summaryRecords.items || [];
+    clearSummarySelection();
     refreshTagSuggestions();
     renderAll();
     startMessageAutoRefresh();
+    startDailyAutoRefresh();
     setStatus(contractWarning || 'Loaded', contractWarning ? 'warn' : 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
 }
@@ -1815,18 +1915,22 @@ async function loadMessages(options={}) {
   }
 }
 async function loadDaily() {
-  const [schedule, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+  const [schedule, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
     api('/manage/daily-package-schedule'),
+    api('/manage/daily-summary-jobs'),
     api('/manage/daily-package-runs'),
     api('/manage/daily-summary-runs'),
-    api('/manage/daily-summary-records'),
+    api(summaryRecordsPath()),
   ]);
   state.dailySchedule = schedule.item || null;
+  state.dailySummaryJobs = summaryJobs.items || [];
   state.dailyPackageRuns = packageRuns.items || [];
   state.dailySummaryRuns = summaryRuns.items || [];
   state.dailySummaryRecords = summaryRecords.items || [];
+  clearSummarySelection();
   renderDaily();
   renderRaw();
+  startDailyAutoRefresh();
   setStatus('Daily runs loaded', 'ok');
 }
 function startMessageAutoRefresh() {
@@ -1840,6 +1944,23 @@ function stopMessageAutoRefresh() {
   if (!messageRefreshTimer) return;
   window.clearInterval(messageRefreshTimer);
   messageRefreshTimer = null;
+}
+function startDailyAutoRefresh() {
+  const active = (state.dailySummaryJobs || []).some(item => ['running', 'queued', 'cancel_requested'].includes(item.status));
+  if (!active || !tokenValue()) {
+    stopDailyAutoRefresh();
+    return;
+  }
+  if (dailyRefreshTimer) return;
+  dailyRefreshTimer = window.setInterval(() => {
+    if (!tokenValue()) return;
+    loadDaily().catch(error => setStatus(String(error), 'error'));
+  }, 2000);
+}
+function stopDailyAutoRefresh() {
+  if (!dailyRefreshTimer) return;
+  window.clearInterval(dailyRefreshTimer);
+  dailyRefreshTimer = null;
 }
 function renderAll() {
   renderSummary(); renderMessages(); renderAccounts(); renderOrigins(); renderDaily(); renderParticipants(); renderCursors(); renderOperationEvents(); renderMedia(); renderRaw();
@@ -2012,9 +2133,53 @@ function renderDaily() {
   }
   const raw = $('daily-schedule-raw');
   if (raw) raw.textContent = JSON.stringify(schedule, null, 2);
-  fillTable('daily-package-runs-body', (state.dailyPackageRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${text(item.origin_count)}</td><td>${text(item.message_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.package_md_path || item.output_dir)}</td></tr>`), 6);
-  fillTable('daily-summary-runs-body', (state.dailySummaryRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.package_run_id)}</td><td>${text(item.provider)}</td><td>${text(item.image_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.summary_path || item.output_dir)}</td></tr>`), 6);
-  fillTable('daily-summary-records-body', (state.dailySummaryRecords || []).map(item => `<tr><td>${text(item.summary_id)}<div class=\"muted\">${text(item.provider)}</div></td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${text((item.tags || []).join(', '))}</td><td>${pill(item.important ? 'important' : 'normal')}</td><td>${text(item.content_preview)}</td><td title=\"${attr(item.summary_path)}\">${text(item.summary_path)}</td></tr>`), 6);
+  renderSummaryRecordHead();
+  fillTable('daily-summary-jobs-body', (state.dailySummaryJobs || []).map(summaryJobRow), 6);
+  fillTable('daily-package-runs-body', (state.dailyPackageRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${progressCell(item)}</td><td>${text(item.origin_count)}</td><td>${text(item.message_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.package_md_path || item.output_dir)}</td></tr>`), 7);
+  fillTable('daily-summary-runs-body', (state.dailySummaryRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.package_run_id)}</td><td>${text(item.provider)}</td><td>${progressCell(item)}</td><td>${text(item.group_count)}</td><td>${text(item.image_count)}</td><td title=\"${attr(item.output_dir)}\">${text(item.summary_path || item.output_dir)}</td></tr>`), 8);
+  fillTable('daily-summary-records-body', (state.dailySummaryRecords || []).map(summaryRecordRow), state.manageSummaries ? 8 : 7);
+  updateSummaryBulk();
+}
+function summaryJobRow(item) {
+  const active = ['running', 'queued', 'cancel_requested'].includes(item.status);
+  const cancelButton = active ? `<button class=\"danger\" data-action=\"cancel-summary-job\" data-job=\"${attr(item.job_id)}\">Cancel</button>` : '<span class=\"muted\">-</span>';
+  return `<tr><td>${text(item.job_id)}<div class=\"muted\">${text(item.started_at)}</div></td><td>${pill(item.status)}</td><td>${progressCell(item)}</td><td>${text(item.package_run_id)}</td><td>${text(item.summary_run_id)}</td><td class=\"actions\">${cancelButton}</td></tr>`;
+}
+function progressCell(item) {
+  const total = Number(item.progress_total || 0);
+  const current = Number(item.progress_current || 0);
+  const label = item.progress_label || item.progress?.label || '-';
+  const counts = total ? `${current}/${total}` : '-';
+  return `<div>${text(counts)}</div><div class=\"muted\">${text(label)}</div>`;
+}
+function renderSummaryRecordHead() {
+  $('daily-summary-records-head').innerHTML = `<tr>${state.manageSummaries ? '<th>Select</th>' : ''}<th>Summary</th><th>Date</th><th>Tags</th><th>State</th><th>Content</th><th>Path</th><th>Actions</th></tr>`;
+}
+function summaryRecordRow(item) {
+  const selected = Boolean(state.selectedSummaries[item.summary_id]);
+  const selectCell = state.manageSummaries ? `<td><input class=\"summary-select\" type=\"checkbox\" data-action=\"select-summary-row\" data-summary=\"${attr(item.summary_id)}\" ${selected ? 'checked' : ''}></td>` : '';
+  const statePill = item.deleted ? pill('deleted') : pill(item.important ? 'important' : 'normal');
+  const action = item.deleted ? 'restore-summary-record' : 'delete-summary-record';
+  const actionLabel = item.deleted ? 'Restore' : 'Delete';
+  const rowClass = item.deleted ? 'deleted-row' : '';
+  return `<tr class=\"${attr(rowClass)}\" data-summary=\"${attr(item.summary_id)}\">${selectCell}<td>${text(item.summary_id)}<div class=\"muted\">${text(item.provider)}</div></td><td>${text(item.date)}<div class=\"muted\">${text(item.timezone)}</div></td><td>${text((item.tags || []).join(', '))}</td><td>${statePill}</td><td>${text(item.content_preview)}</td><td title=\"${attr(item.summary_path)}\">${text(item.summary_path)}</td><td class=\"actions\"><button class=\"${item.deleted ? '' : 'danger'}\" data-action=\"${action}\" data-summary=\"${attr(item.summary_id)}\">${actionLabel}</button></td></tr>`;
+}
+function updateSummaryBulk() {
+  const bulk = $('summary-bulk');
+  if (!bulk) return;
+  bulk.classList.toggle('hidden', !state.manageSummaries);
+  const manageButton = document.querySelector('[data-action=\"toggle-summary-manage\"]');
+  if (manageButton) manageButton.textContent = state.manageSummaries ? 'Done' : 'Manage';
+  $('summary-selection').textContent = `${Object.keys(state.selectedSummaries).length} selected`;
+}
+function clearSummarySelection() {
+  state.selectedSummaries = {};
+}
+function visibleSummaryIds() {
+  return (state.dailySummaryRecords || []).map(item => item.summary_id).filter(Boolean);
+}
+function selectedSummaryIds() {
+  return Object.keys(state.selectedSummaries);
 }
 function renderRaw() { $('raw').textContent = JSON.stringify(state, null, 2); }
 function parseScopeJson(value) {
@@ -2142,6 +2307,23 @@ async function bulkClearPolicies() {
   await loadAll();
   setStatus('Selected policies cleared', 'ok');
 }
+async function setSummaryRecordsDeleted(summaryIds, deleted) {
+  if (!summaryIds.length) throw new Error('Select at least one summary first');
+  setStatus(deleted ? 'Deleting summaries' : 'Restoring summaries');
+  const result = await api('/manage/daily-summary-records', {
+    method: 'PATCH',
+    body: JSON.stringify({ summary_ids: summaryIds, deleted }),
+  });
+  await loadDaily();
+  setStatus(`${result.item?.changed_rows || 0} summaries ${deleted ? 'deleted' : 'restored'}`, 'ok');
+  return result;
+}
+async function bulkSetSummariesDeleted(deleted) {
+  const ids = selectedSummaryIds();
+  if (!ids.length) throw new Error('Select at least one summary first');
+  if (!confirm(`${deleted ? 'Delete' : 'Restore'} ${ids.length} selected summaries?`)) return;
+  await setSummaryRecordsDeleted(ids, deleted);
+}
 function selectedAccount() { return document.querySelector('#account-form [name=account_id]').value.trim(); }
 function selectedOriginAccount() {
   const filtered = $('origin-filter').value.trim() || selectedAccount();
@@ -2209,6 +2391,15 @@ document.addEventListener('click', (event) => {
   }
   selectOriginRowKey(row.dataset.key, event);
 });
+document.addEventListener('click', (event) => {
+  const checkbox = event.target.closest('[data-action=\"select-summary-row\"]');
+  if (!checkbox) return;
+  const summaryId = checkbox.dataset.summary;
+  if (!summaryId) return;
+  if (checkbox.checked) state.selectedSummaries[summaryId] = true;
+  else delete state.selectedSummaries[summaryId];
+  updateSummaryBulk();
+});
 document.addEventListener('click', async (event) => {
   const target = event.target.closest('button');
   if (!target) return;
@@ -2218,7 +2409,7 @@ document.addEventListener('click', async (event) => {
       localStorage.setItem('teleMessToken', tokenValue());
       setStatus(tokenValue() ? 'Token saved' : 'Token cleared', tokenValue() ? 'ok' : 'warn');
       if (tokenValue()) await loadAll();
-      else stopMessageAutoRefresh();
+      else { stopMessageAutoRefresh(); stopDailyAutoRefresh(); }
     }
     else if (target.id === 'refresh' || action === 'load') await loadAll();
     else if (action === 'load-messages') await loadMessages();
@@ -2251,6 +2442,14 @@ document.addEventListener('click', async (event) => {
     else if (action === 'bulk-remove-origins') await bulkSetOriginsRemoved(true);
     else if (action === 'bulk-restore-origins') await bulkSetOriginsRemoved(false);
     else if (action === 'bulk-clear-policies') await bulkClearPolicies();
+    else if (action === 'toggle-summary-manage') { state.manageSummaries = !state.manageSummaries; clearSummarySelection(); renderDaily(); }
+    else if (action === 'select-visible-summaries') { for (const id of visibleSummaryIds()) state.selectedSummaries[id] = true; renderDaily(); }
+    else if (action === 'clear-summary-selection') { clearSummarySelection(); renderDaily(); }
+    else if (action === 'bulk-delete-summaries') await bulkSetSummariesDeleted(true);
+    else if (action === 'bulk-restore-summaries') await bulkSetSummariesDeleted(false);
+    else if (action === 'delete-summary-record') { if (confirm(`Delete summary ${target.dataset.summary}?`)) await setSummaryRecordsDeleted([target.dataset.summary], true); }
+    else if (action === 'restore-summary-record') { await setSummaryRecordsDeleted([target.dataset.summary], false); }
+    else if (action === 'cancel-summary-job') { if (confirm(`Cancel summary job ${target.dataset.job}?`)) { await api('/manage/daily-summary-jobs/cancel', { method: 'PATCH', body: JSON.stringify({ job_id: target.dataset.job }) }); await loadDaily(); setStatus('Summary job cancel requested', 'warn'); } }
     else if (action === 'edit-policy') openPolicy(target);
   } catch (error) { setStatus(String(error), 'error'); }
 });
@@ -2263,6 +2462,7 @@ document.querySelectorAll('.tab').forEach(button => button.addEventListener('cli
 }));
 window.addEventListener('resize', syncOverviewHeights);
 window.addEventListener('beforeunload', () => {
+  stopDailyAutoRefresh();
   for (const url of mediaObjectUrls.values()) URL.revokeObjectURL(url);
 });
 $('account-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/accounts', formData(event.target)); } catch (error) { setStatus(String(error), 'error'); } });
@@ -2293,9 +2493,18 @@ $('daily-summary-form').addEventListener('submit', async (event) => {
     setStatus(`Summary ${result.item?.run_id || ''} ${result.item?.status || ''}`, result.item?.status === 'failed' ? 'error' : 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
 });
+$('daily-summary-job-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const result = await api('/manage/daily-summary-jobs', { method: 'POST', body: JSON.stringify(dailyRunPayload(event.target)) });
+    await loadDaily();
+    setStatus(`Summary job ${result.item?.job_id || ''} ${result.item?.status || ''}`, result.item?.status === 'failed' ? 'error' : 'ok');
+  } catch (error) { setStatus(String(error), 'error'); }
+});
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('show-archived').addEventListener('change', async () => { try { await loadOrigins(); setStatus('Origins loaded', 'ok'); } catch (error) { setStatus(String(error), 'error'); } });
+$('show-deleted-summaries').addEventListener('change', async () => { try { await loadDaily(); } catch (error) { setStatus(String(error), 'error'); } });
 ['origin-search', 'origin-type-filter', 'origin-backup-filter', 'origin-tag-filter', 'origin-sort'].forEach(id => {
   const input = $(id);
   if (input) input.addEventListener('input', renderOrigins);

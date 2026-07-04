@@ -221,8 +221,12 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("/manage/daily-package-schedule", html)
         self.assertIn("/manage/daily-packages", html)
         self.assertIn("/manage/daily-summaries", html)
+        self.assertIn("/manage/daily-summary-jobs", html)
+        self.assertIn("/manage/daily-summary-jobs/cancel", html)
         self.assertIn("/manage/daily-summary-records", html)
+        self.assertIn("daily-summary-jobs-body", html)
         self.assertIn("daily-summary-records-body", html)
+        self.assertIn("startDailyAutoRefresh", html)
         self.assertIn("daily-schedule-form", html)
         self.assertIn("Daily Runs", html)
         self.assertIn("policy-row", html)
@@ -310,6 +314,8 @@ class SyncApiTest(unittest.TestCase):
         )["item"]
         self.assertEqual(package["status"], "completed")
         self.assertEqual(package["message_count"], 1)
+        self.assertEqual(package["progress_current"], package["progress_total"])
+        self.assertEqual(package["progress_label"], "completed")
         package_md = self.request_text(f"/manage/daily-package-runs/content?run_id={package['run_id']}&format=md")
         self.assertIn("Daily Package 2026-07-03", package_md)
 
@@ -319,6 +325,8 @@ class SyncApiTest(unittest.TestCase):
             payload={"package_run_id": package["run_id"], "background": False},
         )["item"]
         self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["progress_current"], summary["progress_total"])
+        self.assertEqual(summary["progress_label"], "completed")
         summary_md = self.request_text(f"/manage/daily-summary-runs/content?run_id={summary['run_id']}")
         self.assertIn("AI provider is disabled", summary_md)
         records = self.request_json(
@@ -331,6 +339,45 @@ class SyncApiTest(unittest.TestCase):
         record = self.request_json(f"/manage/daily-summary-records/item?run_id={summary['run_id']}")["item"]
         self.assertIn("AI provider is disabled", record["content_md"])
         self.assertEqual(record["tags"], ["web3", "info"])
+
+        deleted = self.request_json(
+            "/manage/daily-summary-records",
+            method="PATCH",
+            payload={"summary_ids": [records[0]["summary_id"]], "deleted": True},
+        )["item"]
+        self.assertEqual(deleted["changed_rows"], 1)
+        hidden_records = self.request_json(f"/manage/daily-summary-records?summary_id={records[0]['summary_id']}")["items"]
+        self.assertEqual(hidden_records, [])
+        deleted_records = self.request_json(
+            f"/manage/daily-summary-records?summary_id={records[0]['summary_id']}&deleted=true"
+        )["items"]
+        self.assertEqual(len(deleted_records), 1)
+        self.assertTrue(deleted_records[0]["deleted"])
+
+        restored = self.request_json(
+            "/manage/daily-summary-records",
+            method="PATCH",
+            payload={"summary_id": records[0]["summary_id"], "deleted": False},
+        )["item"]
+        self.assertEqual(restored["changed_rows"], 1)
+
+        job = self.request_json(
+            "/manage/daily-summary-jobs",
+            method="POST",
+            payload={"date": "2026-07-03", "timezone": "UTC", "tag_groups": ["web3 info"]},
+        )["item"]
+        self.assertEqual(job["status"], "running")
+        deadline = time.time() + 3
+        job_items = []
+        while time.time() < deadline:
+            job_items = self.request_json(f"/manage/daily-summary-jobs?job_id={job['job_id']}")["items"]
+            if job_items and job_items[0]["status"] == "completed":
+                break
+            time.sleep(0.05)
+        self.assertEqual(job_items[0]["status"], "completed")
+        self.assertTrue(job_items[0]["package_run_id"].startswith("pkg_"))
+        self.assertTrue(job_items[0]["summary_run_id"].startswith("sum_"))
+        self.assertEqual(job_items[0]["progress_label"], "completed")
 
     def test_api_manifest_requires_token(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/manage/api-manifest")

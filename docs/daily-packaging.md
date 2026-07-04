@@ -153,31 +153,47 @@ SQLite stores run state and queryable summary content:
 - `daily_summary_runs`;
 - `daily_summary_records`.
 
+Package and summary run rows include progress counters (`progress_current`,
+`progress_total`), the current label, and a structured `progress` object so
+clients can monitor how many package units or AI analysis tasks are queued and
+how far the current run has advanced.
+
+For UI clients that need one button to run the full workflow, daily summary
+jobs wrap package generation plus summary analysis in one background job. A job
+records the package run ID, summary run ID, current stage, counters, and the
+active provider process when one is running. Cancellation marks the job as
+cancel-requested, stops the active provider process when possible, and leaves
+the package/summary run rows with their last recorded state.
+
 Summary records store group-level Markdown plus metadata and stage output
 references. One daily summary run can create multiple `daily_summary_records`
 rows: one row per normal tag group, and one row per important origin. Tags are
 stored in both `tags_json` and `tags_csv`, and returned by the API as `tags`
-plus `tags_csv`. The final
+plus `tags_csv`. Summary records are soft-deleted through `deleted_at`; normal
+list and item reads hide deleted records unless requested. The final
 daily rollup remains available through the summary run content path. List
 responses return previews by default; direct record lookup returns full
 Markdown.
 
 Primary management endpoints:
 
-- `GET` / `PATCH /manage/daily-package-schedule`;
-- `POST /manage/daily-packages`;
-- `GET /manage/daily-package-runs`;
-- `GET /manage/daily-package-runs/content`;
-- `POST /manage/daily-summaries`;
-- `GET /manage/daily-summary-runs`;
-- `GET /manage/daily-summary-runs/content`;
-- `GET /manage/daily-summary-records`;
-- `GET /manage/daily-summary-records/item`;
+- `GET` / `PATCH` `/manage/daily-package-schedule`;
+- `POST` `/manage/daily-packages`;
+- `GET` `/manage/daily-package-runs`;
+- `GET` `/manage/daily-package-runs/content`;
+- `POST` `/manage/daily-summaries`;
+- `POST` / `GET` `/manage/daily-summary-jobs`;
+- `PATCH` `/manage/daily-summary-jobs/cancel`;
+- `GET` `/manage/daily-summary-runs`;
+- `GET` `/manage/daily-summary-runs/content`;
+- `GET` `/manage/daily-summary-records`;
+- `GET` `/manage/daily-summary-records/item`;
+- `PATCH` / `DELETE` `/manage/daily-summary-records`;
 - `PATCH /manage/origins/important`.
 
 `GET /manage/daily-summary-records` supports filtering by summary ID, run ID,
 package run ID, date range, provider, important flag, all-of tags, substring
-query, and result limit.
+query, deleted state, and result limit.
 
 ## CLI
 

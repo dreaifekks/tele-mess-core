@@ -16,6 +16,7 @@ from tele_mess_core.models import (
     ChatRecord,
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
+    DailySummaryJobRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
     MediaFileRecord,
@@ -28,7 +29,7 @@ from tele_mess_core.models import (
 )
 
 
-SCHEMA_VERSION = "10"
+SCHEMA_VERSION = "12"
 
 
 class ArchiveStore:
@@ -1161,9 +1162,10 @@ class ArchiveStore:
                 INSERT INTO daily_package_runs(
                   run_id, status, date, timezone, scope_json, output_dir,
                   package_json_path, package_md_path, origin_count, message_count,
-                  media_count, important_origin_count, error, started_at, finished_at
+                  media_count, important_origin_count, progress_total, progress_current,
+                  progress_label, progress_json, error, started_at, finished_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   status = excluded.status,
                   date = excluded.date,
@@ -1176,6 +1178,10 @@ class ArchiveStore:
                   message_count = excluded.message_count,
                   media_count = excluded.media_count,
                   important_origin_count = excluded.important_origin_count,
+                  progress_total = excluded.progress_total,
+                  progress_current = excluded.progress_current,
+                  progress_label = excluded.progress_label,
+                  progress_json = excluded.progress_json,
                   error = excluded.error,
                   finished_at = excluded.finished_at
                 """,
@@ -1192,6 +1198,10 @@ class ArchiveStore:
                     int(run.message_count),
                     int(run.media_count),
                     int(run.important_origin_count),
+                    int(run.progress_total),
+                    int(run.progress_current),
+                    run.progress_label,
+                    run.progress_json,
                     run.error,
                     started_at,
                     run.finished_at,
@@ -1209,7 +1219,8 @@ class ArchiveStore:
                 """
                 SELECT run_id, status, date, timezone, scope_json, output_dir,
                        package_json_path, package_md_path, origin_count, message_count,
-                       media_count, important_origin_count, error, started_at, finished_at
+                       media_count, important_origin_count, progress_total, progress_current,
+                       progress_label, progress_json, error, started_at, finished_at
                 FROM daily_package_runs
                 WHERE run_id = ?
                 """,
@@ -1217,15 +1228,17 @@ class ArchiveStore:
             ).fetchone()
         if row is None:
             return None
-        data = _row_to_dict(row, json_fields={"scope_json"})
+        data = _row_to_dict(row, json_fields={"scope_json", "progress_json"})
         data["scope"] = data.pop("scope_json") or {}
+        data["progress"] = data.pop("progress_json") or {}
         return data
 
     def list_daily_package_runs(self, status: str | None = None, limit: int = 100) -> list[dict[str, Any]]:
         sql = """
             SELECT run_id, status, date, timezone, scope_json, output_dir,
                    package_json_path, package_md_path, origin_count, message_count,
-                   media_count, important_origin_count, error, started_at, finished_at
+                   media_count, important_origin_count, progress_total, progress_current,
+                   progress_label, progress_json, error, started_at, finished_at
             FROM daily_package_runs
         """
         params: list[Any] = []
@@ -1238,8 +1251,9 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         items = []
         for row in rows:
-            data = _row_to_dict(row, json_fields={"scope_json"})
+            data = _row_to_dict(row, json_fields={"scope_json", "progress_json"})
             data["scope"] = data.pop("scope_json") or {}
+            data["progress"] = data.pop("progress_json") or {}
             items.append(data)
         return items
 
@@ -1251,9 +1265,10 @@ class ArchiveStore:
                 INSERT INTO daily_summary_runs(
                   run_id, status, package_run_id, date, timezone, scope_json,
                   output_dir, summary_path, provider, origin_count, group_count,
-                  image_count, error, started_at, finished_at
+                  image_count, progress_total, progress_current, progress_label,
+                  progress_json, error, started_at, finished_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(run_id) DO UPDATE SET
                   status = excluded.status,
                   package_run_id = excluded.package_run_id,
@@ -1266,6 +1281,10 @@ class ArchiveStore:
                   origin_count = excluded.origin_count,
                   group_count = excluded.group_count,
                   image_count = excluded.image_count,
+                  progress_total = excluded.progress_total,
+                  progress_current = excluded.progress_current,
+                  progress_label = excluded.progress_label,
+                  progress_json = excluded.progress_json,
                   error = excluded.error,
                   finished_at = excluded.finished_at
                 """,
@@ -1282,6 +1301,10 @@ class ArchiveStore:
                     int(run.origin_count),
                     int(run.group_count),
                     int(run.image_count),
+                    int(run.progress_total),
+                    int(run.progress_current),
+                    run.progress_label,
+                    run.progress_json,
                     run.error,
                     started_at,
                     run.finished_at,
@@ -1299,7 +1322,8 @@ class ArchiveStore:
                 """
                 SELECT run_id, status, package_run_id, date, timezone, scope_json,
                        output_dir, summary_path, provider, origin_count, group_count,
-                       image_count, error, started_at, finished_at
+                       image_count, progress_total, progress_current, progress_label,
+                       progress_json, error, started_at, finished_at
                 FROM daily_summary_runs
                 WHERE run_id = ?
                 """,
@@ -1307,8 +1331,9 @@ class ArchiveStore:
             ).fetchone()
         if row is None:
             return None
-        data = _row_to_dict(row, json_fields={"scope_json"})
+        data = _row_to_dict(row, json_fields={"scope_json", "progress_json"})
         data["scope"] = data.pop("scope_json") or {}
+        data["progress"] = data.pop("progress_json") or {}
         return data
 
     def list_daily_summary_runs(
@@ -1320,7 +1345,8 @@ class ArchiveStore:
         sql = """
             SELECT run_id, status, package_run_id, date, timezone, scope_json,
                    output_dir, summary_path, provider, origin_count, group_count,
-                   image_count, error, started_at, finished_at
+                   image_count, progress_total, progress_current, progress_label,
+                   progress_json, error, started_at, finished_at
             FROM daily_summary_runs
         """
         clauses: list[str] = []
@@ -1339,10 +1365,135 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         items = []
         for row in rows:
-            data = _row_to_dict(row, json_fields={"scope_json"})
+            data = _row_to_dict(row, json_fields={"scope_json", "progress_json"})
             data["scope"] = data.pop("scope_json") or {}
+            data["progress"] = data.pop("progress_json") or {}
             items.append(data)
         return items
+
+    def upsert_daily_summary_job(self, job: DailySummaryJobRecord) -> dict[str, Any]:
+        now = job.updated_at or utc_now_iso()
+        started_at = job.started_at or now
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_summary_jobs(
+                  job_id, status, date, timezone, scope_json, package_run_id,
+                  summary_run_id, provider, progress_total, progress_current,
+                  progress_label, progress_json, cancel_requested_at, error,
+                  started_at, finished_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(job_id) DO UPDATE SET
+                  status = excluded.status,
+                  date = excluded.date,
+                  timezone = excluded.timezone,
+                  scope_json = excluded.scope_json,
+                  package_run_id = excluded.package_run_id,
+                  summary_run_id = excluded.summary_run_id,
+                  provider = excluded.provider,
+                  progress_total = excluded.progress_total,
+                  progress_current = excluded.progress_current,
+                  progress_label = excluded.progress_label,
+                  progress_json = excluded.progress_json,
+                  cancel_requested_at = COALESCE(excluded.cancel_requested_at, daily_summary_jobs.cancel_requested_at),
+                  error = excluded.error,
+                  finished_at = excluded.finished_at,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    job.job_id,
+                    job.status,
+                    job.date,
+                    job.timezone,
+                    job.scope_json,
+                    job.package_run_id,
+                    job.summary_run_id,
+                    job.provider,
+                    int(job.progress_total),
+                    int(job.progress_current),
+                    job.progress_label,
+                    job.progress_json,
+                    job.cancel_requested_at,
+                    job.error,
+                    started_at,
+                    job.finished_at,
+                    now,
+                ),
+            )
+            self._conn.commit()
+        item = self.get_daily_summary_job(job.job_id)
+        if item is None:
+            raise ValueError("daily summary job was not persisted")
+        return item
+
+    def get_daily_summary_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT job_id, status, date, timezone, scope_json, package_run_id,
+                       summary_run_id, provider, progress_total, progress_current,
+                       progress_label, progress_json, cancel_requested_at, error,
+                       started_at, finished_at, updated_at
+                FROM daily_summary_jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+        if row is None:
+            return None
+        return _summary_job_from_row(row)
+
+    def list_daily_summary_jobs(
+        self,
+        *,
+        job_id: str | None = None,
+        status: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        sql = """
+            SELECT job_id, status, date, timezone, scope_json, package_run_id,
+                   summary_run_id, provider, progress_total, progress_current,
+                   progress_label, progress_json, cancel_requested_at, error,
+                   started_at, finished_at, updated_at
+            FROM daily_summary_jobs
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        if job_id:
+            clauses.append("job_id = ?")
+            params.append(job_id)
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY started_at DESC LIMIT ?"
+        params.append(_bounded_limit(limit, max_limit=500))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_summary_job_from_row(row) for row in rows]
+
+    def request_daily_summary_job_cancel(self, job_id: str) -> dict[str, Any] | None:
+        now = utc_now_iso()
+        with self._lock:
+            row = self._conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id = ?", (job_id,)).fetchone()
+            if row is None:
+                return None
+            status = str(row["status"])
+            if status not in {"completed", "failed", "canceled"}:
+                self._conn.execute(
+                    """
+                    UPDATE daily_summary_jobs
+                    SET status = 'cancel_requested',
+                        cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (now, now, job_id),
+                )
+                self._conn.commit()
+        return self.get_daily_summary_job(job_id)
 
     def upsert_daily_summary_record(self, record: DailySummaryRecord) -> dict[str, Any]:
         now = record.updated_at or utc_now_iso()
@@ -1356,9 +1507,9 @@ class ArchiveStore:
                   summary_id, run_id, package_run_id, date, timezone, scope_json,
                   tags_json, tags_csv, important, provider, title, content_md, content_json,
                   summary_path, origin_count, group_count, image_count, content_length,
-                  created_at, updated_at
+                  deleted_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                   run_id = excluded.run_id,
                   package_run_id = excluded.package_run_id,
@@ -1377,6 +1528,7 @@ class ArchiveStore:
                   group_count = excluded.group_count,
                   image_count = excluded.image_count,
                   content_length = excluded.content_length,
+                  deleted_at = excluded.deleted_at,
                   updated_at = excluded.updated_at
                 """,
                 (
@@ -1398,12 +1550,13 @@ class ArchiveStore:
                     int(record.group_count),
                     int(record.image_count),
                     int(content_length),
+                    record.deleted_at,
                     created_at,
                     now,
                 ),
             )
             self._conn.commit()
-        item = self.get_daily_summary_record(summary_id=record.summary_id)
+        item = self.get_daily_summary_record(summary_id=record.summary_id, include_deleted=True)
         if item is None:
             raise ValueError("daily summary record was not persisted")
         return item
@@ -1413,6 +1566,7 @@ class ArchiveStore:
         *,
         summary_id: str | None = None,
         run_id: str | None = None,
+        include_deleted: bool = False,
     ) -> dict[str, Any] | None:
         clauses: list[str] = []
         params: list[Any] = []
@@ -1424,13 +1578,15 @@ class ArchiveStore:
             params.append(run_id)
         if not clauses:
             return None
+        if not include_deleted:
+            clauses.append("deleted_at IS NULL")
         with self._lock:
             row = self._conn.execute(
                 """
                 SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
                        tags_json, tags_csv, important, provider, title, content_md, content_json,
                        summary_path, origin_count, group_count, image_count, content_length,
-                       created_at, updated_at
+                       deleted_at, created_at, updated_at
                 FROM daily_summary_records
                 WHERE """ + " AND ".join(clauses) + """
                 ORDER BY created_at DESC, summary_id DESC
@@ -1455,6 +1611,8 @@ class ArchiveStore:
         important: bool | None = None,
         tags: list[str] | None = None,
         q: str | None = None,
+        include_deleted: bool = False,
+        deleted: bool | None = None,
         include_content: bool = False,
         limit: int = 100,
     ) -> list[dict[str, Any]]:
@@ -1462,7 +1620,7 @@ class ArchiveStore:
             SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
                    tags_json, tags_csv, important, provider, title, content_md, content_json,
                    summary_path, origin_count, group_count, image_count, content_length,
-                   created_at, updated_at
+                   deleted_at, created_at, updated_at
             FROM daily_summary_records
         """
         clauses: list[str] = []
@@ -1494,6 +1652,10 @@ class ArchiveStore:
         if q:
             clauses.append("(title LIKE ? OR content_md LIKE ?)")
             params.extend((f"%{q}%", f"%{q}%"))
+        if deleted is not None:
+            clauses.append("deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL")
+        elif not include_deleted:
+            clauses.append("deleted_at IS NULL")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY created_at DESC LIMIT ?"
@@ -1513,6 +1675,31 @@ class ArchiveStore:
             if len(items) >= requested_limit:
                 break
         return items
+
+    def set_daily_summary_records_deleted(self, summary_ids: list[str], deleted: bool = True) -> int:
+        clean_ids: list[str] = []
+        seen: set[str] = set()
+        for item in summary_ids:
+            summary_id = str(item or "").strip()
+            if not summary_id or summary_id in seen:
+                continue
+            seen.add(summary_id)
+            clean_ids.append(summary_id)
+        if not clean_ids:
+            return 0
+        placeholders = ",".join("?" for _ in clean_ids)
+        deleted_at = utc_now_iso() if deleted else None
+        with self._lock:
+            cur = self._conn.execute(
+                f"""
+                UPDATE daily_summary_records
+                SET deleted_at = ?, updated_at = ?
+                WHERE summary_id IN ({placeholders})
+                """,
+                (deleted_at, utc_now_iso(), *clean_ids),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def add_operation_event(self, event: OperationEventRecord) -> int:
         occurred_at = event.occurred_at or utc_now_iso()
@@ -1869,6 +2056,38 @@ class ArchiveStore:
             self._conn.execute("ALTER TABLE origins ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
+        self._ensure_column("daily_package_runs", "progress_total", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("daily_package_runs", "progress_current", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("daily_package_runs", "progress_label", "TEXT")
+        self._ensure_column("daily_package_runs", "progress_json", "TEXT")
+        self._ensure_column("daily_summary_runs", "progress_total", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("daily_summary_runs", "progress_current", "INTEGER NOT NULL DEFAULT 0")
+        self._ensure_column("daily_summary_runs", "progress_label", "TEXT")
+        self._ensure_column("daily_summary_runs", "progress_json", "TEXT")
+        if not self._has_table("daily_summary_jobs"):
+            self._conn.execute(
+                """
+                CREATE TABLE daily_summary_jobs (
+                  job_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  date TEXT,
+                  timezone TEXT,
+                  scope_json TEXT,
+                  package_run_id TEXT,
+                  summary_run_id TEXT,
+                  provider TEXT,
+                  progress_total INTEGER NOT NULL DEFAULT 0,
+                  progress_current INTEGER NOT NULL DEFAULT 0,
+                  progress_label TEXT,
+                  progress_json TEXT,
+                  cancel_requested_at TEXT,
+                  error TEXT,
+                  started_at TEXT NOT NULL,
+                  finished_at TEXT,
+                  updated_at TEXT NOT NULL
+                )
+                """
+            )
         if self._daily_summary_records_run_id_is_unique():
             self._migrate_daily_summary_records_run_id_unique()
         if self._has_table("daily_summary_records") and not self._has_column("daily_summary_records", "tags_csv"):
@@ -1883,8 +2102,13 @@ class ArchiveStore:
                 WHERE tags_json IS NOT NULL AND tags_json != ''
                 """
             )
+        self._ensure_column("daily_summary_records", "deleted_at", "TEXT")
         if self._has_table("messages"):
             self._ensure_message_fts_triggers()
+
+    def _ensure_column(self, table: str, column: str, definition: str) -> None:
+        if self._has_table(table) and not self._has_column(table, column):
+            self._conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
     def _daily_summary_records_run_id_is_unique(self) -> bool:
         if not self._has_table("daily_summary_records"):
@@ -1917,6 +2141,7 @@ class ArchiveStore:
               group_count INTEGER NOT NULL DEFAULT 0,
               image_count INTEGER NOT NULL DEFAULT 0,
               content_length INTEGER NOT NULL DEFAULT 0,
+              deleted_at TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -1924,7 +2149,7 @@ class ArchiveStore:
               summary_id, run_id, package_run_id, date, timezone, scope_json,
               tags_json, tags_csv, important, provider, title, content_md, content_json,
               summary_path, origin_count, group_count, image_count, content_length,
-              created_at, updated_at
+              deleted_at, created_at, updated_at
             )
             SELECT
               summary_id, run_id, package_run_id, date, timezone, scope_json,
@@ -1935,7 +2160,7 @@ class ArchiveStore:
               ),
               important, provider, title, content_md, content_json,
               summary_path, origin_count, group_count, image_count, content_length,
-              created_at, updated_at
+              NULL, created_at, updated_at
             FROM daily_summary_records_old_unique;
             DROP TABLE daily_summary_records_old_unique;
             CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
@@ -2090,9 +2315,17 @@ def _summary_record_from_row(row: sqlite3.Row, *, include_content: bool) -> dict
     content = str(data.get("content_md") or "")
     data["content_preview"] = content[:240]
     data["content_length"] = int(data.get("content_length") or len(content))
+    data["deleted"] = bool(data.get("deleted_at"))
     if not include_content:
         data.pop("content_md", None)
         data.pop("content_json", None)
+    return data
+
+
+def _summary_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(row, json_fields={"scope_json", "progress_json"})
+    data["scope"] = data.pop("scope_json") or {}
+    data["progress"] = data.pop("progress_json") or {}
     return data
 
 
