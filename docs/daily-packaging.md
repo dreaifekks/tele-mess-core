@@ -62,7 +62,8 @@ Each package run writes files under:
 
 - package metadata: local date, timezone, UTC window, scope, counts;
 - origin metadata: source, account, origin/topic IDs, title, tags, important;
-- message lists: speaker, sent time, local time, text, permalink;
+- message lists: speaker, sent time, local time, text, web permalink, Telegram
+  `tg://` deeplink;
 - media metadata: kind, MIME type, file size, downloaded file path.
 
 `package.md` and the per-group/per-origin Markdown files are human review
@@ -95,20 +96,24 @@ The stages are:
   parsed in the MVP. Their path, filename, MIME type, size, origin, and message
   reference are preserved.
 - `normal_origin_key_extraction`: each normal origin in a tag group is reduced
-  to a reusable origin record, key information strings, suggested tags, and
-  ignored noise. When the origin has 200 or fewer messages in the daily window,
-  the prompt asks Codex to preserve the full chronological message content
-  instead of only extracting highlights.
+  to reusable topic/event extractions, key information strings, suggested tags,
+  and ignored noise. When the origin has 200 or fewer messages in the daily
+  window, Codex must scan all messages as evidence, but the output is grouped
+  by topic instead of replaying every message as a flat list.
 - `normal_group_analysis`: extracted normal-origin facts are summarized by tag
-  group with a full content digest, key threads, derived tags, risks,
-  opportunities, actions, and source references.
-- `important_origin_analysis`: each important origin gets a complete record and
-  priority analysis. Important origins keep the full chronological message
-  content for the daily window. The prompt first asks Codex to scan segment
-  importance, then decide from the surrounding context whether each media item
-  deserves OCR/visual extraction or should only be listed by path.
+  group with a topic/event digest, key threads and decisions, derived tags,
+  risks, opportunities, actions, and source references.
+- `important_origin_analysis`: each important origin gets priority analysis
+  over the full daily window. Important origins still scan the full
+  chronological message set, but the output is organized into readable topics,
+  events, decisions, actions, and risks. The prompt first asks Codex to scan
+  segment importance, then decide from the surrounding context whether each
+  media item deserves OCR/visual extraction or should only be listed by path.
 - `final_daily_summary`: final Markdown rollup from important-origin analysis,
-  normal group analysis, and media analysis outputs.
+  normal group analysis, and media analysis outputs. The final rollup is a
+  readable topic-based daily report, not a per-message transcript.
+  Topic start links prefer Telegram `tg://` deeplinks so they open in the
+  Telegram client instead of the browser.
 
 For groups or origins tagged `info`, the prompts add an explicit information
 collection instruction: collect facts, announcements, events, resources, links,

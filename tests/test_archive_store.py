@@ -466,6 +466,32 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(len(grouped[(SOURCE_TELEGRAM, "main", -1002, 22)]), 1)
         self.assertEqual(grouped[(SOURCE_TELEGRAM, "main", -1002, 22)][0]["file_path"], "/tmp/media.bin")
 
+    def test_media_files_grouping_handles_large_message_batches(self) -> None:
+        now = utc_now_iso()
+        for message_id in (1, 500, 1100):
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-1002,
+                    message_id=message_id,
+                    file_path=f"/tmp/media-{message_id}.bin",
+                    media_kind="document",
+                    downloaded_at=now,
+                )
+            )
+
+        grouped = self.store.list_media_files_for_messages(
+            [
+                {"source": SOURCE_TELEGRAM, "account_id": "main", "chat_id": -1002, "message_id": message_id}
+                for message_id in range(1, 1101)
+            ]
+        )
+
+        self.assertEqual(grouped[(SOURCE_TELEGRAM, "main", -1002, 1)][0]["file_path"], "/tmp/media-1.bin")
+        self.assertEqual(grouped[(SOURCE_TELEGRAM, "main", -1002, 500)][0]["file_path"], "/tmp/media-500.bin")
+        self.assertEqual(grouped[(SOURCE_TELEGRAM, "main", -1002, 1100)][0]["file_path"], "/tmp/media-1100.bin")
+
     def test_operation_events_are_queryable_and_counted_in_state(self) -> None:
         now = utc_now_iso()
         self.store.upsert_chat(ChatRecord(source=SOURCE_TELEGRAM, account_id="main", chat_id=-1001, title="Error Chat"))

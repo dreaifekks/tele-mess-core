@@ -225,7 +225,44 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual({tuple(item["tags"]) for item in records}, {("web3", "info"), ("ai", "info")})
         self.assertEqual({item["tags_csv"] for item in records}, {"web3,info", "ai,info"})
         group_prompt = Path(summary["output_dir"]) / "stages" / "normal-groups" / "web3-info.prompt.md"
-        self.assertIn("Tag-specific instruction for `info`", group_prompt.read_text(encoding="utf-8"))
+        group_prompt_text = group_prompt.read_text(encoding="utf-8")
+        self.assertIn("Tag-specific instruction for `info`", group_prompt_text)
+        self.assertIn("不要把输入消息机械地逐条重排成消息列表", group_prompt_text)
+        self.assertIn("### 主题标题 ([起始消息](telegram_deeplink 或 source_ref))", group_prompt_text)
+        self.assertIn("不要把网页版 `https://t.me/...` 当作首选链接", group_prompt_text)
+
+    def test_daily_package_adds_telegram_deeplinks_for_message_links(self) -> None:
+        self._origin(-8001, "Public Link", "info")
+        self._origin(-1001234567890, "Private Link", "info")
+        for chat_id, message_id, permalink in (
+            (-8001, 42, "https://t.me/example_channel/42"),
+            (-1001234567890, 99, "https://t.me/c/1234567890/99"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    sent_at="2026-07-03T01:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=f"linked message {message_id}",
+                    permalink=permalink,
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        messages = {
+            message["message_id"]: message
+            for group in payload["normal_groups"]
+            for origin in group["origins"]
+            for message in origin["messages"]
+        }
+
+        self.assertEqual(messages[42]["telegram_deeplink"], "tg://resolve?domain=example_channel&post=42")
+        self.assertEqual(messages[99]["telegram_deeplink"], "tg://privatepost?channel=1234567890&post=99")
 
     def test_important_origin_prompt_includes_all_messages_past_normal_limit(self) -> None:
         self._origin(-7001, "Important Full", "trade,info", important=True)
@@ -254,6 +291,8 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn('"truncated_message_count": 0', prompt_text)
         self.assertIn("important payload 205", prompt_text)
         self.assertIn("Segment Importance Scan", prompt_text)
+        self.assertIn("但最终输出要按话题/事件/决策聚合", prompt_text)
+        self.assertIn("## Important Topic / Event Summary", prompt_text)
 
     def test_daily_package_skips_origins_without_messages_in_window(self) -> None:
         self._origin(-6001, "Active Web3", "web3,info")

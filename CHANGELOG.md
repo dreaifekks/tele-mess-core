@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.4 - 2026-07-04
+
+- Fixed daily package media enrichment for large message batches by splitting media lookups before SQLite expression-depth limits are reached.
+- Updated daily summary prompts to produce topic/event based reports instead of flat message lists.
+- Added Telegram `tg://` deeplinks to daily package message records and instructed summaries to prefer them for topic start links.
+
 ## 0.2.3 - 2026-07-04
 
 - Added daily package/summary progress counters and soft-deletable summary records with batch management APIs.

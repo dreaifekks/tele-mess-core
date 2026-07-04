@@ -1525,6 +1525,19 @@ def _tag_specific_instruction(*tag_values: Any) -> str:
     )
 
 
+def _topic_summary_instruction() -> str:
+    return (
+        "Readable summary format:\n"
+        "- 不要把输入消息机械地逐条重排成消息列表；先按话题、事件、线索或决策聚合。\n"
+        "- 每个 topic 使用 `### 主题标题 ([起始消息](telegram_deeplink 或 source_ref))`，链接取该 topic 第一条关键消息；"
+        "优先使用 `telegram_deeplink` 这种 `tg://` 链接，不要把网页版 `https://t.me/...` 当作首选链接。"
+        "如果没有 telegram_deeplink，就在标题或 bullet 中保留 origin title/message_id。\n"
+        "- 每个 topic 下用 2-5 条 bullet 写清楚发生了什么、谁在讨论、关键结论/资源/数值/时间、后续行动。\n"
+        "- 低价值闲聊、重复表情和无上下文短句合并进 `低价值/噪声`，不要逐条复述。\n"
+        "- 保留必要 source_refs，但不要为了引用而把每条消息都展开成独立 bullet。\n"
+    )
+
+
 def _normal_origin_key_prompt(
     group: dict[str, Any],
     origin_payload: dict[str, Any],
@@ -1538,13 +1551,14 @@ def _normal_origin_key_prompt(
     return (
         "TASK: normal_origin_key_extraction\n"
         "你是 Telegram 每日归档的关键信息提取器。当前 origin 不是 important，属于 normal tag group。\n"
-        "请从这个 origin 的消息中整理可用于组内汇总的原始内容和关键内容，不要做最终总结。"
+        "请从这个 origin 的消息中整理可用于组内汇总的话题、事件和关键内容，不要做最终日总结。"
         "若 origin 是按 parent tags 进入本组的 topic，请只处理本 topic 的消息，后续再与 parent/group 整合。\n"
-        "内容保留规则：当 `truncated_message_count` 为 0 时，输入消息不超过 200 条，必须按时间顺序保留全部消息文本、发言人、时间和 source_refs；"
-        "不要只抽几条重点。只有当消息超过 200 条并被截断时，才做重点段落/主题摘要。\n"
+        "内容保留规则：当 `truncated_message_count` 为 0 时，输入消息不超过 200 条，必须把全部消息作为证据扫描；"
+        "但输出要按话题/事件聚合，不要把全部消息逐条打印成列表。只有当消息超过 200 条并被截断时，才说明截断数量。\n"
+        f"{_topic_summary_instruction()}"
         "输出 Markdown，包含：\n"
-        "## Full Content Record\n"
-        "- 若未截断，逐条保留全部消息；若已截断，说明截断数量并保留代表性段落。\n"
+        "## Topic / Event Extraction\n"
+        "- 按 topic 输出标题、起始消息链接和要点。\n"
         "## Key Information Strings\n"
         "- 每条是一句独立、可引用的事实/观点/事件/资源，保留 source_refs。\n"
         "## Suggested Tags\n"
@@ -1572,13 +1586,14 @@ def _normal_group_analysis_prompt(group: dict[str, Any], origin_artifacts: list[
         "TASK: normal_group_analysis\n"
         "你是 Telegram 每日归档的 tag group 分析器。请基于组内多个 origin 的关键内容串，"
         "总结这一组的分析结果和 tags。同一 parent 下按 parent tags 分入本组的 topics 要与 parent 作为一体整合。"
-        "如果 origin 提取结果包含 `Full Content Record`，说明该 origin 当天消息量不大，请把完整记录作为主要依据，"
-        "输出的信息密度要接近原始内容，不要压缩成一两句话。\n"
+        "如果 origin 提取结果包含完整消息证据，说明该 origin 当天消息量不大，请把它作为主要依据，"
+        "但输出仍然要按主题组织，不要退化成逐条消息列表。\n"
+        f"{_topic_summary_instruction()}"
         "输出 Markdown，包含：\n"
         "## Group Analysis\n"
-        "## Full Content Digest\n"
-        "- 按 origin/topic 分块，保留主要原文事实、链接、资源名、数值、时间和 source_refs。\n"
-        "## Key Threads\n"
+        "## Topic / Event Digest\n"
+        "- 按跨 origin/topic 的主题分块，保留主要事实、链接、资源名、数值、时间和 source_refs。\n"
+        "## Key Threads / Decisions\n"
         "## Derived Tags\n"
         "## Risks / Opportunities / Actions\n"
         "## Source Refs\n\n"
@@ -1600,14 +1615,16 @@ def _important_origin_analysis_prompt(
         "TASK: important_origin_analysis\n"
         "你是 Telegram 每日归档的 important origin 分析器。这个 origin 需要单独分析，不能只并入普通 tag group。\n"
         "important origin 永远按全量消息处理：输入中的 messages 已包含查询时间窗内全部消息，"
-        "必须按时间顺序把全部消息文本、发言人、时间和 source_refs 写入 `Complete Important Record`，不要做 200 条截断摘要。\n"
+        "必须扫描全部消息文本、发言人、时间和 source_refs，不要做 200 条截断摘要；"
+        "但最终输出要按话题/事件/决策聚合，不要把全部消息按时间顺序机械列出来。\n"
         "请先做 `Segment Importance Scan`：按时间段/讨论段落判断重要度，再根据 media 所在消息或前后上下文的重要度决定是否处理 media。"
         "只有重要上下文中的图片才需要 OCR/视觉事实提取并插入记录；低重要度 media 只列出路径和跳过原因。"
         "PDF/视频等长内容只保留路径和文件名，除非上下文显示它是重要信息源。\n"
+        f"{_topic_summary_instruction()}"
         "输出 Markdown，包含：\n"
-        "## Complete Important Record\n"
+        "## Important Topic / Event Summary\n"
         "## Segment Importance Scan\n"
-        "## Important Analysis\n"
+        "## Important Decisions / Action Items / Risks\n"
         "## Tags\n"
         "## Media Handling\n"
         "## Source Refs\n\n"
@@ -1656,14 +1673,15 @@ def _final_daily_summary_prompt(
     return (
         "TASK: final_daily_summary\n"
         "你是每日 Telegram 归档最终分析器。请基于已经完成的 media、important origin、normal tag group 分析，"
-        "输出最终 Markdown 总结。\n"
+        "输出最终 Markdown 总结。最终读者需要一份可浏览的日报，不需要看到逐条消息流水账。\n"
         "要求：\n"
-        "1. 先给出 Important Highlights，并保留 important 和 tag 分析结果。\n"
-        "2. 再按 tag group 输出 normal content 的分析、机会、风险和行动项；当组内分析包含 Full Content Digest 时，"
-        "最终总结也要保留足够细节，不要压缩成极短摘要。\n"
+        "1. 先给出 Important Highlights，每个重点按主题/事件写标题、起始消息链接和 2-5 条 bullet。\n"
+        "2. 再按 tag group 输出 normal content 的主题摘要、机会、风险和行动项；"
+        "当组内分析包含完整证据时，要保留足够事实密度，但不要输出逐条消息列表。\n"
         "3. 把图片 OCR/图像分析作为内容依据引用；PDF/视频只引用路径和文件名，不编造内容。\n"
         "4. 每个结论尽量保留 source_refs，引用 origin title/message_id/file_path。\n"
-        "5. 输出应是可直接阅读的 Markdown，不要返回 JSON。\n\n"
+        "5. 输出应是可直接阅读的 Markdown，不要返回 JSON。\n"
+        f"{_topic_summary_instruction()}\n"
         "Analysis inputs:\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
     )
@@ -1700,6 +1718,7 @@ def _compact_origin_for_analysis(
                 "local_sent_at": message.get("local_sent_at"),
                 "text": message.get("text"),
                 "permalink": message.get("permalink"),
+                "telegram_deeplink": message.get("telegram_deeplink") or _telegram_deeplink(message),
                 "media_files": media_files,
             }
         )
@@ -2089,8 +2108,31 @@ def _package_message(message: dict[str, Any], media_files: list[dict[str, Any]],
         "has_media": bool(message.get("has_media")),
         "media_kind": message.get("media_kind"),
         "permalink": message.get("permalink"),
+        "telegram_deeplink": _telegram_deeplink(message),
         "media_files": media_files,
     }
+
+
+def _telegram_deeplink(message: dict[str, Any]) -> str | None:
+    permalink = str(message.get("permalink") or "")
+    message_id = message.get("message_id")
+    if not message_id:
+        return None
+
+    match = re.match(r"^https://t\.me/c/(?P<channel>\d+)/(?P<post>\d+)(?:\?.*)?$", permalink)
+    if match:
+        return f"tg://privatepost?channel={match.group('channel')}&post={match.group('post')}"
+
+    match = re.match(r"^https://t\.me/(?P<domain>[A-Za-z0-9_]+)/(?P<post>\d+)(?:\?.*)?$", permalink)
+    if match:
+        return f"tg://resolve?domain={match.group('domain')}&post={match.group('post')}"
+
+    chat_id = str(message.get("chat_id") or "")
+    if chat_id.startswith("-100"):
+        return f"tg://privatepost?channel={chat_id[4:]}&post={message_id}"
+    if chat_id.startswith("-"):
+        return f"tg://privatepost?channel={chat_id[1:]}&post={message_id}"
+    return None
 
 
 def _package_media_file(media: dict[str, Any]) -> dict[str, Any]:
@@ -2254,6 +2296,7 @@ def _compact_origins(origins: list[dict[str, Any]]) -> list[dict[str, Any]]:
                         "local_sent_at": message.get("local_sent_at"),
                         "text": message.get("text"),
                         "permalink": message.get("permalink"),
+                        "telegram_deeplink": message.get("telegram_deeplink") or _telegram_deeplink(message),
                         "media_files": message.get("media_files"),
                     }
                     for message in messages[:200]

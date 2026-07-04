@@ -1010,13 +1010,7 @@ class ArchiveStore:
         if not keys:
             return {}
 
-        clauses: list[str] = []
-        params: list[Any] = []
-        for source, account_id, chat_id, message_id in keys:
-            clauses.append("(m.source = ? AND m.account_id = ? AND m.chat_id = ? AND m.message_id = ?)")
-            params.extend([source, account_id, chat_id, message_id])
-
-        sql = f"""
+        lookup_sql = """
             SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
                    m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
                    COALESCE(c.title, o.title) AS chat_title
@@ -1030,11 +1024,23 @@ class ArchiveStore:
              AND o.account_id = m.account_id
              AND o.origin_id = m.chat_id
              AND o.topic_id = 0
-            WHERE {" OR ".join(clauses)}
+            WHERE {where_clause}
             ORDER BY m.source, m.account_id, m.chat_id, m.message_id, m.file_index
         """
+        rows: list[sqlite3.Row] = []
         with self._lock:
-            rows = self._conn.execute(sql, tuple(params)).fetchall()
+            for batch_start in range(0, len(keys), 200):
+                clauses: list[str] = []
+                params: list[Any] = []
+                for source, account_id, chat_id, message_id in keys[batch_start : batch_start + 200]:
+                    clauses.append("(m.source = ? AND m.account_id = ? AND m.chat_id = ? AND m.message_id = ?)")
+                    params.extend([source, account_id, chat_id, message_id])
+                rows.extend(
+                    self._conn.execute(
+                        lookup_sql.format(where_clause=" OR ".join(clauses)),
+                        tuple(params),
+                    ).fetchall()
+                )
 
         grouped: dict[tuple[str, str, int, int], list[dict[str, Any]]] = {key: [] for key in keys}
         for row in rows:
