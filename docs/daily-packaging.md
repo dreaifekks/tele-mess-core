@@ -148,6 +148,29 @@ Set `daily.ai.provider: disabled` for local dry runs. In that mode the pipeline
 still creates stage files and summary records, but stage content is a disabled
 provider marker.
 
+The final daily rollup can also be delivered back to Telegram after it is
+generated:
+
+```yaml
+daily:
+  delivery:
+    enabled: true
+    account_id: "main"
+    origin_id: -1001234567890
+    topic_id: 0
+```
+
+`account_id` selects the configured Telegram session that sends the message.
+`origin_id` is the target group or channel ID. `topic_id` is optional; set it
+to a forum topic ID when the summary should be posted into that topic. To pick
+a target from a client, run live discovery with
+`POST /manage/discover-origins`, then list saved choices with
+`GET /manage/origins?account_id=<account_id>`. Returned rows include
+`origin_type` (`group`, `channel`, or `topic`), `origin_id`, `topic_id`, title,
+username, and forum metadata. Delivered messages use the final Markdown rollup
+with a generated header containing the summary date, timezone, Telegram
+searchable hashtags, and summary provider.
+
 ## Persistence And API
 
 SQLite stores run state and queryable summary content:

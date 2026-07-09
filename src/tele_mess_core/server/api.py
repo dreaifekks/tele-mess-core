@@ -103,7 +103,7 @@ class SyncApiServer:
         config = self.config
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.2.4"
+            server_version = "tele-mess-core/0.2.5"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
@@ -498,6 +498,7 @@ def _capabilities() -> dict[str, Any]:
             "daily_package_runs",
             "daily_summary_runs",
             "daily_summary_records",
+            "daily_summary_delivery",
             "web_console",
         ],
         "auth_flow": {

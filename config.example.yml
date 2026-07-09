@@ -53,6 +53,14 @@ daily:
       # - "{task}"
       - "-"
     timeout_seconds: 900
+  delivery:
+    enabled: false
+    # Send the final daily summary through this authenticated account.
+    account_id: "main"
+    # Telegram group/channel ID from GET /manage/origins?account_id=main.
+    origin_id: -1001234567890
+    # Optional forum topic ID. Leave as 0 to send to the group/channel root.
+    topic_id: 0
 
 logging:
   level: "INFO"

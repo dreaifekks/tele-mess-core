@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.5 - 2026-07-09
+
+- Added configurable Telegram delivery for final daily summaries, targeting a chosen account, group/channel, and optional forum topic.
+- Added Telegram-searchable hashtag/date/provider headers before delivered summary Markdown.
+- Documented discovery-based group/channel/topic selection for summary delivery.
+
 ## 0.2.4 - 2026-07-04
 
 - Fixed daily package media enrichment for large message batches by splitting media lookups before SQLite expression-depth limits are reached.

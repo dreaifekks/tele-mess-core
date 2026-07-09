@@ -8,10 +8,11 @@ import time
 import unittest
 from contextlib import redirect_stdout
 from pathlib import Path
+from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
-from tele_mess_core.config import AppConfig, DailyAiConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
+from tele_mess_core.config import AppConfig, DailyAiConfig, DailyDeliveryConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
 from tele_mess_core.daily import build_daily_package, cancel_daily_summary_job, run_daily_summary, start_daily_summary_job, update_daily_package_schedule
 from tele_mess_core.models import BackupPolicyRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
@@ -230,6 +231,60 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("不要把输入消息机械地逐条重排成消息列表", group_prompt_text)
         self.assertIn("### 主题标题 ([起始消息](telegram_deeplink 或 source_ref))", group_prompt_text)
         self.assertIn("不要把网页版 `https://t.me/...` 当作首选链接", group_prompt_text)
+
+    def test_daily_summary_delivers_final_summary_when_configured(self) -> None:
+        self._origin(-7001, "Delivery Source", "info")
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-7001,
+                message_id=1,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="delivery source",
+            ),
+            event_type="new",
+        )
+        package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                systemd_user_dir=self.config.daily.systemd_user_dir,
+                ai=DailyAiConfig(provider="disabled"),
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001, topic_id=88),
+            ),
+            config_path=self.config.config_path,
+        )
+
+        delivery_result = {
+            "account_id": "main",
+            "origin_id": -9001,
+            "topic_id": 88,
+            "status": "sent",
+            "message_count": 1,
+            "message_ids": [123],
+        }
+        with patch("tele_mess_core.daily.deliver_daily_summary", return_value=delivery_result) as deliver:
+            summary = run_daily_summary(self.store, delivery_config, package_run_id=package["run_id"])
+
+        deliver.assert_called_once()
+        delivered_content = deliver.call_args.args[2]
+        self.assertIn("# Daily Summary", delivered_content)
+        self.assertIn("- Date: `2026-07-03`", delivered_content)
+        self.assertIn("- Timezone: `UTC`", delivered_content)
+        self.assertIn("- Tags: #info", delivered_content)
+        self.assertIn("- Summary provider: `disabled`", delivered_content)
+        self.assertIn("AI provider is disabled", delivered_content)
+        self.assertEqual(summary["status"], "completed")
+        self.assertEqual(summary["progress_current"], summary["progress_total"])
+        self.assertEqual(summary["progress"]["delivery_count"], 1)
+        summary_payload = json.loads((Path(summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary_payload["delivery"], delivery_result)
 
     def test_daily_package_adds_telegram_deeplinks_for_message_links(self) -> None:
         self._origin(-8001, "Public Link", "info")

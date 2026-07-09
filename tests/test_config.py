@@ -56,6 +56,11 @@ daily:
     provider: disabled
     command: [python3, -c, pass]
     timeout_seconds: 12
+  delivery:
+    enabled: true
+    account_id: main
+    origin_id: -1001
+    topic_id: 42
 """,
                 encoding="utf-8",
             )
@@ -67,6 +72,31 @@ daily:
         self.assertEqual(config.daily.cli_path, "./bin/tele-mess-core")
         self.assertEqual(config.daily.ai.provider, "disabled")
         self.assertEqual(config.daily.ai.timeout_seconds, 12)
+        self.assertTrue(config.daily.delivery.enabled)
+        self.assertEqual(config.daily.delivery.account_id, "main")
+        self.assertEqual(config.daily.delivery.origin_id, -1001)
+        self.assertEqual(config.daily.delivery.topic_id, 42)
+
+    def test_daily_delivery_requires_target_when_enabled(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yml"
+            config_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+daily:
+  delivery:
+    enabled: true
+    account_id: main
+""",
+                encoding="utf-8",
+            )
+
+            with self.assertRaisesRegex(ValueError, "daily.delivery.origin_id"):
+                load_config(config_path)
 
 
 if __name__ == "__main__":

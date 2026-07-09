@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import os
@@ -466,19 +467,21 @@ def build_daily_package(
         )
 
 
-def _summary_progress_counts(package_payload: dict[str, Any]) -> dict[str, int]:
+def _summary_progress_counts(package_payload: dict[str, Any], *, include_delivery: bool = False) -> dict[str, int]:
     normal_group_count = len(package_payload.get("normal_groups") or [])
     normal_origin_count = sum(len(group.get("origins") or []) for group in package_payload.get("normal_groups") or [])
     important_origin_count = len(package_payload.get("important_origins") or [])
     media_count = len(_collect_media_analysis_targets(package_payload))
     final_count = 1
+    delivery_count = 1 if include_delivery else 0
     return {
         "media_count": media_count,
         "normal_origin_count": normal_origin_count,
         "normal_group_count": normal_group_count,
         "important_origin_count": important_origin_count,
         "final_count": final_count,
-        "total": media_count + normal_origin_count + normal_group_count + important_origin_count + final_count,
+        "delivery_count": delivery_count,
+        "total": media_count + normal_origin_count + normal_group_count + important_origin_count + final_count + delivery_count,
     }
 
 
@@ -501,6 +504,7 @@ def _summary_progress_payload(
         "normal_group_count": int(counts.get("normal_group_count") or 0),
         "important_origin_count": int(counts.get("important_origin_count") or 0),
         "final_count": int(counts.get("final_count") or 0),
+        "delivery_count": int(counts.get("delivery_count") or 0),
         **(extra or {}),
     }
 
@@ -529,7 +533,7 @@ def run_daily_summary(
         raise ValueError(f"Package JSON is missing for run: {package_run_id}")
 
     package_payload = json.loads(package_json_path.read_text(encoding="utf-8"))
-    progress_counts = _summary_progress_counts(package_payload)
+    progress_counts = _summary_progress_counts(package_payload, include_delivery=_daily_delivery_enabled(config))
     image_count_estimate = len(_collect_image_paths(package_payload))
     run_id = run_id or _new_run_id("sum")
     output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
@@ -593,20 +597,15 @@ def run_daily_summary(
         )
         image_paths = _collect_image_paths(package_payload)
         summary_text = str((analysis.get("final") or {}).get("content") or "")
-        (output_root / "summary.json").write_text(
-            json.dumps(
-                {
-                    "run_id": run_id,
-                    "package_run_id": package_run_id,
-                    "provider": config.daily.ai.provider,
-                    "image_paths": image_paths,
-                    "summary_path": str(summary_path),
-                    "analysis": _analysis_record_payload(analysis),
-                },
-                ensure_ascii=False,
-                indent=2,
-            ),
-            encoding="utf-8",
+        _write_summary_analysis_json(
+            output_root / "summary.json",
+            run_id=run_id,
+            package_run_id=str(package_run_id),
+            provider=config.daily.ai.provider,
+            image_paths=image_paths,
+            summary_path=summary_path,
+            analysis=analysis,
+            delivery=None,
         )
         summary_records = _build_summary_records(
             run_id=run_id,
@@ -621,6 +620,37 @@ def run_daily_summary(
         )
         for summary_record in summary_records:
             store.upsert_daily_summary_record(summary_record)
+        delivery_result = None
+        if _daily_delivery_enabled(config):
+            delivery_content = _summary_delivery_markdown(
+                package_run=package_run,
+                package_payload=package_payload,
+                provider=config.daily.ai.provider,
+                summary_text=summary_text,
+            )
+            update_progress(
+                max(0, int(progress_counts.get("total") or 0) - 1),
+                "delivering daily summary",
+                "delivery",
+                {"delivery": _delivery_target_payload(config)},
+            )
+            delivery_result = deliver_daily_summary(store, config, delivery_content)
+            _write_summary_analysis_json(
+                output_root / "summary.json",
+                run_id=run_id,
+                package_run_id=str(package_run_id),
+                provider=config.daily.ai.provider,
+                image_paths=image_paths,
+                summary_path=summary_path,
+                analysis=analysis,
+                delivery=delivery_result,
+            )
+            update_progress(
+                int(progress_counts.get("total") or 0),
+                "delivered daily summary",
+                "delivery",
+                {"delivery": delivery_result},
+            )
         return store.upsert_daily_summary_run(
             DailySummaryRunRecord(
                 run_id=run_id,
@@ -739,6 +769,97 @@ def run_daily_package_and_summary(
         }
     )
     return result
+
+
+def deliver_daily_summary(store: ArchiveStore, config: AppConfig, content: str) -> dict[str, Any] | None:
+    delivery = config.daily.delivery
+    if not delivery.enabled:
+        return None
+    if delivery.origin_id is None:
+        raise ValueError("daily.delivery.origin_id is required when daily.delivery.enabled is true")
+    account = _delivery_account_config(config)
+    from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
+
+    return asyncio.run(TelegramSummaryDeliveryService(account, store).send_summary(delivery, content))
+
+
+def _daily_delivery_enabled(config: AppConfig) -> bool:
+    return bool(config.daily.delivery.enabled)
+
+
+def _delivery_account_config(config: AppConfig):
+    account_id = config.daily.delivery.account_id
+    for account in config.telegram.accounts:
+        if account.account_id == account_id:
+            return account
+    raise ValueError(f"Unknown daily.delivery.account_id: {account_id}")
+
+
+def _delivery_target_payload(config: AppConfig) -> dict[str, Any]:
+    delivery = config.daily.delivery
+    return {
+        "account_id": delivery.account_id,
+        "origin_id": delivery.origin_id,
+        "topic_id": delivery.topic_id,
+    }
+
+
+def _write_summary_analysis_json(
+    path: Path,
+    *,
+    run_id: str,
+    package_run_id: str,
+    provider: str,
+    image_paths: list[str],
+    summary_path: Path,
+    analysis: dict[str, Any],
+    delivery: dict[str, Any] | None,
+) -> None:
+    payload = {
+        "run_id": run_id,
+        "package_run_id": package_run_id,
+        "provider": provider,
+        "image_paths": image_paths,
+        "summary_path": str(summary_path),
+        "analysis": _analysis_record_payload(analysis),
+        "delivery": delivery,
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def _summary_delivery_markdown(
+    *,
+    package_run: dict[str, Any],
+    package_payload: dict[str, Any],
+    provider: str,
+    summary_text: str,
+) -> str:
+    date = str(package_payload.get("date") or package_run.get("date") or "unknown")
+    timezone_name = str(package_payload.get("timezone") or package_run.get("timezone") or "")
+    tags = _collect_summary_tags(package_payload)
+    hashtags = [_telegram_hashtag(tag) for tag in tags]
+    tag_text = " ".join(hashtag for hashtag in hashtags if hashtag) or "#untagged"
+    header = [
+        "# Daily Summary",
+        "",
+        f"- Date: `{date}`",
+    ]
+    if timezone_name:
+        header.append(f"- Timezone: `{timezone_name}`")
+    header.extend(
+        [
+            f"- Tags: {tag_text}",
+            f"- Summary provider: `{provider}`",
+            "",
+        ]
+    )
+    body = str(summary_text or "").strip()
+    return "\n".join(header) + "\n" + (body or "_No summary content._") + "\n"
+
+
+def _telegram_hashtag(tag: str) -> str:
+    cleaned = re.sub(r"[^\w]+", "_", str(tag or "").strip(), flags=re.UNICODE).strip("_")
+    return f"#{cleaned}" if cleaned else ""
 
 
 def start_daily_summary_job(
@@ -1783,7 +1904,11 @@ def start_daily_summary_thread(
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
     package_json_path = Path(str(package_run.get("package_json_path") or ""))
     package_payload = json.loads(package_json_path.read_text(encoding="utf-8")) if package_json_path.is_file() else {}
-    progress_counts = _summary_progress_counts(package_payload) if package_payload else {"total": 0}
+    progress_counts = (
+        _summary_progress_counts(package_payload, include_delivery=_daily_delivery_enabled(config))
+        if package_payload
+        else {"total": 0}
+    )
     progress = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
     item = store.upsert_daily_summary_run(
         DailySummaryRunRecord(

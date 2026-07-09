@@ -77,11 +77,20 @@ class DailyAiConfig:
 
 
 @dataclass(slots=True)
+class DailyDeliveryConfig:
+    enabled: bool = False
+    account_id: str = ""
+    origin_id: int | None = None
+    topic_id: int = 0
+
+
+@dataclass(slots=True)
 class DailyPackagingConfig:
     output_dir: Path | None = None
     systemd_user_dir: Path | None = None
     cli_path: str = "tele-mess-core"
     ai: DailyAiConfig = field(default_factory=DailyAiConfig)
+    delivery: DailyDeliveryConfig = field(default_factory=DailyDeliveryConfig)
 
 
 @dataclass(slots=True)
@@ -215,6 +224,7 @@ def _parse_daily(base_dir: Path, raw: Any) -> DailyPackagingConfig:
         systemd_user_dir=_resolve_path(base_dir, systemd_user_dir) if systemd_user_dir else None,
         cli_path=str(raw.get("cli_path", "tele-mess-core") or "tele-mess-core"),
         ai=_parse_daily_ai(raw.get("ai", {})),
+        delivery=_parse_daily_delivery(raw.get("delivery", {})),
     )
 
 
@@ -236,6 +246,30 @@ def _parse_daily_ai(raw: Any) -> DailyAiConfig:
         provider=str(raw.get("provider", "codex-cli") or "codex-cli"),
         command=command_list,
         timeout_seconds=max(1, int(raw.get("timeout_seconds", 900))),
+    )
+
+
+def _parse_daily_delivery(raw: Any) -> DailyDeliveryConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("daily.delivery must be a mapping")
+    enabled = _parse_bool(raw.get("enabled", False))
+    account_id = str(raw.get("account_id") or "").strip()
+    origin_id_raw = raw.get("origin_id")
+    topic_id_raw = raw.get("topic_id", 0)
+    origin_id = None if origin_id_raw in (None, "") else int(origin_id_raw)
+    topic_id = 0 if topic_id_raw in (None, "") else int(topic_id_raw)
+    if enabled:
+        if not account_id:
+            raise ValueError("daily.delivery.account_id is required when daily.delivery.enabled is true")
+        if origin_id is None:
+            raise ValueError("daily.delivery.origin_id is required when daily.delivery.enabled is true")
+    return DailyDeliveryConfig(
+        enabled=enabled,
+        account_id=account_id,
+        origin_id=origin_id,
+        topic_id=topic_id,
     )
 
 
