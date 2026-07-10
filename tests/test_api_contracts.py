@@ -35,6 +35,8 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(manifest_routes, expected)
         self.assertEqual(openapi_routes, expected)
         self.assertIn("/manage/api-manifest", openapi["paths"])
+        self.assertIn("/manage/daily-message-points", openapi["paths"])
+        self.assertIn("DailyMessagePoint", openapi["components"]["schemas"])
         self.assertIn("ApiManifest", openapi["components"]["schemas"])
         self.assertEqual(set(ENDPOINTS_BY_ROUTE), {(method.upper(), path) for method, path in expected})
         self.assertEqual(
@@ -81,6 +83,14 @@ class ApiContractTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "account_id"):
             validate_query_params(media_endpoint, {"chat_id": ["-1001"], "message_id": ["1"]})
+
+        points_endpoint = next(
+            endpoint
+            for endpoint in API_ENDPOINTS
+            if endpoint.method == "GET" and endpoint.path == "/manage/daily-message-points"
+        )
+        with self.assertRaisesRegex(ValueError, "importance_min must be an integer"):
+            validate_query_params(points_endpoint, {"importance_min": ["high"]})
 
 
 if __name__ == "__main__":

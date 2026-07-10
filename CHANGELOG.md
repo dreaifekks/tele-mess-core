@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+- Split daily AI output into an important-origin full-context report and a
+  separate `#point` digest built from structured message points extracted from
+  all eligible origins.
+- Added queryable message-point fields for time, tags, content, Telegram source,
+  importance, and evidence, plus a filtered Message Points view in the built-in
+  console.
+- Added typed daily summary records so important daily reports, point digests,
+  and legacy per-origin/group artifacts can be distinguished.
+- Hid failed/canceled-run points from normal queries while keeping an explicit
+  diagnostic view, and discard unsent Telegram chunks when a job is canceled.
+- Paginated origin-window reads so high-volume days are not silently truncated
+  at 10,000 messages.
+- Changed the default Codex CLI model template to `gpt-5.6-sol` with `{model}`
+  and task-specific `{output_schema}` placeholders.
 - Added SQLite-backed `GET`/`PATCH /manage/daily-summary-delivery` configuration for clients.
 - Allowed schedule updates to persist a nested `delivery` target and reject unknown fields instead of returning a false success.
 - Changed scheduled and background summary jobs to resolve the persisted delivery target before creating the Telegram outbox.

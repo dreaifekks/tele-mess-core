@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import os
@@ -22,6 +23,7 @@ from tele_mess_core.config import AppConfig, DailyDeliveryConfig
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
+    DailyMessagePointRecord,
     DailySummaryDeliveryRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
@@ -31,6 +33,8 @@ from tele_mess_core.models import (
 
 
 DAILY_SYSTEMD_BASENAME = "tele-mess-core-daily-package"
+MESSAGE_POINT_CHUNK_SIZE = 200
+PACKAGE_MESSAGE_PAGE_SIZE = 5000
 
 
 class DailyJobCancelled(RuntimeError):
@@ -217,6 +221,7 @@ def build_daily_package(
         output_root.mkdir(parents=True, exist_ok=True)
         (output_root / "normal-groups").mkdir(exist_ok=True)
         (output_root / "important-origins").mkdir(exist_ok=True)
+        (output_root / "point-origins").mkdir(exist_ok=True)
         (output_root / "analysis").mkdir(exist_ok=True)
 
         selected_origins = [
@@ -228,13 +233,23 @@ def build_daily_package(
             cancel_check()
         important_origins = [origin for origin in selected_origins if origin.get("important")]
         normal_origins = [origin for origin in selected_origins if not origin.get("important")]
+        packaged_origins: dict[tuple[str, str, int, int], dict[str, Any]] = {}
+
+        def package_selected_origin(origin: dict[str, Any]) -> dict[str, Any]:
+            key = _origin_identity(origin)
+            payload = packaged_origins.get(key)
+            if payload is None:
+                payload = _package_origin(store, origin, window_start_utc, window_end_utc, tz)
+                packaged_origins[key] = payload
+            return payload
+
         tag_groups = parse_tag_groups(scope.get("tag_groups"))
         grouped = (
             assign_origins_to_tag_groups(normal_origins, tag_groups)
             if tag_groups
             else assign_origins_to_effective_tag_groups(normal_origins)
         )
-        package_units = len(grouped["groups"]) + len(important_origins)
+        package_units = len(grouped["groups"]) + len(important_origins) + len(grouped["unmatched"])
         package_current = 0
         update_progress(
             package_current,
@@ -260,7 +275,7 @@ def build_daily_package(
             if cancel_check:
                 cancel_check()
             origin_packages = [
-                _package_origin(store, origin, window_start_utc, window_end_utc, tz)
+                package_selected_origin(origin)
                 for origin in group["origins"]
             ]
             group_payload = {
@@ -299,7 +314,7 @@ def build_daily_package(
             )
             if cancel_check:
                 cancel_check()
-            payload = _package_origin(store, origin, window_start_utc, window_end_utc, tz)
+            payload = package_selected_origin(origin)
             important_packages.append(payload)
             name = _origin_file_stem(origin)
             _write_json(output_root / "important-origins" / f"{name}.json", payload)
@@ -314,6 +329,49 @@ def build_daily_package(
                 f"packaged important {origin_label}",
                 {"current_origin": origin_label, "unit_type": "important_origin"},
             )
+
+        for origin in grouped["unmatched"]:
+            origin_label = _origin_ref({"origin": origin})
+            update_progress(
+                package_current,
+                package_units,
+                f"packaging point-only {origin_label}",
+                {"current_origin": origin_label, "unit_type": "point_origin"},
+            )
+            package_selected_origin(origin)
+            package_current += 1
+            update_progress(
+                package_current,
+                package_units,
+                f"packaged point-only {origin_label}",
+                {"current_origin": origin_label, "unit_type": "point_origin"},
+            )
+
+        point_packages = _canonicalize_point_origin_packages(
+            [package_selected_origin(origin) for origin in selected_origins]
+        )
+        for point_payload in point_packages:
+            point_origin = point_payload.get("origin") or {}
+            name = _origin_file_stem(point_origin)
+            _write_json(output_root / "point-origins" / f"{name}.json", point_payload)
+            (output_root / "point-origins" / f"{name}.md").write_text(
+                _origin_markdown(point_payload),
+                encoding="utf-8",
+            )
+        point_message_count = sum(len(item.get("messages") or []) for item in point_packages)
+        point_media_count = sum(
+            int((item.get("package_meta") or {}).get("media_count") or 0)
+            for item in point_packages
+        )
+        totals = {
+            **totals,
+            "analysis_origin_count": totals["origin_count"],
+            "analysis_message_count": totals["message_count"],
+            "analysis_media_count": totals["media_count"],
+            "origin_count": len(point_packages),
+            "message_count": point_message_count,
+            "media_count": point_media_count,
+        }
 
         package_payload = {
             "run_id": run_id,
@@ -332,8 +390,13 @@ def build_daily_package(
             "auto_tag_groups": not bool(tag_groups),
             "normal_groups": group_packages,
             "important_origins": important_packages,
+            "point_origins": point_packages,
             "unmatched_origins": [_origin_summary(origin) for origin in grouped["unmatched"]],
-            "stats": totals,
+            "stats": {
+                **totals,
+                "point_origin_count": len(point_packages),
+                "point_message_count": point_message_count,
+            },
         }
         _write_json(package_json_path, package_payload)
         package_md_path.write_text(_package_markdown(package_payload), encoding="utf-8")
@@ -366,6 +429,8 @@ def build_daily_package(
                         "important_origin_count": len(important_origins),
                         "selected_origin_count": len(selected_origins),
                         "unmatched_origin_count": len(grouped["unmatched"]),
+                        "point_origin_count": len(point_packages),
+                        "point_message_count": point_message_count,
                     },
                     ensure_ascii=False,
                     sort_keys=True,
@@ -423,19 +488,36 @@ def build_daily_package(
 
 def _summary_progress_counts(package_payload: dict[str, Any], *, include_delivery: bool = False) -> dict[str, int]:
     normal_group_count = len(package_payload.get("normal_groups") or [])
-    normal_origin_count = sum(len(group.get("origins") or []) for group in package_payload.get("normal_groups") or [])
     important_origin_count = len(package_payload.get("important_origins") or [])
+    point_origin_count = len(_iter_point_origin_payloads(package_payload))
+    point_extraction_count = sum(
+        (len(origin_payload.get("messages") or []) + MESSAGE_POINT_CHUNK_SIZE - 1)
+        // MESSAGE_POINT_CHUNK_SIZE
+        for origin_payload in _iter_point_origin_payloads(package_payload)
+    )
     media_count = len(_collect_media_analysis_targets(package_payload))
-    final_count = 1
-    delivery_count = 1 if include_delivery else 0
+    important_summary_count = 1 if important_origin_count else 0
+    point_summary_count = 1
+    delivery_count = (1 + int(bool(important_origin_count))) if include_delivery else 0
     return {
         "media_count": media_count,
-        "normal_origin_count": normal_origin_count,
+        "normal_origin_count": 0,
         "normal_group_count": normal_group_count,
         "important_origin_count": important_origin_count,
-        "final_count": final_count,
+        "point_origin_count": point_origin_count,
+        "point_extraction_count": point_extraction_count,
+        "important_summary_count": important_summary_count,
+        "point_summary_count": point_summary_count,
+        "final_count": important_summary_count + point_summary_count,
         "delivery_count": delivery_count,
-        "total": media_count + normal_origin_count + normal_group_count + important_origin_count + final_count + delivery_count,
+        "total": (
+            media_count
+            + point_extraction_count
+            + important_origin_count
+            + important_summary_count
+            + point_summary_count
+            + delivery_count
+        ),
     }
 
 
@@ -457,6 +539,10 @@ def _summary_progress_payload(
         "normal_origin_count": int(counts.get("normal_origin_count") or 0),
         "normal_group_count": int(counts.get("normal_group_count") or 0),
         "important_origin_count": int(counts.get("important_origin_count") or 0),
+        "point_origin_count": int(counts.get("point_origin_count") or 0),
+        "point_extraction_count": int(counts.get("point_extraction_count") or 0),
+        "important_summary_count": int(counts.get("important_summary_count") or 0),
+        "point_summary_count": int(counts.get("point_summary_count") or 0),
         "final_count": int(counts.get("final_count") or 0),
         "delivery_count": int(counts.get("delivery_count") or 0),
         **(extra or {}),
@@ -496,7 +582,10 @@ def run_daily_summary(
     run_id = run_id or _new_run_id("sum")
     output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
     summary_path = output_root / "summary.md"
-    prompt_path = output_root / "prompt.md"
+    important_summary_path = output_root / "important-summary.md"
+    important_prompt_path = output_root / "important-summary.prompt.md"
+    point_summary_path = output_root / "point-summary.md"
+    point_prompt_path = output_root / "point-summary.prompt.md"
     output_root.mkdir(parents=True, exist_ok=True)
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
     progress_state = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
@@ -528,7 +617,11 @@ def run_daily_summary(
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
                 provider=config.daily.ai.provider,
-                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                origin_count=int(
+                    package_payload.get("stats", {}).get("point_origin_count")
+                    or package_payload.get("stats", {}).get("origin_count")
+                    or 0
+                ),
                 group_count=len(package_payload.get("normal_groups") or []),
                 image_count=image_count_estimate,
                 progress_total=int(progress_counts.get("total") or 0),
@@ -541,20 +634,38 @@ def run_daily_summary(
         if progress_callback:
             progress_callback(dict(progress_state))
 
+    message_point_records: list[DailyMessagePointRecord] = []
+
+    def persist_message_points(points: list[dict[str, Any]]) -> None:
+        nonlocal message_point_records
+        message_point_records = _build_message_point_records(
+            run_id=run_id,
+            package_run_id=str(package_run_id),
+            package_run=package_run,
+            provider=config.daily.ai.provider,
+            points=points,
+        )
+        store.persist_daily_message_points(run_id, message_point_records)
+
     update_progress(0, "starting summary", "starting")
     try:
         analysis = _run_ai_analysis_pipeline(
             config,
             package_payload,
             output_root,
-            final_summary_path=summary_path,
-            final_prompt_path=prompt_path,
+            combined_summary_path=summary_path,
+            important_summary_path=important_summary_path,
+            important_prompt_path=important_prompt_path,
+            point_summary_path=point_summary_path,
+            point_prompt_path=point_prompt_path,
+            points_ready_callback=persist_message_points,
             progress_callback=update_progress,
             cancel_check=cancel_check,
             process_callback=process_callback,
         )
         image_paths = _collect_image_paths(package_payload)
-        summary_text = str((analysis.get("final") or {}).get("content") or "")
+        important_summary_text = str((analysis.get("important_summary") or {}).get("content") or "")
+        point_summary_text = str((analysis.get("point_summary") or {}).get("content") or "")
         _write_summary_analysis_json(
             output_root / "summary.json",
             run_id=run_id,
@@ -572,26 +683,48 @@ def run_daily_summary(
             package_payload=package_payload,
             provider=config.daily.ai.provider,
             summary_path=summary_path,
-            summary_text=summary_text,
             image_paths=image_paths,
             analysis=analysis,
         )
-        delivery_result = None
-        delivery_content = None
+        delivery_result: dict[str, Any] | None = None
+        delivery_contents: list[tuple[str, str]] = []
         outbox_items: list[dict[str, Any]] = []
         if delivery.enabled:
-            delivery_content = _summary_delivery_markdown(
-                package_run=package_run,
-                package_payload=package_payload,
-                provider=config.daily.ai.provider,
-                summary_text=summary_text,
+            if package_payload.get("important_origins"):
+                delivery_contents.append(
+                    (
+                        "important_summary",
+                        _summary_delivery_markdown(
+                            package_run=package_run,
+                            package_payload=package_payload,
+                            provider=config.daily.ai.provider,
+                            summary_text=important_summary_text,
+                            summary_kind="important",
+                        ),
+                    )
+                )
+            delivery_contents.append(
+                (
+                    "point_summary",
+                    _summary_delivery_markdown(
+                        package_run=package_run,
+                        package_payload=package_payload,
+                        provider=config.daily.ai.provider,
+                        summary_text=point_summary_text,
+                        summary_kind="point",
+                    ),
+                )
             )
             if defer_delivery:
                 from tele_mess_core.telegram.delivery import split_telegram_message
 
-                chunks = split_telegram_message(delivery_content)
-                for index, chunk in enumerate(chunks, start=1):
-                    body = f"[{index}/{len(chunks)}]\n\n{chunk}" if len(chunks) > 1 else chunk
+                pending_chunks = [
+                    (kind, chunk)
+                    for kind, content in delivery_contents
+                    for chunk in split_telegram_message(content)
+                ]
+                for index, (kind, chunk) in enumerate(pending_chunks, start=1):
+                    body = f"[{index}/{len(pending_chunks)}]\n\n{chunk}" if len(pending_chunks) > 1 else chunk
                     outbox_items.append(
                         {
                             "outbox_id": f"out_{run_id}_{index}",
@@ -601,17 +734,29 @@ def run_daily_summary(
                             "origin_id": delivery.origin_id,
                             "topic_id": delivery.topic_id,
                             "chunk_index": index,
-                            "chunk_count": len(chunks),
+                            "chunk_count": len(pending_chunks),
+                            "content_kind": kind,
                             "content": body,
                         }
                     )
-        store.persist_daily_summary_batch(summary_records, outbox_items)
+        store.persist_daily_summary_batch(
+            summary_records,
+            outbox_items,
+            message_points=message_point_records,
+        )
         if delivery.enabled:
+            delivery_start = max(
+                0,
+                int(progress_counts.get("total") or 0) - int(progress_counts.get("delivery_count") or 0),
+            )
             update_progress(
-                max(0, int(progress_counts.get("total") or 0) - 1),
-                "queueing daily summary delivery" if defer_delivery else "delivering daily summary",
+                delivery_start,
+                "queueing daily deliveries" if defer_delivery else "delivering daily summaries",
                 "delivery",
-                {"delivery": _delivery_target_payload(delivery)},
+                {
+                    "delivery": _delivery_target_payload(delivery),
+                    "delivery_kinds": [kind for kind, _ in delivery_contents],
+                },
             )
             if defer_delivery:
                 delivery_result = {
@@ -619,15 +764,30 @@ def run_daily_summary(
                     "status": "queued",
                     "message_count": len(outbox_items),
                     "outbox_ids": [item["outbox_id"] for item in outbox_items],
+                    "delivery_kinds": [kind for kind, _ in delivery_contents],
                 }
             else:
-                delivery_result = deliver_daily_summary(
-                    store,
-                    config,
-                    str(delivery_content or ""),
-                    telegram_runtime=telegram_runtime,
-                    delivery=delivery,
-                )
+                delivery_results: list[dict[str, Any]] = []
+                for delivery_index, (kind, content) in enumerate(delivery_contents, start=1):
+                    result = deliver_daily_summary(
+                        store,
+                        config,
+                        content,
+                        telegram_runtime=telegram_runtime,
+                        delivery=delivery,
+                    )
+                    delivery_results.append({"kind": kind, "result": result})
+                    update_progress(
+                        delivery_start + delivery_index,
+                        f"delivered {kind}",
+                        "delivery",
+                        {"delivery": result, "delivery_kind": kind},
+                    )
+                delivery_result = {
+                    **_delivery_target_payload(delivery),
+                    "status": "sent",
+                    "deliveries": delivery_results,
+                }
             _write_summary_analysis_json(
                 output_root / "summary.json",
                 run_id=run_id,
@@ -640,7 +800,7 @@ def run_daily_summary(
             )
             update_progress(
                 int(progress_counts.get("total") or 0),
-                "queued daily summary delivery" if defer_delivery else "delivered daily summary",
+                "queued daily deliveries" if defer_delivery else "delivered daily summaries",
                 "delivery",
                 {"delivery": delivery_result},
             )
@@ -655,7 +815,11 @@ def run_daily_summary(
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
                 provider=config.daily.ai.provider,
-                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                origin_count=int(
+                    package_payload.get("stats", {}).get("point_origin_count")
+                    or package_payload.get("stats", {}).get("origin_count")
+                    or 0
+                ),
                 group_count=len(package_payload.get("normal_groups") or []),
                 image_count=len(image_paths),
                 progress_total=int(progress_counts.get("total") or 0),
@@ -686,7 +850,11 @@ def run_daily_summary(
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
                 provider=config.daily.ai.provider,
-                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                origin_count=int(
+                    package_payload.get("stats", {}).get("point_origin_count")
+                    or package_payload.get("stats", {}).get("origin_count")
+                    or 0
+                ),
                 group_count=len(package_payload.get("normal_groups") or []),
                 image_count=image_count_estimate,
                 progress_total=int(progress_counts.get("total") or 0),
@@ -713,7 +881,11 @@ def run_daily_summary(
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
                 provider=config.daily.ai.provider,
-                origin_count=int(package_payload.get("stats", {}).get("origin_count") or 0),
+                origin_count=int(
+                    package_payload.get("stats", {}).get("point_origin_count")
+                    or package_payload.get("stats", {}).get("origin_count")
+                    or 0
+                ),
                 group_count=len(package_payload.get("normal_groups") or []),
                 image_count=image_count_estimate,
                 progress_total=int(progress_counts.get("total") or 0),
@@ -894,14 +1066,20 @@ def _summary_delivery_markdown(
     package_payload: dict[str, Any],
     provider: str,
     summary_text: str,
+    summary_kind: str = "important",
 ) -> str:
     date = str(package_payload.get("date") or package_run.get("date") or "unknown")
     timezone_name = str(package_payload.get("timezone") or package_run.get("timezone") or "")
-    tags = _collect_summary_tags(package_payload)
-    hashtags = [_telegram_hashtag(tag) for tag in tags]
-    tag_text = " ".join(hashtag for hashtag in hashtags if hashtag) or "#untagged"
+    if summary_kind == "point":
+        title = "# Daily Message Point Summary"
+        tag_text = "#point"
+    else:
+        title = "# Important Daily Summary"
+        tags = _collect_important_summary_tags(package_payload)
+        hashtags = [_telegram_hashtag(tag) for tag in tags]
+        tag_text = " ".join(hashtag for hashtag in hashtags if hashtag) or "#important"
     header = [
-        "# Daily Summary",
+        title,
         "",
         f"- Date: `{date}`",
     ]
@@ -931,7 +1109,6 @@ def _build_summary_records(
     package_payload: dict[str, Any],
     provider: str,
     summary_path: Path,
-    summary_text: str,
     image_paths: list[str],
     analysis: dict[str, Any] | None = None,
 ) -> list[DailySummaryRecord]:
@@ -942,46 +1119,6 @@ def _build_summary_records(
     timezone_name = str(package_run.get("timezone") or package_payload.get("timezone") or "")
     scope_json = json.dumps(package_payload.get("scope") or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
     records: list[DailySummaryRecord] = []
-
-    for artifact in analysis.get("normal_groups") or []:
-        metadata = artifact.get("metadata") or {}
-        group_name = str(metadata.get("group_name") or "untagged")
-        tags = parse_tags(metadata.get("group_tags"))
-        origin_refs = list(metadata.get("origin_refs") or [])
-        content = str(artifact.get("content") or "")
-        content_json = _summary_record_content_json(
-            package_run_id=package_run_id,
-            package_run=package_run,
-            record_type="tag_group",
-            tags=tags,
-            image_paths=image_paths,
-            artifact=artifact,
-            final_summary_path=summary_path,
-        )
-        records.append(
-            DailySummaryRecord(
-                summary_id=f"{run_id}--group--{_slug(group_name)}",
-                run_id=run_id,
-                package_run_id=package_run_id,
-                date=date or None,
-                timezone=timezone_name or None,
-                scope_json=scope_json,
-                tags_json=json.dumps(tags, ensure_ascii=False),
-                tags_csv=",".join(tags),
-                important=False,
-                provider=provider,
-                title=f"Daily Summary {date} - {group_name}" if date else f"Daily Summary - {group_name}",
-                content_md=content,
-                content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
-                summary_path=str(artifact.get("output_path") or summary_path),
-                origin_count=len(origin_refs),
-                group_count=1,
-                image_count=0,
-                content_length=len(content),
-                created_at=now,
-                updated_at=now,
-            )
-        )
 
     for artifact in analysis.get("important_origins") or []:
         metadata = artifact.get("metadata") or {}
@@ -1004,6 +1141,7 @@ def _build_summary_records(
             DailySummaryRecord(
                 summary_id=f"{run_id}--important--{_slug(origin_ref or title)}",
                 run_id=run_id,
+                record_type="important_origin",
                 package_run_id=package_run_id,
                 date=date or None,
                 timezone=timezone_name or None,
@@ -1025,43 +1163,145 @@ def _build_summary_records(
             )
         )
 
-    if records:
-        return records
+    important_summary = analysis.get("important_summary") or {}
+    if package_payload.get("important_origins") and important_summary:
+        important_tags = _collect_important_summary_tags(package_payload)
+        important_content = str(important_summary.get("content") or "")
+        content_json = _summary_record_content_json(
+            package_run_id=package_run_id,
+            package_run=package_run,
+            record_type="important_daily",
+            tags=important_tags,
+            image_paths=image_paths,
+            artifact=important_summary,
+            final_summary_path=summary_path,
+        )
+        records.append(
+            DailySummaryRecord(
+                summary_id=f"{run_id}--important-daily",
+                run_id=run_id,
+                record_type="important_daily",
+                package_run_id=package_run_id,
+                date=date or None,
+                timezone=timezone_name or None,
+                scope_json=scope_json,
+                tags_json=json.dumps(important_tags, ensure_ascii=False),
+                tags_csv=",".join(important_tags),
+                important=True,
+                provider=provider,
+                title=f"Important Daily Summary {date}" if date else "Important Daily Summary",
+                content_md=important_content,
+                content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
+                summary_path=str(important_summary.get("output_path") or summary_path),
+                origin_count=len(package_payload.get("important_origins") or []),
+                group_count=0,
+                image_count=len(image_paths),
+                content_length=len(important_content),
+                created_at=now,
+                updated_at=now,
+            )
+        )
 
-    content_json = _summary_record_content_json(
+    point_summary = analysis.get("point_summary") or {}
+    point_content = str(point_summary.get("content") or "")
+    point_tags = ["point"]
+    point_content_json = _summary_record_content_json(
         package_run_id=package_run_id,
         package_run=package_run,
-        record_type="final",
-        tags=_collect_summary_tags(package_payload),
-        image_paths=image_paths,
-        artifact=analysis.get("final") or {},
+        record_type="point_daily",
+        tags=point_tags,
+        image_paths=[],
+        artifact=point_summary,
         final_summary_path=summary_path,
-        full_analysis=analysis,
     )
-    return [
+    records.append(
         DailySummaryRecord(
-            summary_id=run_id,
+            summary_id=f"{run_id}--point-daily",
             run_id=run_id,
+            record_type="point_daily",
             package_run_id=package_run_id,
             date=date or None,
             timezone=timezone_name or None,
             scope_json=scope_json,
-            tags_json=json.dumps(_collect_summary_tags(package_payload), ensure_ascii=False),
-            tags_csv=",".join(_collect_summary_tags(package_payload)),
-            important=bool(package_payload.get("important_origins") or stats.get("important_origin_count")),
+            tags_json=json.dumps(point_tags, ensure_ascii=False),
+            tags_csv="point",
+            important=False,
             provider=provider,
-            title=f"Daily Summary {date}" if date else "Daily Summary",
-            content_md=summary_text,
-            content_json=json.dumps(content_json, ensure_ascii=False, sort_keys=True),
-            summary_path=str(summary_path),
-            origin_count=int(stats.get("origin_count") or 0),
-            group_count=len(package_payload.get("normal_groups") or []),
-            image_count=len(image_paths),
-            content_length=len(summary_text),
+            title=f"Daily Message Point Summary {date}" if date else "Daily Message Point Summary",
+            content_md=point_content,
+            content_json=json.dumps(point_content_json, ensure_ascii=False, sort_keys=True),
+            summary_path=str(point_summary.get("output_path") or summary_path),
+            origin_count=int(stats.get("point_origin_count") or stats.get("origin_count") or 0),
+            group_count=0,
+            image_count=0,
+            content_length=len(point_content),
             created_at=now,
             updated_at=now,
         )
-    ]
+    )
+    return records
+
+
+def _build_message_point_records(
+    *,
+    run_id: str,
+    package_run_id: str,
+    package_run: dict[str, Any],
+    provider: str,
+    points: list[dict[str, Any]],
+) -> list[DailyMessagePointRecord]:
+    date = str(package_run.get("date") or "")
+    timezone_name = str(package_run.get("timezone") or "")
+    now = utc_now_iso()
+    records: list[DailyMessagePointRecord] = []
+    for index, point in enumerate(points, start=1):
+        source_refs = list(point.get("source_refs") or [])
+        identity = json.dumps(
+            {
+                "run_id": run_id,
+                "source": point.get("source"),
+                "account_id": point.get("account_id"),
+                "origin_id": point.get("origin_id"),
+                "topic_id": point.get("topic_id"),
+                "source_refs": source_refs,
+                "content": point.get("content"),
+                "index": index,
+            },
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        )
+        point_id = f"point_{hashlib.sha256(identity.encode('utf-8')).hexdigest()[:24]}"
+        tags = parse_tags(point.get("tags"))
+        records.append(
+            DailyMessagePointRecord(
+                point_id=point_id,
+                run_id=run_id,
+                package_run_id=package_run_id,
+                date=date,
+                timezone=timezone_name,
+                source=str(point.get("source") or SOURCE_TELEGRAM),
+                account_id=str(point.get("account_id") or ""),
+                origin_id=int(point.get("origin_id") or 0),
+                topic_id=int(point.get("topic_id") or 0),
+                origin_title=str(point.get("origin_title") or "") or None,
+                message_id=int(point["message_id"]) if point.get("message_id") is not None else None,
+                occurred_at=str(point.get("local_occurred_at") or point.get("occurred_at") or date),
+                tags_json=json.dumps(tags, ensure_ascii=False),
+                tags_csv=",".join(tags),
+                content=str(point.get("content") or ""),
+                telegram_deeplink=str(point.get("telegram_deeplink") or "") or None,
+                permalink=str(point.get("permalink") or "") or None,
+                importance_score=int(point.get("importance_score") or 3),
+                importance_reason=str(point.get("importance_reason") or "") or None,
+                origin_important=bool(point.get("origin_important")),
+                source_refs_json=json.dumps(source_refs, ensure_ascii=False),
+                provider=provider,
+                created_at=now,
+                updated_at=now,
+            )
+        )
+    return records
 
 
 def _summary_record_content_json(
@@ -1095,30 +1335,15 @@ def _origin_ref_from_summary(origin: dict[str, Any]) -> str:
     return f"{origin.get('account_id')}/{origin.get('origin_id')}/{origin.get('topic_id') or 0}"
 
 
-def _collect_summary_tags(package_payload: dict[str, Any]) -> list[str]:
+def _collect_important_summary_tags(package_payload: dict[str, Any]) -> list[str]:
     tags: list[str] = []
     seen: set[str] = set()
-
-    def add_many(values: Any) -> None:
-        for tag in parse_tags(values):
-            normalized = normalize_tag(tag)
-            if not normalized or normalized in seen:
-                continue
-            seen.add(normalized)
-            tags.append(tag)
-
-    scope = package_payload.get("scope") or {}
-    if isinstance(scope, dict):
-        add_many(scope.get("tags"))
-    for tag_group in package_payload.get("tag_groups") or []:
-        if isinstance(tag_group, dict):
-            add_many(tag_group.get("tags"))
-    for group in package_payload.get("normal_groups") or []:
-        add_many(group.get("tags"))
-        for origin_payload in group.get("origins") or []:
-            add_many((origin_payload.get("origin") or {}).get("tags"))
     for origin_payload in package_payload.get("important_origins") or []:
-        add_many((origin_payload.get("origin") or {}).get("tags"))
+        for tag in parse_tags((origin_payload.get("origin") or {}).get("tags")):
+            normalized = normalize_tag(tag)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                tags.append(tag)
     return tags
 
 
@@ -1127,8 +1352,12 @@ def _run_ai_analysis_pipeline(
     package_payload: dict[str, Any],
     output_root: Path,
     *,
-    final_summary_path: Path,
-    final_prompt_path: Path,
+    combined_summary_path: Path,
+    important_summary_path: Path,
+    important_prompt_path: Path,
+    point_summary_path: Path,
+    point_prompt_path: Path,
+    points_ready_callback: Callable[[list[dict[str, Any]]], None] | None = None,
     progress_callback: Callable[[int, str, str, dict[str, Any] | None], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
@@ -1158,77 +1387,60 @@ def _run_ai_analysis_pipeline(
         process_callback=process_callback,
     )
 
-    normal_origin_artifacts: list[dict[str, Any]] = []
-    normal_origin_by_ref: dict[str, dict[str, Any]] = {}
-    normal_origin_dir = stages_dir / "normal-origins"
-    for group in package_payload.get("normal_groups") or []:
-        group_name = str(group.get("name") or "group")
-        for origin_payload in group.get("origins") or []:
-            origin_ref = _origin_ref(origin_payload)
-            mark_started(
-                f"analyzing origin {origin_ref}",
-                "normal_origin",
-                {"group_name": group_name, "origin_ref": origin_ref},
-            )
+    point_artifacts: list[dict[str, Any]] = []
+    message_points: list[dict[str, Any]] = []
+    point_dir = stages_dir / "message-points"
+    for origin_payload in _iter_point_origin_payloads(package_payload):
+        origin_ref = _origin_ref(origin_payload)
+        messages = list(origin_payload.get("messages") or [])
+        chunk_count = (len(messages) + MESSAGE_POINT_CHUNK_SIZE - 1) // MESSAGE_POINT_CHUNK_SIZE
+        for chunk_index, start in enumerate(range(0, len(messages), MESSAGE_POINT_CHUNK_SIZE), start=1):
+            chunk = messages[start : start + MESSAGE_POINT_CHUNK_SIZE]
+            label = f"extracting points {origin_ref} ({chunk_index}/{chunk_count})"
+            progress_extra = {
+                "origin_ref": origin_ref,
+                "chunk_index": chunk_index,
+                "chunk_count": chunk_count,
+                "message_count": len(chunk),
+            }
+            mark_started(label, "message_points", progress_extra)
             if cancel_check:
                 cancel_check()
-            prompt = _normal_origin_key_prompt(group, origin_payload, media_artifacts)
             artifact = _run_ai_task(
                 config,
-                "normal_origin_key_extraction",
-                prompt,
-                normal_origin_dir / f"{_slug(group_name)}--{_slug(origin_ref)}.md",
+                "message_point_extraction",
+                _message_point_extraction_prompt(origin_payload, chunk, media_artifacts),
+                point_dir / f"{_slug(origin_ref)}--{chunk_index:03d}.json",
                 image_paths=[],
                 metadata={
-                    "group_name": group_name,
-                    "group_tags": group.get("tags") or [],
                     "origin": origin_payload.get("origin") or {},
+                    **progress_extra,
                 },
+                output_schema=_message_point_output_schema(),
                 cancel_check=cancel_check,
                 process_callback=process_callback,
             )
-            normal_origin_artifacts.append(artifact)
-            normal_origin_by_ref[origin_ref] = artifact
+            extracted = _validated_message_points(
+                str(artifact.get("content") or ""),
+                origin_payload=origin_payload,
+                messages=chunk,
+            )
+            artifact["metadata"]["point_count"] = len(extracted)
+            point_artifacts.append(artifact)
+            message_points.extend(extracted)
             mark_completed(
-                f"analyzed origin {origin_ref}",
-                "normal_origin",
-                {"group_name": group_name, "origin_ref": origin_ref},
+                f"extracted {len(extracted)} points from {origin_ref} ({chunk_index}/{chunk_count})",
+                "message_points",
+                {**progress_extra, "point_count": len(extracted)},
             )
 
-    normal_group_artifacts: list[dict[str, Any]] = []
-    group_dir = stages_dir / "normal-groups"
-    for group in package_payload.get("normal_groups") or []:
-        group_name = str(group.get("name") or "group")
-        origin_refs = [_origin_ref(origin_payload) for origin_payload in group.get("origins") or []]
-        origin_artifacts = [normal_origin_by_ref[ref] for ref in origin_refs if ref in normal_origin_by_ref]
-        mark_started(
-            f"analyzing group {group_name}",
-            "normal_group",
-            {"group_name": group_name, "origin_count": len(origin_refs)},
-        )
-        if cancel_check:
-            cancel_check()
-        prompt = _normal_group_analysis_prompt(group, origin_artifacts)
-        artifact = _run_ai_task(
-            config,
-            "normal_group_analysis",
-            prompt,
-            group_dir / f"{_slug(group_name)}.md",
-            image_paths=[],
-            metadata={
-                "group_name": group_name,
-                "group_tags": group.get("tags") or [],
-                "origin_refs": origin_refs,
-            },
-            cancel_check=cancel_check,
-            process_callback=process_callback,
-        )
-        normal_group_artifacts.append(artifact)
-        mark_completed(
-            f"analyzed group {group_name}",
-            "normal_group",
-            {"group_name": group_name, "origin_count": len(origin_refs)},
-        )
+    mark_started(
+        f"persisting {len(message_points)} message points",
+        "message_points",
+        {"point_count": len(message_points)},
+    )
+    if points_ready_callback:
+        points_ready_callback(list(message_points))
 
     important_artifacts: list[dict[str, Any]] = []
     important_dir = stages_dir / "important-origins"
@@ -1263,37 +1475,83 @@ def _run_ai_analysis_pipeline(
             {"origin_ref": origin_ref, "image_count": len(image_paths)},
         )
 
-    mark_started("writing final summary", "final")
+    if important_artifacts:
+        mark_started("writing important daily summary", "important_summary")
+        if cancel_check:
+            cancel_check()
+        important_artifact = _run_ai_task(
+            config,
+            "important_daily_summary",
+            _important_daily_summary_prompt(
+                package_payload,
+                important_artifacts=important_artifacts,
+                media_artifacts=media_artifacts,
+            ),
+            important_summary_path,
+            image_paths=[],
+            prompt_path=important_prompt_path,
+            metadata={
+                "package_run_id": package_payload.get("run_id"),
+                "date": package_payload.get("date"),
+                "timezone": package_payload.get("timezone"),
+            },
+            cancel_check=cancel_check,
+            process_callback=process_callback,
+        )
+        mark_completed("wrote important daily summary", "important_summary")
+    else:
+        important_artifact = _static_artifact(
+            task="important_daily_summary",
+            output_path=important_summary_path,
+            content="# Important Daily Summary\n\n_No important-origin messages were archived for this date._\n",
+            metadata={"package_run_id": package_payload.get("run_id")},
+        )
+
+    mark_started("writing daily point summary", "point_summary", {"point_count": len(message_points)})
     if cancel_check:
         cancel_check()
-    final_prompt = _final_daily_summary_prompt(
-        package_payload,
-        normal_group_artifacts=normal_group_artifacts,
-        important_artifacts=important_artifacts,
-        media_artifacts=media_artifacts,
+    if message_points:
+        point_summary_artifact = _run_ai_task(
+            config,
+            "daily_point_summary",
+            _daily_point_summary_prompt(package_payload, message_points),
+            point_summary_path,
+            image_paths=[],
+            prompt_path=point_prompt_path,
+            metadata={
+                "package_run_id": package_payload.get("run_id"),
+                "date": package_payload.get("date"),
+                "timezone": package_payload.get("timezone"),
+                "point_count": len(message_points),
+            },
+            cancel_check=cancel_check,
+            process_callback=process_callback,
+        )
+    else:
+        point_summary_artifact = _static_artifact(
+            task="daily_point_summary",
+            output_path=point_summary_path,
+            content="# Daily Message Point Summary\n\n_No message points were extracted for this date._\n",
+            metadata={
+                "package_run_id": package_payload.get("run_id"),
+                "point_count": 0,
+            },
+        )
+    mark_completed("wrote daily point summary", "point_summary", {"point_count": len(message_points)})
+
+    _write_combined_daily_summary(
+        combined_summary_path,
+        important_content=str(important_artifact.get("content") or ""),
+        point_content=str(point_summary_artifact.get("content") or ""),
     )
-    final_artifact = _run_ai_task(
-        config,
-        "final_daily_summary",
-        final_prompt,
-        final_summary_path,
-        image_paths=[],
-        prompt_path=final_prompt_path,
-        metadata={
-            "package_run_id": package_payload.get("run_id"),
-            "date": package_payload.get("date"),
-            "timezone": package_payload.get("timezone"),
-        },
-        cancel_check=cancel_check,
-        process_callback=process_callback,
-    )
-    mark_completed("wrote final summary", "final")
     analysis = {
         "media": list(media_artifacts.values()),
-        "normal_origins": normal_origin_artifacts,
-        "normal_groups": normal_group_artifacts,
+        "message_point_extractions": point_artifacts,
+        "message_points": message_points,
         "important_origins": important_artifacts,
-        "final": final_artifact,
+        "important_summary": important_artifact,
+        "point_summary": point_summary_artifact,
+        "final": important_artifact,
     }
     _write_json(output_root / "analysis.json", _analysis_record_payload(analysis))
     return analysis
@@ -1363,6 +1621,7 @@ def _run_ai_task(
     image_paths: list[str],
     metadata: dict[str, Any],
     prompt_path: Path | None = None,
+    output_schema: dict[str, Any] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> dict[str, Any]:
@@ -1372,12 +1631,19 @@ def _run_ai_task(
     prompt_path = prompt_path or output_path.with_suffix(".prompt.md")
     prompt_path.parent.mkdir(parents=True, exist_ok=True)
     prompt_path.write_text(prompt, encoding="utf-8")
+    output_schema_path = output_path.with_suffix(".schema.json") if output_schema is not None else None
+    if output_schema_path is not None:
+        output_schema_path.write_text(
+            json.dumps(output_schema, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
     content = _run_summary_provider(
         config,
         prompt,
         output_path,
         image_paths,
         task_name=task_name,
+        output_schema_path=output_schema_path,
         cancel_check=cancel_check,
         process_callback=process_callback,
     )
@@ -1390,6 +1656,7 @@ def _run_ai_task(
         "id": _slug(output_path.stem),
         "output_path": str(output_path),
         "prompt_path": str(prompt_path),
+        "output_schema_path": str(output_schema_path) if output_schema_path else None,
         "content": content,
         "image_paths": image_paths,
         "generated_by_ai": config.daily.ai.provider != "disabled",
@@ -1397,17 +1664,285 @@ def _run_ai_task(
     }
 
 
+def _static_artifact(
+    *,
+    task: str,
+    output_path: Path,
+    content: str,
+    metadata: dict[str, Any],
+) -> dict[str, Any]:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    output_path.write_text(content, encoding="utf-8")
+    return {
+        "task": task,
+        "id": _slug(output_path.stem),
+        "output_path": str(output_path),
+        "prompt_path": None,
+        "output_schema_path": None,
+        "content": content,
+        "image_paths": [],
+        "generated_by_ai": False,
+        "metadata": metadata,
+    }
+
+
+def _message_point_output_schema() -> dict[str, Any]:
+    return {
+        "type": "object",
+        "additionalProperties": False,
+        "properties": {
+            "points": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "properties": {
+                        "source_message_ids": {
+                            "type": "array",
+                            "items": {"type": "integer"},
+                            "minItems": 1,
+                            "maxItems": 20,
+                        },
+                        "tags": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "maxItems": 12,
+                        },
+                        "content": {"type": "string"},
+                        "importance_score": {"type": "integer", "minimum": 1, "maximum": 5},
+                        "importance_reason": {"type": "string"},
+                    },
+                    "required": [
+                        "source_message_ids",
+                        "tags",
+                        "content",
+                        "importance_score",
+                        "importance_reason",
+                    ],
+                },
+            }
+        },
+        "required": ["points"],
+    }
+
+
+def _message_point_extraction_prompt(
+    origin_payload: dict[str, Any],
+    messages: list[dict[str, Any]],
+    media_artifacts: dict[str, dict[str, Any]],
+) -> str:
+    origin = origin_payload.get("origin") or {}
+    tag_instruction = _tag_specific_instruction(origin.get("tags"))
+    evidence: list[dict[str, Any]] = []
+    for message in messages:
+        media_evidence = []
+        for media in message.get("media_files") or []:
+            file_path = str(media.get("file_path") or "")
+            artifact = media_artifacts.get(file_path) or {}
+            media_evidence.append(
+                {
+                    "file_path": file_path,
+                    "file_name": Path(file_path).name if file_path else "",
+                    "media_kind": media.get("media_kind"),
+                    "analysis": _truncate_text(str(artifact.get("content") or ""), 3000),
+                }
+            )
+        evidence.append(
+            {
+                "message_id": message.get("message_id"),
+                "speaker": message.get("speaker"),
+                "sent_at": message.get("sent_at"),
+                "local_sent_at": message.get("local_sent_at"),
+                "text": message.get("text"),
+                "media": media_evidence,
+            }
+        )
+    return (
+        "TASK: message_point_extraction\n"
+        "你是 Telegram 每日消息点提取器。请从当前批次中提取独立、可复用、值得后续查看的信息点，"
+        "覆盖事实、事件、公告、观点变化、资源、链接、数值、时间、决定、行动项、风险与机会。"
+        "合并表达同一件事的相邻消息，跳过纯表情、问候、重复转发和没有上下文的低价值闲聊。\n"
+        "每个 point 只返回输入中真实存在的 `source_message_ids`；不要返回时间或 URL，"
+        "系统会从这些消息 ID 回填可信的时间和 Telegram deeplink。"
+        "`content` 必须是一句可脱离聊天上下文理解的中文描述，不得编造输入中没有的信息。\n"
+        "`importance_score` 使用 1-5：1=低价值背景，2=可参考，3=有明确价值，4=重要，5=紧急或高影响；"
+        "来源是否 important 与单个 point 的 score 是两个不同概念。"
+        "`tags` 使用简短内容标签，不带 #；`importance_reason` 用一句话说明评分依据。\n"
+        "严格按提供的 JSON Schema 输出，不要输出 Markdown、代码围栏或额外说明。\n\n"
+        f"{tag_instruction}\n"
+        "Origin metadata:\n"
+        f"{json.dumps(origin, ensure_ascii=False, indent=2)}\n\n"
+        "Message evidence:\n"
+        f"{json.dumps(evidence, ensure_ascii=False, indent=2)}\n"
+    )
+
+
+def _validated_message_points(
+    content: str,
+    *,
+    origin_payload: dict[str, Any],
+    messages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    payload = _parse_json_object(content)
+    raw_points = payload.get("points") if isinstance(payload, dict) else None
+    if not isinstance(raw_points, list):
+        return []
+    message_by_id = {
+        int(message["message_id"]): message
+        for message in messages
+        if message.get("message_id") is not None
+    }
+    origin = origin_payload.get("origin") or {}
+    origin_tags = parse_tags(origin.get("tags"))
+    normalized: list[dict[str, Any]] = []
+    seen: set[tuple[tuple[int, ...], str]] = set()
+    for raw in raw_points:
+        if not isinstance(raw, dict):
+            continue
+        source_ids: list[int] = []
+        for value in raw.get("source_message_ids") or []:
+            try:
+                message_id = int(value)
+            except (TypeError, ValueError):
+                continue
+            if message_id in message_by_id and message_id not in source_ids:
+                source_ids.append(message_id)
+        content_text = str(raw.get("content") or "").strip()
+        try:
+            importance_score = int(raw.get("importance_score"))
+        except (TypeError, ValueError):
+            continue
+        if not source_ids or not content_text or not 1 <= importance_score <= 5:
+            continue
+        dedupe_key = (tuple(source_ids), content_text.casefold())
+        if dedupe_key in seen:
+            continue
+        seen.add(dedupe_key)
+        source_messages = [message_by_id[message_id] for message_id in source_ids]
+        primary = source_messages[0]
+        tags = parse_tags([*origin_tags, *parse_tags(raw.get("tags"))])
+        deeplink = next(
+            (str(message.get("telegram_deeplink")) for message in source_messages if message.get("telegram_deeplink")),
+            None,
+        )
+        permalink = next(
+            (str(message.get("permalink")) for message in source_messages if message.get("permalink")),
+            None,
+        )
+        normalized.append(
+            {
+                "source": str(origin.get("source") or SOURCE_TELEGRAM),
+                "account_id": str(origin.get("account_id") or ""),
+                "origin_id": int(origin.get("origin_id") or 0),
+                "topic_id": int(origin.get("topic_id") or 0),
+                "origin_title": str(origin.get("title") or "") or None,
+                "origin_important": bool(origin.get("important")),
+                "message_id": int(primary["message_id"]),
+                "occurred_at": str(primary.get("sent_at") or "") or None,
+                "local_occurred_at": str(primary.get("local_sent_at") or "") or None,
+                "tags": tags,
+                "content": content_text,
+                "telegram_deeplink": deeplink,
+                "permalink": permalink,
+                "importance_score": importance_score,
+                "importance_reason": str(raw.get("importance_reason") or "").strip() or None,
+                "source_message_ids": source_ids,
+                "source_refs": [
+                    f"{origin.get('account_id')}/{origin.get('origin_id')}/{origin.get('topic_id') or 0}/{message_id}"
+                    for message_id in source_ids
+                ],
+            }
+        )
+    return normalized
+
+
+def _parse_json_object(content: str) -> dict[str, Any]:
+    text = str(content or "").strip()
+    fenced = re.fullmatch(r"```(?:json)?\s*(.*?)\s*```", text, flags=re.DOTALL | re.IGNORECASE)
+    if fenced:
+        text = fenced.group(1).strip()
+    try:
+        value = json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start < 0 or end <= start:
+            return {}
+        try:
+            value = json.loads(text[start : end + 1])
+        except json.JSONDecodeError:
+            return {}
+    return value if isinstance(value, dict) else {}
+
+
+def _daily_point_summary_prompt(
+    package_payload: dict[str, Any],
+    message_points: list[dict[str, Any]],
+) -> str:
+    compact_points = [
+        {
+            "time": point.get("local_occurred_at") or point.get("occurred_at"),
+            "tags": point.get("tags") or [],
+            "content": point.get("content"),
+            "telegram_deeplink": point.get("telegram_deeplink"),
+            "importance_score": point.get("importance_score"),
+            "origin_title": point.get("origin_title"),
+            "origin_ref": f"{point.get('account_id')}/{point.get('origin_id')}/{point.get('topic_id') or 0}",
+            "source_message_ids": point.get("source_message_ids") or [],
+        }
+        for point in message_points
+    ]
+    return (
+        "TASK: daily_point_summary\n"
+        "你是 Telegram 每日消息点日报编辑器。输入是已经验证并持久化前标准化的 message points；"
+        "不要回看或重新概括原始消息，也不要添加输入之外的事实。\n"
+        "输出可直接发送到 Telegram 的 Markdown：先给出 3-8 条 Highest Priority Points，"
+        "再按时间段和 tag 聚合当日信息点。每个主题保留关键内容、重要程度和可用的 Telegram deeplink；"
+        "合并重复 point，但不要丢失不同来源的冲突、数值、日期、资源或行动项。"
+        "最后给出 Watch Next。不要输出逐条原始消息流水账，不要输出 JSON。\n\n"
+        "Daily metadata:\n"
+        f"{json.dumps({'date': package_payload.get('date'), 'timezone': package_payload.get('timezone'), 'point_count': len(compact_points)}, ensure_ascii=False, indent=2)}\n\n"
+        "Validated message points:\n"
+        f"{json.dumps(compact_points, ensure_ascii=False, indent=2)}\n"
+    )
+
+
+def _write_combined_daily_summary(
+    path: Path,
+    *,
+    important_content: str,
+    point_content: str,
+) -> None:
+    path.write_text(
+        "# Daily Analysis\n\n"
+        "## Important Full Summary\n\n"
+        + str(important_content or "").strip()
+        + "\n\n## Daily Message Point Summary\n\n"
+        + str(point_content or "").strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+
 def _analysis_record_payload(analysis: dict[str, Any]) -> dict[str, Any]:
     return {
-        "task_count": sum(
-            len(analysis.get(key) or [])
-            for key in ("media", "normal_origins", "normal_groups", "important_origins")
-        )
-        + (1 if analysis.get("final") else 0),
+        "task_count": (
+            len(analysis.get("media") or [])
+            + len(analysis.get("message_point_extractions") or [])
+            + len(analysis.get("important_origins") or [])
+            + (1 if analysis.get("important_summary") else 0)
+            + (1 if analysis.get("point_summary") else 0)
+        ),
         "media": [_artifact_payload(item) for item in analysis.get("media") or []],
-        "normal_origins": [_artifact_payload(item) for item in analysis.get("normal_origins") or []],
-        "normal_groups": [_artifact_payload(item) for item in analysis.get("normal_groups") or []],
+        "message_point_extractions": [
+            _artifact_payload(item) for item in analysis.get("message_point_extractions") or []
+        ],
+        "message_points": list(analysis.get("message_points") or []),
+        "normal_origins": [],
+        "normal_groups": [],
         "important_origins": [_artifact_payload(item) for item in analysis.get("important_origins") or []],
+        "important_summary": _artifact_payload(analysis.get("important_summary") or {}),
+        "point_summary": _artifact_payload(analysis.get("point_summary") or {}),
         "final": _artifact_payload(analysis.get("final") or {}),
     }
 
@@ -1420,6 +1955,7 @@ def _artifact_payload(artifact: dict[str, Any]) -> dict[str, Any]:
         "id": artifact.get("id"),
         "output_path": artifact.get("output_path"),
         "prompt_path": artifact.get("prompt_path"),
+        "output_schema_path": artifact.get("output_schema_path"),
         "image_paths": artifact.get("image_paths") or [],
         "generated_by_ai": bool(artifact.get("generated_by_ai")),
         "metadata": artifact.get("metadata") or {},
@@ -1513,73 +2049,6 @@ def _topic_summary_instruction() -> str:
     )
 
 
-def _normal_origin_key_prompt(
-    group: dict[str, Any],
-    origin_payload: dict[str, Any],
-    media_artifacts: dict[str, dict[str, Any]],
-) -> str:
-    payload = _compact_origin_for_analysis(origin_payload, media_artifacts)
-    tag_instruction = _tag_specific_instruction(
-        group.get("tags"),
-        (origin_payload.get("origin") or {}).get("tags"),
-    )
-    return (
-        "TASK: normal_origin_key_extraction\n"
-        "你是 Telegram 每日归档的关键信息提取器。当前 origin 不是 important，属于 normal tag group。\n"
-        "请从这个 origin 的消息中整理可用于组内汇总的话题、事件和关键内容，不要做最终日总结。"
-        "若 origin 是按 parent tags 进入本组的 topic，请只处理本 topic 的消息，后续再与 parent/group 整合。\n"
-        "内容保留规则：当 `truncated_message_count` 为 0 时，输入消息不超过 200 条，必须把全部消息作为证据扫描；"
-        "但输出要按话题/事件聚合，不要把全部消息逐条打印成列表。只有当消息超过 200 条并被截断时，才说明截断数量。\n"
-        f"{_topic_summary_instruction()}"
-        "输出 Markdown，包含：\n"
-        "## Topic / Event Extraction\n"
-        "- 按 topic 输出标题、起始消息链接和要点。\n"
-        "## Key Information Strings\n"
-        "- 每条是一句独立、可引用的事实/观点/事件/资源，保留 source_refs。\n"
-        "## Suggested Tags\n"
-        "- 从原始 tags 和内容中提炼 3-8 个 tags。\n"
-        "## Noise Or Low Value\n"
-        "- 简述被忽略的闲聊/重复内容类型。\n\n"
-        "Group metadata:\n"
-        f"{json.dumps({'name': group.get('name'), 'tags': group.get('tags')}, ensure_ascii=False, indent=2)}\n\n"
-        f"{tag_instruction}\n"
-        "Origin package:\n"
-        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
-    )
-
-
-def _normal_group_analysis_prompt(group: dict[str, Any], origin_artifacts: list[dict[str, Any]]) -> str:
-    tag_instruction = _tag_specific_instruction(group.get("tags"))
-    extracted = [
-        {
-            "origin": artifact.get("metadata", {}).get("origin"),
-            "content": _truncate_text(str(artifact.get("content") or ""), 8000),
-        }
-        for artifact in origin_artifacts
-    ]
-    return (
-        "TASK: normal_group_analysis\n"
-        "你是 Telegram 每日归档的 tag group 分析器。请基于组内多个 origin 的关键内容串，"
-        "总结这一组的分析结果和 tags。同一 parent 下按 parent tags 分入本组的 topics 要与 parent 作为一体整合。"
-        "如果 origin 提取结果包含完整消息证据，说明该 origin 当天消息量不大，请把它作为主要依据，"
-        "但输出仍然要按主题组织，不要退化成逐条消息列表。\n"
-        f"{_topic_summary_instruction()}"
-        "输出 Markdown，包含：\n"
-        "## Group Analysis\n"
-        "## Topic / Event Digest\n"
-        "- 按跨 origin/topic 的主题分块，保留主要事实、链接、资源名、数值、时间和 source_refs。\n"
-        "## Key Threads / Decisions\n"
-        "## Derived Tags\n"
-        "## Risks / Opportunities / Actions\n"
-        "## Source Refs\n\n"
-        "Group metadata:\n"
-        f"{json.dumps({'name': group.get('name'), 'tags': group.get('tags'), 'origin_count': group.get('origin_count')}, ensure_ascii=False, indent=2)}\n\n"
-        f"{tag_instruction}\n"
-        "Origin key extractions:\n"
-        f"{json.dumps(extracted, ensure_ascii=False, indent=2)}\n"
-    )
-
-
 def _important_origin_analysis_prompt(
     origin_payload: dict[str, Any],
     media_artifacts: dict[str, dict[str, Any]],
@@ -1609,10 +2078,9 @@ def _important_origin_analysis_prompt(
     )
 
 
-def _final_daily_summary_prompt(
+def _important_daily_summary_prompt(
     package_payload: dict[str, Any],
     *,
-    normal_group_artifacts: list[dict[str, Any]],
     important_artifacts: list[dict[str, Any]],
     media_artifacts: dict[str, dict[str, Any]],
 ) -> str:
@@ -1621,14 +2089,6 @@ def _final_daily_summary_prompt(
         "date": package_payload.get("date"),
         "timezone": package_payload.get("timezone"),
         "stats": package_payload.get("stats"),
-        "normal_group_analyses": [
-            {
-                "group_name": artifact.get("metadata", {}).get("group_name"),
-                "group_tags": artifact.get("metadata", {}).get("group_tags"),
-                "analysis": _truncate_text(str(artifact.get("content") or ""), 10000),
-            }
-            for artifact in normal_group_artifacts
-        ],
         "important_origin_analyses": [
             {
                 "origin": artifact.get("metadata", {}).get("origin"),
@@ -1646,13 +2106,13 @@ def _final_daily_summary_prompt(
         ],
     }
     return (
-        "TASK: final_daily_summary\n"
-        "你是每日 Telegram 归档最终分析器。请基于已经完成的 media、important origin、normal tag group 分析，"
-        "输出最终 Markdown 总结。最终读者需要一份可浏览的日报，不需要看到逐条消息流水账。\n"
+        "TASK: important_daily_summary\n"
+        "你是每日 Telegram 归档的 important 全量总结器。请只基于已经完成的 important origin 全量分析"
+        "以及相关 media 证据输出 Markdown；不得混入 normal origin 或 message point summary。"
+        "最终读者需要一份可浏览的 important 日报，不需要看到逐条消息流水账。\n"
         "要求：\n"
         "1. 先给出 Important Highlights，每个重点按主题/事件写标题、起始消息链接和 2-5 条 bullet。\n"
-        "2. 再按 tag group 输出 normal content 的主题摘要、机会、风险和行动项；"
-        "当组内分析包含完整证据时，要保留足够事实密度，但不要输出逐条消息列表。\n"
+        "2. 汇总跨 important origin 的决定、行动项、风险、机会、资源、数值和时间。\n"
         "3. 把图片 OCR/图像分析作为内容依据引用；PDF/视频只引用路径和文件名，不编造内容。\n"
         "4. 每个结论尽量保留 source_refs，引用 origin title/message_id/file_path。\n"
         "5. 输出应是可直接阅读的 Markdown，不要返回 JSON。\n"
@@ -1918,6 +2378,66 @@ def _parent_lookup_key(origin: dict[str, Any]) -> tuple[str, str, int]:
     )
 
 
+def _origin_identity(origin: dict[str, Any]) -> tuple[str, str, int, int]:
+    return (
+        str(origin.get("source") or SOURCE_TELEGRAM),
+        str(origin.get("account_id") or ""),
+        int(origin.get("origin_id") or 0),
+        int(origin.get("topic_id") or 0),
+    )
+
+
+def _packaged_message_identity(message: dict[str, Any]) -> tuple[str, str, int, int]:
+    return (
+        str(message.get("source") or SOURCE_TELEGRAM),
+        str(message.get("account_id") or ""),
+        int(message.get("chat_id") or 0),
+        int(message.get("message_id") or 0),
+    )
+
+
+def _canonicalize_point_origin_packages(
+    origin_packages: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Assign each archived message to one point origin, preferring a topic over its parent."""
+    topic_message_keys = {
+        _packaged_message_identity(message)
+        for origin_payload in origin_packages
+        if int((origin_payload.get("origin") or {}).get("topic_id") or 0)
+        for message in origin_payload.get("messages") or []
+    }
+    seen: set[tuple[str, str, int, int]] = set()
+    canonical: list[dict[str, Any]] = []
+    for origin_payload in origin_packages:
+        origin = origin_payload.get("origin") or {}
+        is_parent = int(origin.get("topic_id") or 0) == 0
+        messages: list[dict[str, Any]] = []
+        for message in origin_payload.get("messages") or []:
+            key = _packaged_message_identity(message)
+            if is_parent and key in topic_message_keys:
+                continue
+            if key in seen:
+                continue
+            seen.add(key)
+            messages.append(message)
+        if not messages:
+            continue
+        media_count = sum(len(message.get("media_files") or []) for message in messages)
+        canonical.append(
+            {
+                **origin_payload,
+                "package_meta": {
+                    **(origin_payload.get("package_meta") or {}),
+                    "message_count": len(messages),
+                    "media_count": media_count,
+                    "point_canonicalized": True,
+                },
+                "messages": messages,
+            }
+        )
+    return canonical
+
+
 def _normalized_tag_set(tags: Any) -> frozenset[str]:
     return frozenset(normalize_tag(tag) for tag in parse_tags(tags) if normalize_tag(tag))
 
@@ -1948,14 +2468,23 @@ def _package_origin(
     window_end_utc: datetime,
     local_tz: ZoneInfo,
 ) -> dict[str, Any]:
-    messages = store.list_messages_for_origin_window(
-        str(origin.get("source") or SOURCE_TELEGRAM),
-        str(origin["account_id"]),
-        int(origin["origin_id"]),
-        topic_id=int(origin.get("topic_id") or 0),
-        window_start=window_start_utc.isoformat(),
-        window_end=window_end_utc.isoformat(),
-    )
+    messages: list[dict[str, Any]] = []
+    offset = 0
+    while True:
+        page = store.list_messages_for_origin_window(
+            str(origin.get("source") or SOURCE_TELEGRAM),
+            str(origin["account_id"]),
+            int(origin["origin_id"]),
+            topic_id=int(origin.get("topic_id") or 0),
+            window_start=window_start_utc.isoformat(),
+            window_end=window_end_utc.isoformat(),
+            limit=PACKAGE_MESSAGE_PAGE_SIZE,
+            offset=offset,
+        )
+        messages.extend(page)
+        if len(page) < PACKAGE_MESSAGE_PAGE_SIZE:
+            break
+        offset += len(page)
     media_by_message = store.list_media_files_for_messages(messages)
     packaged_messages = []
     media_count = 0
@@ -2074,16 +2603,28 @@ def _run_summary_provider(
     image_paths: list[str],
     *,
     task_name: str = "summary",
+    output_schema_path: Path | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
 ) -> str:
     if cancel_check:
         cancel_check()
     if config.daily.ai.provider == "disabled":
-        text = f"# AI Task Disabled\n\nTask: `{task_name}`\n\nAI provider is disabled for this run.\n"
+        text = (
+            '{"points": []}\n'
+            if output_schema_path is not None
+            else f"# AI Task Disabled\n\nTask: `{task_name}`\n\nAI provider is disabled for this run.\n"
+        )
         output_path.write_text(text, encoding="utf-8")
         return text
-    command = _expand_command(config.daily.ai.command, output_path, image_paths, task_name=task_name)
+    command = _expand_command(
+        config.daily.ai.command,
+        output_path,
+        image_paths,
+        task_name=task_name,
+        model=config.daily.ai.model,
+        output_schema_path=output_schema_path,
+    )
     config.storage.data_dir.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         command,
@@ -2149,7 +2690,15 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
             pass
 
 
-def _expand_command(command: list[str], output_path: Path, image_paths: list[str], *, task_name: str = "summary") -> list[str]:
+def _expand_command(
+    command: list[str],
+    output_path: Path,
+    image_paths: list[str],
+    *,
+    task_name: str = "summary",
+    model: str = "",
+    output_schema_path: Path | None = None,
+) -> list[str]:
     expanded: list[str] = []
     image_args: list[str] = []
     for path in image_paths:
@@ -2157,77 +2706,41 @@ def _expand_command(command: list[str], output_path: Path, image_paths: list[str
     for token in command:
         if token == "{images}":
             expanded.extend(image_args)
+        elif token == "{model}":
+            if model:
+                expanded.extend(["--model", model])
+        elif token == "{output_schema}":
+            if output_schema_path is not None:
+                expanded.extend(["--output-schema", str(output_schema_path)])
         else:
-            expanded.append(token.replace("{output}", str(output_path)).replace("{task}", task_name))
-    return expanded
-
-
-def _summary_prompt(package_payload: dict[str, Any]) -> str:
-    compact_payload = {
-        "run_id": package_payload.get("run_id"),
-        "date": package_payload.get("date"),
-        "timezone": package_payload.get("timezone"),
-        "stats": package_payload.get("stats"),
-        "normal_groups": _compact_groups(package_payload.get("normal_groups") or []),
-        "important_origins": _compact_origins(package_payload.get("important_origins") or []),
-        "unmatched_origins": package_payload.get("unmatched_origins") or [],
-    }
-    return (
-        "你是每日 Telegram 归档分析器。请基于输入的 package JSON 输出 Markdown。\n"
-        "要求：\n"
-        "1. 先给出 important origin 的重点分析。\n"
-        "2. 再按 tag group 总结关键线索、风险、机会和行动项。\n"
-        "3. 图片若已作为附件提供，请结合图片内容；若只看到路径，则引用路径。\n"
-        "4. PDF、视频等长内容只保留文件名和路径，不编造内容。\n"
-        "5. 保留 source_refs，引用 origin title/message_id/file_path。\n\n"
-        "Package JSON:\n"
-        f"{json.dumps(compact_payload, ensure_ascii=False, indent=2)}\n"
-    )
-
-
-def _compact_groups(groups: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    return [
-        {
-            "name": group.get("name"),
-            "tags": group.get("tags"),
-            "origin_count": group.get("origin_count"),
-            "message_count": group.get("message_count"),
-            "media_count": group.get("media_count"),
-            "origins": _compact_origins(group.get("origins") or []),
-        }
-        for group in groups
-    ]
-
-
-def _compact_origins(origins: list[dict[str, Any]]) -> list[dict[str, Any]]:
-    compact = []
-    for origin in origins:
-        messages = origin.get("messages") or []
-        compact.append(
-            {
-                "origin": origin.get("origin"),
-                "package_meta": origin.get("package_meta"),
-                "messages": [
-                    {
-                        "message_id": message.get("message_id"),
-                        "speaker": message.get("speaker"),
-                        "local_sent_at": message.get("local_sent_at"),
-                        "text": message.get("text"),
-                        "permalink": message.get("permalink"),
-                        "telegram_deeplink": message.get("telegram_deeplink") or _telegram_deeplink(message),
-                        "media_files": message.get("media_files"),
-                    }
-                    for message in messages[:200]
-                ],
-                "truncated_message_count": max(0, len(messages) - 200),
-            }
+            expanded.append(
+                token.replace("{output}", str(output_path))
+                .replace("{task}", task_name)
+                .replace("{model}", model)
+                .replace("{output_schema}", str(output_schema_path or ""))
+            )
+    executable = Path(expanded[0]).name.lower() if expanded else ""
+    if executable in {"codex", "codex.exe"} and "exec" in expanded:
+        insert_at = expanded.index("exec") + 1
+        has_model = any(
+            token in {"-m", "--model"} or token.startswith("--model=")
+            for token in expanded
         )
-    return compact
+        if model and not has_model:
+            expanded[insert_at:insert_at] = ["--model", model]
+            insert_at += 2
+        has_output_schema = any(
+            token == "--output-schema" or token.startswith("--output-schema=")
+            for token in expanded
+        )
+        if output_schema_path is not None and not has_output_schema:
+            expanded[insert_at:insert_at] = ["--output-schema", str(output_schema_path)]
+    return expanded
 
 
 def _collect_image_paths(package_payload: dict[str, Any], limit: int = 20) -> list[str]:
     paths: list[str] = []
-    for origin_payload in _iter_origin_payloads(package_payload):
+    for origin_payload in _iter_point_origin_payloads(package_payload):
         for message in origin_payload.get("messages") or []:
             for media in message.get("media_files") or []:
                 content_type = str(media.get("content_type") or media.get("mime_type") or "")
@@ -2242,9 +2755,7 @@ def _collect_image_paths(package_payload: dict[str, Any], limit: int = 20) -> li
 def _collect_media_analysis_targets(package_payload: dict[str, Any]) -> list[dict[str, Any]]:
     targets: list[dict[str, Any]] = []
     seen_paths: set[str] = set()
-    for origin_payload in _iter_origin_payloads(package_payload):
-        if (origin_payload.get("origin") or {}).get("important"):
-            continue
+    for origin_payload in _iter_point_origin_payloads(package_payload):
         for message in origin_payload.get("messages") or []:
             for media in message.get("media_files") or []:
                 file_path = str(media.get("file_path") or "")
@@ -2263,6 +2774,13 @@ def _iter_origin_payloads(package_payload: dict[str, Any]) -> list[dict[str, Any
     return origins
 
 
+def _iter_point_origin_payloads(package_payload: dict[str, Any]) -> list[dict[str, Any]]:
+    point_origins = package_payload.get("point_origins")
+    if isinstance(point_origins, list):
+        return point_origins
+    return _canonicalize_point_origin_packages(_iter_origin_payloads(package_payload))
+
+
 def _package_markdown(package_payload: dict[str, Any]) -> str:
     lines = [
         f"# Daily Package {package_payload['date']}",
@@ -2273,6 +2791,8 @@ def _package_markdown(package_payload: dict[str, Any]) -> str:
         f"- Origins: {package_payload['stats']['origin_count']}",
         f"- Messages: {package_payload['stats']['message_count']}",
         f"- Media files: {package_payload['stats']['media_count']}",
+        f"- Point origins: {package_payload['stats'].get('point_origin_count', 0)}",
+        f"- Canonical point messages: {package_payload['stats'].get('point_message_count', 0)}",
         "",
         "## Normal Groups",
         "",
@@ -2287,6 +2807,16 @@ def _package_markdown(package_payload: dict[str, Any]) -> str:
         meta = origin["origin"]
         lines.append(f"### {meta.get('title') or meta.get('origin_id')}")
         lines.append(f"- Messages: {origin['package_meta']['message_count']}; media: {origin['package_meta']['media_count']}")
+        lines.append("")
+    lines.extend(["## Point Origins", ""])
+    for origin in _iter_point_origin_payloads(package_payload):
+        meta = origin.get("origin") or {}
+        lines.append(f"### {meta.get('title') or meta.get('origin_id')}")
+        lines.append(f"- Tags: {', '.join(meta.get('tags') or []) or '-'}")
+        lines.append(
+            f"- Messages: {origin.get('package_meta', {}).get('message_count', 0)}; "
+            f"important origin: {bool(meta.get('important'))}"
+        )
         lines.append("")
     return "\n".join(lines)
 

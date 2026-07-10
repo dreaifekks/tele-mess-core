@@ -22,6 +22,8 @@ from tele_mess_core.config import (
 )
 from tele_mess_core.models import (
     ChatRecord,
+    DailyMessagePointRecord,
+    DailySummaryRunRecord,
     MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
@@ -378,27 +380,41 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(summary["progress_label"], "completed")
         summary_md = self.request_text(f"/manage/daily-summary-runs/content?run_id={summary['run_id']}")
         self.assertIn("AI provider is disabled", summary_md)
-        records = self.request_json(
+        important_records = self.request_json(
             f"/manage/daily-summary-records?package_run_id={package['run_id']}&tag=web3&tags=info&important=true"
         )["items"]
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["run_id"], summary["run_id"])
-        self.assertIn("AI provider is disabled", records[0]["content_preview"])
-        self.assertNotIn("content_md", records[0])
-        record = self.request_json(f"/manage/daily-summary-records/item?run_id={summary['run_id']}")["item"]
-        self.assertIn("AI provider is disabled", record["content_md"])
-        self.assertEqual(record["tags"], ["web3", "info"])
+        self.assertEqual(
+            {item["record_type"] for item in important_records},
+            {"important_origin", "important_daily"},
+        )
+        self.assertTrue(all(item["run_id"] == summary["run_id"] for item in important_records))
+        self.assertTrue(all("AI provider is disabled" in item["content_preview"] for item in important_records))
+        self.assertTrue(all("content_md" not in item for item in important_records))
+
+        point_records = self.request_json(
+            f"/manage/daily-summary-records?package_run_id={package['run_id']}&record_type=point_daily&tag=point"
+        )["items"]
+        self.assertEqual(len(point_records), 1)
+        point_record = point_records[0]
+        record = self.request_json(
+            f"/manage/daily-summary-records/item?run_id={summary['run_id']}&record_type=point_daily"
+        )["item"]
+        self.assertEqual(record["record_type"], "point_daily")
+        self.assertIn("No message points were extracted", record["content_md"])
+        self.assertEqual(record["tags"], ["point"])
 
         deleted = self.request_json(
             "/manage/daily-summary-records",
             method="PATCH",
-            payload={"summary_ids": [records[0]["summary_id"]], "deleted": True},
+            payload={"summary_ids": [point_record["summary_id"]], "deleted": True},
         )["item"]
         self.assertEqual(deleted["changed_rows"], 1)
-        hidden_records = self.request_json(f"/manage/daily-summary-records?summary_id={records[0]['summary_id']}")["items"]
+        hidden_records = self.request_json(
+            f"/manage/daily-summary-records?summary_id={point_record['summary_id']}"
+        )["items"]
         self.assertEqual(hidden_records, [])
         deleted_records = self.request_json(
-            f"/manage/daily-summary-records?summary_id={records[0]['summary_id']}&deleted=true"
+            f"/manage/daily-summary-records?summary_id={point_record['summary_id']}&deleted=true"
         )["items"]
         self.assertEqual(len(deleted_records), 1)
         self.assertTrue(deleted_records[0]["deleted"])
@@ -406,7 +422,7 @@ class SyncApiTest(unittest.TestCase):
         restored = self.request_json(
             "/manage/daily-summary-records",
             method="PATCH",
-            payload={"summary_id": records[0]["summary_id"], "deleted": False},
+            payload={"summary_id": point_record["summary_id"], "deleted": False},
         )["item"]
         self.assertEqual(restored["changed_rows"], 1)
 
@@ -478,6 +494,95 @@ class SyncApiTest(unittest.TestCase):
             urlopen(req, timeout=3)
         self.assertEqual(raised.exception.code, 400)
         raised.exception.close()
+
+    def test_daily_message_points_api_filters_and_item(self) -> None:
+        self.store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id="sum_points_api",
+                status="completed",
+                package_run_id="pkg_points_api",
+                date="2026-07-03",
+                timezone="UTC",
+            )
+        )
+        self.store.persist_daily_message_points(
+            "sum_points_api",
+            [
+                DailyMessagePointRecord(
+                    point_id="point_api",
+                    run_id="sum_points_api",
+                    package_run_id="pkg_points_api",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    origin_id=-2001,
+                    topic_id=8,
+                    origin_title="API Points",
+                    message_id=77,
+                    occurred_at="2026-07-03T01:00:00+00:00",
+                    tags_json='["ai", "point"]',
+                    content="API point payload",
+                    telegram_deeplink="tg://privatepost?channel=2001&post=77",
+                    importance_score=5,
+                    importance_reason="API-visible",
+                    origin_important=True,
+                    source_refs_json='[{"message_id":77}]',
+                    provider="fake",
+                )
+            ],
+        )
+
+        items = self.request_json(
+            "/manage/daily-message-points?date=2026-07-03&account_id=default&origin_id=-2001"
+            "&topic_id=8&tags=AI,point&importance_min=4&origin_important=true&q=payload"
+        )["items"]
+        self.assertEqual([item["point_id"] for item in items], ["point_api"])
+        self.assertEqual(items[0]["source_refs"], [{"message_id": 77}])
+        self.assertTrue(items[0]["origin_important"])
+        self.assertEqual(items[0]["run_status"], "completed")
+
+        item = self.request_json("/manage/daily-message-points/item?point_id=point_api")["item"]
+        self.assertEqual(item["telegram_deeplink"], "tg://privatepost?channel=2001&post=77")
+
+        self.store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id="sum_points_failed_api",
+                status="failed",
+                package_run_id="pkg_points_failed_api",
+                date="2026-07-03",
+                timezone="UTC",
+            )
+        )
+        self.store.persist_daily_message_points(
+            "sum_points_failed_api",
+            [
+                DailyMessagePointRecord(
+                    point_id="point_failed_api",
+                    run_id="sum_points_failed_api",
+                    package_run_id="pkg_points_failed_api",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    origin_id=-2001,
+                    occurred_at="2026-07-03T02:00:00+00:00",
+                    content="failed API point",
+                )
+            ],
+        )
+        default_ids = {
+            point["point_id"]
+            for point in self.request_json("/manage/daily-message-points?date=2026-07-03")["items"]
+        }
+        self.assertNotIn("point_failed_api", default_ids)
+        diagnostic_ids = {
+            point["point_id"]
+            for point in self.request_json(
+                "/manage/daily-message-points?date=2026-07-03&include_incomplete=true"
+            )["items"]
+        }
+        self.assertIn("point_failed_api", diagnostic_ids)
 
     def test_api_manifest_requires_token(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/manage/api-manifest")
@@ -752,6 +857,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("capture_cursors", capabilities["management"])
         self.assertIn("operation_events", capabilities["management"])
         self.assertIn("operation_event_delete", capabilities["management"])
+        self.assertIn("daily_message_points", capabilities["management"])
 
         archive = self.request_json(
             "/manage/origins/archive",

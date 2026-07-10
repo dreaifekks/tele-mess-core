@@ -28,7 +28,9 @@ The basic management model is implemented in SQLite and exposed through HTTP:
   bounded topic/participant scans, and media-download retry failures.
 - Daily package runs generated from archived messages by origin, tag group,
   timezone, and local date.
-- Local Codex-backed daily summary runs with run records and artifact paths.
+- Local Codex-backed daily runs with important-only full-context reports,
+  all-origin structured message points, point-based daily digests, run records,
+  and artifact paths.
 
 The remaining work is longer-duration real-world soak testing and client polish:
 watching how the core behaves across days of Telegram reconnects, very large
@@ -67,6 +69,9 @@ configure Telegram origins:
   by tag intersections and split by important origin status.
 - Daily summary run: an on-demand local AI analysis of a daily package, backed
   by configurable Codex CLI invocation.
+- Message point: a reusable fact, event, decision, resource, risk, opportunity,
+  or action linked to its time, tags, Telegram source, importance, and evidence
+  messages.
 
 ## Interface Priorities
 
@@ -86,6 +91,8 @@ The next API surface should be management-first, not just sync-first:
   recurring trigger stays in user-level systemd.
 - Trigger daily package and summary runs on demand and inspect their status,
   output paths, and errors.
+- Search daily message points and inspect the distinct important and `#point`
+  daily report records without reopening local artifact files.
 
 ## Open Design Questions
 

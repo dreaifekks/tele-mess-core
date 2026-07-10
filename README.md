@@ -32,7 +32,8 @@ daily package and AI analysis details.
 - Runtime operation events for Telegram auth/discovery/media-download failures.
 - Server daemon mode for devNuc-style always-on deployment.
 - Daily package generation by origin, tag group, timezone, and local date.
-- Local Codex-backed daily summary runs with configurable AI command templates.
+- Local Codex-backed daily analysis with important-origin full-context reports,
+  all-origin structured message points, and point-based daily digests.
 - Durable daily package-and-summary jobs with deduplication, cancellation,
   restart recovery, leases, and a retryable Telegram delivery outbox.
 - System-managed daily package and summary scheduling through user-level systemd
@@ -116,6 +117,8 @@ the freed pages for later messages.
 - `GET /manage/daily-summary-runs`
 - `GET /manage/daily-summary-records`
 - `GET /manage/daily-summary-records/item`
+- `GET /manage/daily-message-points`
+- `GET /manage/daily-message-points/item`
 - `POST /manage/discover-origins`
 - `POST /manage/participants/refresh`
 - `GET /console`
@@ -181,25 +184,36 @@ or tag groups, then skips origins with no messages in the selected daily
 window. Parent origins and forum topics are grouped together by the parent's
 tags unless a topic has explicit different tags or is marked important.
 When no ad hoc tag group scope is supplied, origins are grouped by their
-effective CSV tag set, so `web3,info` and `ai,info` become separate summary
-records. Explicit tag groups are still assigned from most-specific to
-least-specific so a `web3,it,info` origin is removed from broader `web3,info`
-processing after it is assigned.
+effective CSV tag set for package navigation and point metadata. Explicit tag
+groups are assigned from most-specific to least-specific, but unmatched origins
+still enter the all-origin point flow. Normal tag groups no longer create their
+own summary records.
 
 Origin rows can be marked `important`; important origins are packaged separately
-and analyzed per origin before the final rollup. Summary runs use a staged AI
-pipeline:
+and analyzed in full context. Every eligible origin, including important ones,
+also participates in a separate structured message-point pipeline. Daily runs
+therefore produce two independent products:
 
 - image media analysis with OCR/visual extraction through Codex image inputs;
 - non-image long media such as PDF/video preserved as file references;
-- normal-origin key information extraction;
-- normal tag-group analysis;
-- important-origin analysis;
-- final daily rollup from those stage outputs.
+- message-point extraction from important and non-important origins, with time,
+  tags, content, Telegram links, importance, and source references;
+- full-context analysis and a daily report sourced only from important origins;
+- a separate daily digest sourced only from the persisted message points.
 
 Package and summary artifacts are written under the configured daily output
-directory, while SQLite stores run status, paths, counts, errors, and completed
-group-level summary Markdown for API lookup/filtering.
+directory, while SQLite stores run status, paths, counts, errors, typed summary
+records, and individually queryable message points for API lookup/filtering.
+Normal point queries expose completed runs; diagnostic callers can opt into
+failed, canceled, or still-running run points explicitly.
+
+When Telegram delivery is enabled, the important report and point digest are
+sent as separate logical messages to the configured target. The point digest
+uses the fixed searchable tag `#point`; the important report keeps its source
+tags.
+
+The default Codex CLI template selects `gpt-5.6-sol` and expands task-specific
+`{model}` and `{output_schema}` placeholders before invoking the provider.
 
 API and scheduled package-plus-summary requests use the same durable SQLite job
 queue. Equivalent active or completed requests are deduplicated unless

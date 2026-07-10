@@ -9,7 +9,7 @@ import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import AppConfig, DailyDeliveryConfig
@@ -61,7 +61,9 @@ def enqueue_daily_summary_job(
     delivery = resolve_daily_summary_delivery(store, config)
     dedupe_payload = {
         **request,
+        "pipeline_version": 2,
         "provider": config.daily.ai.provider,
+        "model": config.daily.ai.model,
         "delivery": {
             "enabled": delivery.enabled,
             "account_id": delivery.account_id,
@@ -343,7 +345,9 @@ class DailyJobWorker:
                 if summary.get("status") == "canceled":
                     raise DailyJobCancelled("canceled")
                 raise RuntimeError(summary.get("error") or "Daily summary did not complete")
-            self._drain_summary_delivery(str(summary["run_id"]))
+            check_cancel()
+            self._drain_summary_delivery(str(summary["run_id"]), cancel_check=check_cancel)
+            check_cancel()
             write_job(
                 "completed",
                 {
@@ -362,6 +366,7 @@ class DailyJobWorker:
         except DailyJobWorkerStopping:
             self.store.requeue_daily_summary_job(job_id, self.worker_id, now=utc_now_iso())
         except DailyJobCancelled as exc:
+            self.store.discard_unsent_delivery_outbox(job_id=job_id)
             current = self.store.get_daily_summary_job(job_id) or {}
             write_job(
                 "canceled",
@@ -390,8 +395,15 @@ class DailyJobWorker:
         now = datetime.now(timezone.utc)
         return now.isoformat(), (now + timedelta(seconds=self._lease_seconds)).isoformat()
 
-    def _drain_summary_delivery(self, summary_run_id: str) -> None:
+    def _drain_summary_delivery(
+        self,
+        summary_run_id: str,
+        *,
+        cancel_check: Callable[[], None] | None = None,
+    ) -> None:
         while not self._stop_event.is_set():
+            if cancel_check:
+                cancel_check()
             if not self._deliver_pending_once(summary_run_id=summary_run_id):
                 return
 

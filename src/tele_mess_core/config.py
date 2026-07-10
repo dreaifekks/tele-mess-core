@@ -61,15 +61,18 @@ class LoggingConfig:
 @dataclass(slots=True)
 class DailyAiConfig:
     provider: str = "codex-cli"
+    model: str = "gpt-5.6-sol"
     command: list[str] = field(
         default_factory=lambda: [
             "codex",
             "-a",
             "never",
             "exec",
+            "{model}",
             "--skip-git-repo-check",
             "--output-last-message",
             "{output}",
+            "{output_schema}",
             "{images}",
             "-",
         ]
@@ -248,6 +251,7 @@ def _parse_daily_ai(raw: Any) -> DailyAiConfig:
         raise ValueError("daily.ai.command must be a string or list")
     return DailyAiConfig(
         provider=str(raw.get("provider", "codex-cli") or "codex-cli"),
+        model=str(raw.get("model", "gpt-5.6-sol") or "gpt-5.6-sol"),
         command=command_list,
         timeout_seconds=max(1, int(raw.get("timeout_seconds", 900))),
     )

@@ -6,14 +6,24 @@ import sys
 import tempfile
 import time
 import unittest
+import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
 from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
-from tele_mess_core.config import AppConfig, DailyAiConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
-from tele_mess_core.daily import build_daily_package, run_daily_summary, update_daily_package_schedule
+from tele_mess_core.config import (
+    AppConfig,
+    DailyAiConfig,
+    DailyDeliveryConfig,
+    DailyPackagingConfig,
+    LoggingConfig,
+    ServerConfig,
+    StorageConfig,
+    TelegramConfig,
+)
+from tele_mess_core.daily import _expand_command, build_daily_package, run_daily_summary, update_daily_package_schedule
 from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.models import BackupPolicyRecord, DailySummaryDeliveryRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
@@ -123,73 +133,23 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(summary["progress"]["normal_group_count"], 3)
         self.assertEqual(summary["progress"]["important_origin_count"], 1)
         self.assertIn("AI provider is disabled", Path(summary["summary_path"]).read_text(encoding="utf-8"))
-        records = self.store.list_daily_summary_records(package_run_id=package["run_id"], tags=["ai", "info"], important=True)
-        self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["run_id"], summary["run_id"])
-        self.assertIn("--important--", records[0]["summary_id"])
-        self.assertIn("AI provider is disabled", records[0]["content_preview"])
-        record = self.store.get_daily_summary_record(run_id=summary["run_id"])
-        assert record is not None
-        self.assertIn("AI provider is disabled", record["content_md"])
-        self.assertTrue(set(record["tags"]).issubset({"web3", "info", "it", "ai"}))
+        records = self.store.list_daily_summary_records(
+            package_run_id=package["run_id"],
+            tags=["ai", "info"],
+            important=True,
+        )
+        self.assertEqual({item["record_type"] for item in records}, {"important_origin", "important_daily"})
+        self.assertTrue(all(item["run_id"] == summary["run_id"] for item in records))
+        self.assertTrue(all("AI provider is disabled" in item["content_preview"] for item in records))
         all_records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
-        self.assertEqual(len(all_records), 4)
         self.assertEqual(
-            {tuple(item["tags"]) for item in all_records},
-            {("web3", "it", "info"), ("web3", "info"), ("ai", "info")},
+            {item["record_type"] for item in all_records},
+            {"important_origin", "important_daily", "point_daily"},
         )
-
-        fake_provider = self.root / "fake_provider.py"
-        fake_log = self.root / "fake_provider_calls.jsonl"
-        fake_provider.write_text(
-            "from pathlib import Path\n"
-            "import json\n"
-            "import sys\n"
-            "prompt = sys.stdin.read()\n"
-            "output = Path(sys.argv[1])\n"
-            "task = sys.argv[2]\n"
-            "log_path = Path(sys.argv[3])\n"
-            "extra = sys.argv[4:]\n"
-            "output.write_text(f'# Fake {task}\\n' + '\\n'.join(extra), encoding='utf-8')\n"
-            "with log_path.open('a', encoding='utf-8') as handle:\n"
-            "    handle.write(json.dumps({'task': task, 'args': extra, 'prompt': prompt[:500]}, ensure_ascii=False) + '\\n')\n",
-            encoding="utf-8",
-        )
-        fake_config = AppConfig(
-            storage=self.config.storage,
-            telegram=self.config.telegram,
-            server=self.config.server,
-            logging=self.config.logging,
-            daily=DailyPackagingConfig(
-                output_dir=self.config.daily.output_dir,
-                systemd_user_dir=self.config.daily.systemd_user_dir,
-                ai=DailyAiConfig(
-                    provider="fake",
-                    command=[sys.executable, str(fake_provider), "{output}", "{task}", str(fake_log), "{images}"],
-                ),
-            ),
-            config_path=self.config.config_path,
-        )
-        fake_summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
-        fake_text = Path(fake_summary["summary_path"]).read_text(encoding="utf-8")
-        self.assertIn("# Fake final_daily_summary", fake_text)
-        calls = [json.loads(line) for line in fake_log.read_text(encoding="utf-8").splitlines()]
-        tasks = [call["task"] for call in calls]
-        self.assertNotIn("media_image_analysis", tasks)
-        self.assertIn("normal_origin_key_extraction", tasks)
-        self.assertIn("normal_group_analysis", tasks)
-        self.assertIn("important_origin_analysis", tasks)
-        self.assertIn("final_daily_summary", tasks)
-        important_call = next(call for call in calls if call["task"] == "important_origin_analysis")
-        self.assertIn("--image", important_call["args"])
-        self.assertIn(str(media_path), important_call["args"])
-        summary_payload = json.loads((Path(fake_summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(summary_payload["analysis"]["media"], [])
-        important_prompt_path = Path(summary_payload["analysis"]["important_origins"][0]["prompt_path"])
-        self.assertIn(str(pdf_path), important_prompt_path.read_text(encoding="utf-8"))
-        fake_record = self.store.get_daily_summary_record(run_id=fake_summary["run_id"])
-        assert fake_record is not None
-        self.assertIn(fake_record["content_json"]["record_type"], {"tag_group", "important_origin"})
+        point_daily = next(item for item in all_records if item["record_type"] == "point_daily")
+        self.assertEqual(point_daily["tags"], ["point"])
+        self.assertEqual(point_daily["tags_csv"], "point")
+        self.assertEqual(self.store.list_daily_message_points(run_id=summary["run_id"]), [])
 
     def test_default_daily_package_groups_by_origin_tag_sets(self) -> None:
         self._origin(-5001, "Web3 One", "web3,info")
@@ -223,15 +183,16 @@ class DailyPackagingTest(unittest.TestCase):
 
         summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
         records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
-        self.assertEqual(len(records), 2)
-        self.assertEqual({tuple(item["tags"]) for item in records}, {("web3", "info"), ("ai", "info")})
-        self.assertEqual({item["tags_csv"] for item in records}, {"web3,info", "ai,info"})
-        group_prompt = Path(summary["output_dir"]) / "stages" / "normal-groups" / "web3-info.prompt.md"
-        group_prompt_text = group_prompt.read_text(encoding="utf-8")
-        self.assertIn("Tag-specific instruction for `info`", group_prompt_text)
-        self.assertIn("不要把输入消息机械地逐条重排成消息列表", group_prompt_text)
-        self.assertIn("### 主题标题 ([起始消息](telegram_deeplink 或 source_ref))", group_prompt_text)
-        self.assertIn("不要把网页版 `https://t.me/...` 当作首选链接", group_prompt_text)
+        self.assertEqual(len(records), 1)
+        self.assertEqual(records[0]["record_type"], "point_daily")
+        self.assertEqual(records[0]["tags"], ["point"])
+        self.assertEqual(records[0]["tags_csv"], "point")
+        point_prompts = list((Path(summary["output_dir"]) / "stages" / "message-points").glob("*.prompt.md"))
+        self.assertEqual(len(point_prompts), 3)
+        prompt_text = "\n".join(path.read_text(encoding="utf-8") for path in point_prompts)
+        self.assertIn("TASK: message_point_extraction", prompt_text)
+        self.assertIn('"tags": [\n    "web3",\n    "info"', prompt_text)
+        self.assertFalse((Path(summary["output_dir"]) / "stages" / "normal-groups").exists())
 
     def test_daily_summary_delivers_final_summary_when_configured(self) -> None:
         self._origin(-7001, "Delivery Source", "info")
@@ -270,18 +231,295 @@ class DailyPackagingTest(unittest.TestCase):
 
         deliver.assert_called_once()
         delivered_content = deliver.call_args.args[2]
-        self.assertIn("# Daily Summary", delivered_content)
+        self.assertIn("# Daily Message Point Summary", delivered_content)
         self.assertIn("- Date: `2026-07-03`", delivered_content)
         self.assertIn("- Timezone: `UTC`", delivered_content)
-        self.assertIn("- Tags: #info", delivered_content)
+        self.assertIn("- Tags: #point", delivered_content)
         self.assertIn("- Summary provider: `disabled`", delivered_content)
-        self.assertIn("AI provider is disabled", delivered_content)
+        self.assertIn("No message points were extracted", delivered_content)
         self.assertEqual(deliver.call_args.kwargs["delivery"].origin_id, -9001)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["progress_current"], summary["progress_total"])
         self.assertEqual(summary["progress"]["delivery_count"], 1)
         summary_payload = json.loads((Path(summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(summary_payload["delivery"], delivery_result)
+        self.assertEqual(summary_payload["delivery"]["status"], "sent")
+        self.assertEqual(summary_payload["delivery"]["deliveries"], [{"kind": "point_summary", "result": delivery_result}])
+
+    def test_structured_points_are_persisted_for_normal_and_important_origins(self) -> None:
+        self._origin(-9001, "Normal Source", "normal,info")
+        self._origin(-9002, "Important Source", "alert,info", important=True)
+        for chat_id, message_id, sent_at, permalink in (
+            (-9001, 11, "2026-07-03T01:05:00+00:00", "https://t.me/normal_source/11"),
+            (-9002, 22, "2026-07-03T02:15:00+00:00", "https://t.me/important_source/22"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    sent_at=sent_at,
+                    ingested_at=utc_now_iso(),
+                    text=f"structured payload {message_id}",
+                    permalink=permalink,
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        fake_config, fake_log = self._structured_ai_config(delivery=True)
+        delivery_result = {
+            "account_id": "main",
+            "origin_id": -9900,
+            "topic_id": 0,
+            "status": "sent",
+            "message_count": 1,
+            "message_ids": [321],
+        }
+
+        with patch("tele_mess_core.daily.deliver_daily_summary", return_value=delivery_result) as deliver:
+            summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
+
+        self.assertEqual(summary["status"], "completed")
+        calls = self._structured_provider_calls(fake_log)
+        tasks = [item["task"] for item in calls]
+        point_calls = [item for item in calls if item["task"] == "message_point_extraction"]
+        self.assertEqual({item["origin"]["origin_id"] for item in point_calls}, {-9001, -9002})
+        self.assertTrue(all("--output-schema" in item["args"] for item in point_calls))
+        self.assertIn("important_origin_analysis", tasks)
+        self.assertIn("important_daily_summary", tasks)
+        self.assertIn("daily_point_summary", tasks)
+        self.assertEqual(
+            next(item for item in calls if item["task"] == "daily_point_summary")["persisted_point_count"],
+            2,
+        )
+        self.assertNotIn("normal_origin_key_extraction", tasks)
+        self.assertNotIn("normal_group_analysis", tasks)
+        self.assertNotIn("final_daily_summary", tasks)
+
+        points = self.store.list_daily_message_points(run_id=summary["run_id"], limit=20)
+        self.assertEqual(len(points), 2)
+        points_by_origin = {item["origin_id"]: item for item in points}
+        normal_point = points_by_origin[-9001]
+        important_point = points_by_origin[-9002]
+        self.assertEqual(normal_point["occurred_at"], "2026-07-03T01:05:00+00:00")
+        self.assertEqual(normal_point["telegram_deeplink"], "tg://resolve?domain=normal_source&post=11")
+        self.assertNotEqual(normal_point["telegram_deeplink"], "tg://resolve?domain=forged&post=1")
+        self.assertEqual(normal_point["message_id"], 11)
+        self.assertEqual(normal_point["source_refs"], ["main/-9001/0/11"])
+        self.assertEqual(normal_point["importance_score"], 4)
+        self.assertEqual(normal_point["tags"], ["normal", "info", "derived"])
+        self.assertFalse(normal_point["origin_important"])
+        self.assertTrue(important_point["origin_important"])
+        self.assertEqual(important_point["telegram_deeplink"], "tg://resolve?domain=important_source&post=22")
+
+        records = self.store.list_daily_summary_records(run_id=summary["run_id"], limit=20)
+        self.assertEqual(
+            {item["record_type"] for item in records},
+            {"important_origin", "important_daily", "point_daily"},
+        )
+        point_daily = next(item for item in records if item["record_type"] == "point_daily")
+        self.assertEqual(point_daily["tags"], ["point"])
+        self.assertIn("Fake daily_point_summary", point_daily["content_preview"])
+
+        self.assertEqual(deliver.call_count, 2)
+        delivered = [item.args[2] for item in deliver.call_args_list]
+        important_delivery = next(content for content in delivered if content.startswith("# Important Daily Summary"))
+        point_delivery = next(content for content in delivered if content.startswith("# Daily Message Point Summary"))
+        self.assertNotIn("- Tags: #point", important_delivery)
+        self.assertIn("- Tags: #point", point_delivery)
+        self.assertIn("Fake daily_point_summary", point_delivery)
+        self.assertEqual(summary["progress"]["delivery_count"], 2)
+
+    def test_point_extraction_batches_all_unmatched_messages(self) -> None:
+        self._origin(-9101, "Unmatched Source", "misc")
+        for index in range(205):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-9101,
+                    message_id=index + 1,
+                    sent_at=f"2026-07-03T01:{index % 60:02d}:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=f"unmatched payload {index + 1}",
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tag_groups": ["ai info"]},
+        )
+        package_payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual([item["origin_id"] for item in package_payload["unmatched_origins"]], [-9101])
+        self.assertEqual(package_payload["stats"]["origin_count"], 1)
+        self.assertEqual(package_payload["stats"]["message_count"], 205)
+        self.assertEqual(package_payload["stats"]["point_origin_count"], 1)
+        self.assertEqual(package_payload["stats"]["point_message_count"], 205)
+
+        fake_config, fake_log = self._structured_ai_config()
+        summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
+
+        self.assertEqual(summary["status"], "completed")
+        calls = [
+            item
+            for item in self._structured_provider_calls(fake_log)
+            if item["task"] == "message_point_extraction"
+        ]
+        self.assertEqual(len(calls), 2)
+        self.assertEqual([len(item["message_ids"]) for item in calls], [200, 5])
+        all_message_ids = [message_id for item in calls for message_id in item["message_ids"]]
+        self.assertEqual(sorted(all_message_ids), list(range(1, 206)))
+        self.assertEqual(len(set(all_message_ids)), 205)
+        self.assertEqual(summary["progress"]["point_extraction_count"], 2)
+        all_calls = self._structured_provider_calls(fake_log)
+        self.assertEqual(
+            next(item for item in all_calls if item["task"] == "daily_point_summary")["persisted_point_count"],
+            2,
+        )
+        points = self.store.list_daily_message_points(run_id=summary["run_id"], limit=20)
+        self.assertEqual(
+            {item["message_id"] for item in points},
+            {int(item["message_ids"][0]) for item in calls},
+        )
+
+    def test_parent_topic_messages_are_canonicalized_once_for_points(self) -> None:
+        self._origin(-9201, "Parent", "info")
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-9201,
+                topic_id=42,
+                parent_origin_id=-9201,
+                origin_type="topic",
+                title="Topic 42",
+            )
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-9201,
+                topic_id=42,
+                enabled=True,
+                tags="topic,info",
+            )
+        )
+        for message_id, topic_id, text in (
+            (1, None, "parent-only message"),
+            (42, 42, "topic message"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-9201,
+                    topic_id=topic_id,
+                    message_id=message_id,
+                    sent_at="2026-07-03T03:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=text,
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        canonical_messages = {
+            int(item["origin"]["topic_id"]): [message["message_id"] for message in item["messages"]]
+            for item in payload["point_origins"]
+        }
+        self.assertEqual(canonical_messages, {0: [1], 42: [42]})
+
+        fake_config, fake_log = self._structured_ai_config()
+        summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
+
+        self.assertEqual(summary["status"], "completed")
+        point_calls = [
+            item
+            for item in self._structured_provider_calls(fake_log)
+            if item["task"] == "message_point_extraction"
+        ]
+        self.assertEqual(
+            {(item["origin"]["topic_id"], tuple(item["message_ids"])) for item in point_calls},
+            {(0, (1,)), (42, (42,))},
+        )
+        points = self.store.list_daily_message_points(run_id=summary["run_id"], limit=20)
+        self.assertEqual({(item["topic_id"], item["message_id"]) for item in points}, {(0, 1), (42, 42)})
+
+    def test_ai_command_placeholders_expand_model_schema_and_images(self) -> None:
+        output_path = self.root / "point.json"
+        schema_path = self.root / "point.schema.json"
+
+        expanded = _expand_command(
+            ["codex", "exec", "{model}", "{output_schema}", "{images}", "--task={task}", "{output}"],
+            output_path,
+            ["one.png", "two.png"],
+            task_name="message_point_extraction",
+            model="gpt-5.6-sol",
+            output_schema_path=schema_path,
+        )
+
+        self.assertEqual(
+            expanded,
+            [
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5.6-sol",
+                "--output-schema",
+                str(schema_path),
+                "--image",
+                "one.png",
+                "--image",
+                "two.png",
+                "--task=message_point_extraction",
+                str(output_path),
+            ],
+        )
+
+        legacy = _expand_command(
+            [
+                "codex",
+                "-a",
+                "never",
+                "exec",
+                "--skip-git-repo-check",
+                "--output-last-message",
+                "{output}",
+                "{images}",
+                "-",
+            ],
+            output_path,
+            [],
+            task_name="message_point_extraction",
+            model="gpt-5.6-sol",
+            output_schema_path=schema_path,
+        )
+        exec_index = legacy.index("exec")
+        self.assertEqual(
+            legacy[exec_index + 1 : exec_index + 5],
+            ["--model", "gpt-5.6-sol", "--output-schema", str(schema_path)],
+        )
+        self.assertEqual(legacy.count("--model"), 1)
+        self.assertEqual(legacy.count("--output-schema"), 1)
 
     def test_daily_package_adds_telegram_deeplinks_for_message_links(self) -> None:
         self._origin(-8001, "Public Link", "info")
@@ -315,6 +553,36 @@ class DailyPackagingTest(unittest.TestCase):
 
         self.assertEqual(messages[42]["telegram_deeplink"], "tg://resolve?domain=example_channel&post=42")
         self.assertEqual(messages[99]["telegram_deeplink"], "tg://privatepost?channel=1234567890&post=99")
+
+    def test_daily_package_pages_through_complete_origin_history(self) -> None:
+        self._origin(-8050, "Paged Origin", "info")
+        for message_id in range(1, 6):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-8050,
+                    message_id=message_id,
+                    sent_at=f"2026-07-03T01:0{message_id}:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=f"paged message {message_id}",
+                ),
+                event_type="new",
+            )
+
+        with patch("tele_mess_core.daily.PACKAGE_MESSAGE_PAGE_SIZE", 2):
+            package = build_daily_package(
+                self.store,
+                self.config,
+                run_date="2026-07-03",
+                timezone_name="UTC",
+                scope={"account_id": "main"},
+            )
+
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        point_messages = payload["point_origins"][0]["messages"]
+        self.assertEqual([item["message_id"] for item in point_messages], [1, 2, 3, 4, 5])
+        self.assertEqual(payload["stats"]["message_count"], 5)
 
     def test_important_origin_prompt_includes_all_messages_past_normal_limit(self) -> None:
         self._origin(-7001, "Important Full", "trade,info", important=True)
@@ -389,7 +657,8 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(summary["group_count"], 1)
         records = self.store.list_daily_summary_records(package_run_id=package["run_id"])
         self.assertEqual(len(records), 1)
-        self.assertEqual(records[0]["tags_csv"], "web3,info")
+        self.assertEqual(records[0]["record_type"], "point_daily")
+        self.assertEqual(records[0]["tags_csv"], "point")
 
     def test_schedule_update_writes_systemd_user_timer_files(self) -> None:
         schedule = update_daily_package_schedule(
@@ -632,6 +901,81 @@ daily:
             self.assertEqual(current["progress_label"], "canceled")
         finally:
             worker.stop()
+
+    def _structured_ai_config(self, *, delivery: bool = False) -> tuple[AppConfig, Path]:
+        provider_path = self.root / "structured_provider.py"
+        log_path = self.root / f"structured_provider_{uuid.uuid4().hex}.jsonl"
+        provider_path.write_text(
+            "from pathlib import Path\n"
+            "import json\n"
+            "import sqlite3\n"
+            "import sys\n"
+            "prompt = sys.stdin.read()\n"
+            "output = Path(sys.argv[1])\n"
+            "task = sys.argv[2]\n"
+            "log_path = Path(sys.argv[3])\n"
+            "extra = sys.argv[4:]\n"
+            "origin = {}\n"
+            "evidence = []\n"
+            "persisted_point_count = None\n"
+            "if task == 'message_point_extraction':\n"
+            "    origin_text, evidence_text = prompt.split('Origin metadata:\\n', 1)[1].split('\\n\\nMessage evidence:\\n', 1)\n"
+            "    origin = json.loads(origin_text)\n"
+            "    evidence = json.loads(evidence_text)\n"
+            "    first = evidence[0]\n"
+            "    last = evidence[-1]\n"
+            "    payload = {'points': [{'source_message_ids': [first['message_id']], 'tags': ['derived'], "
+            "'content': f\"Point for {origin.get('origin_id')}/{origin.get('topic_id', 0)} messages {first['message_id']}-{last['message_id']}\", "
+            "'importance_score': 4, 'importance_reason': 'fake material update', "
+            "'occurred_at': '1900-01-01T00:00:00+00:00', "
+            "'telegram_deeplink': 'tg://resolve?domain=forged&post=1'}]}\n"
+            "    output.write_text(json.dumps(payload, ensure_ascii=False), encoding='utf-8')\n"
+            "else:\n"
+            "    if task == 'daily_point_summary':\n"
+            "        with sqlite3.connect(log_path.parent / 'archive.db') as connection:\n"
+            "            persisted_point_count = connection.execute('SELECT COUNT(*) FROM daily_message_points').fetchone()[0]\n"
+            "    output.write_text(f'# Fake {task}\\n\\nGenerated from validated inputs.\\n', encoding='utf-8')\n"
+            "with log_path.open('a', encoding='utf-8') as handle:\n"
+            "    handle.write(json.dumps({'task': task, 'args': extra, 'origin': origin, "
+            "'message_ids': [item.get('message_id') for item in evidence], "
+            "'persisted_point_count': persisted_point_count}, ensure_ascii=False) + '\\n')\n",
+            encoding="utf-8",
+        )
+        return (
+            AppConfig(
+                storage=self.config.storage,
+                telegram=self.config.telegram,
+                server=self.config.server,
+                logging=self.config.logging,
+                daily=DailyPackagingConfig(
+                    output_dir=self.config.daily.output_dir,
+                    systemd_user_dir=self.config.daily.systemd_user_dir,
+                    ai=DailyAiConfig(
+                        provider="fake-structured",
+                        model="gpt-5.6-sol",
+                        command=[
+                            sys.executable,
+                            str(provider_path),
+                            "{output}",
+                            "{task}",
+                            str(log_path),
+                            "{output_schema}",
+                            "{images}",
+                        ],
+                    ),
+                    delivery=DailyDeliveryConfig(
+                        enabled=delivery,
+                        account_id="main" if delivery else "",
+                        origin_id=-9900 if delivery else None,
+                    ),
+                ),
+                config_path=self.config.config_path,
+            ),
+            log_path,
+        )
+
+    def _structured_provider_calls(self, log_path: Path) -> list[dict[str, object]]:
+        return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
 
     def _origin(self, origin_id: int, title: str, tags: str, important: bool = False) -> None:
         self.store.upsert_origin(

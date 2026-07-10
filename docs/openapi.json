@@ -547,6 +547,155 @@
         ],
         "type": "object"
       },
+      "DailyMessagePoint": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "content": {
+            "type": "string"
+          },
+          "created_at": {
+            "type": "string"
+          },
+          "date": {
+            "type": "string"
+          },
+          "importance_reason": {
+            "nullable": true,
+            "type": "string"
+          },
+          "importance_score": {
+            "maximum": 5,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "job_status": {
+            "nullable": true,
+            "type": "string"
+          },
+          "message_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "occurred_at": {
+            "type": "string"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "origin_important": {
+            "type": "boolean"
+          },
+          "origin_title": {
+            "nullable": true,
+            "type": "string"
+          },
+          "package_run_id": {
+            "type": "string"
+          },
+          "permalink": {
+            "nullable": true,
+            "type": "string"
+          },
+          "point_id": {
+            "type": "string"
+          },
+          "provider": {
+            "nullable": true,
+            "type": "string"
+          },
+          "run_id": {
+            "type": "string"
+          },
+          "run_status": {
+            "nullable": true,
+            "type": "string"
+          },
+          "source": {
+            "type": "string"
+          },
+          "source_refs": {
+            "items": {
+              "oneOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "object"
+                }
+              ]
+            },
+            "type": "array"
+          },
+          "tags": {
+            "items": {
+              "type": "string"
+            },
+            "type": "array"
+          },
+          "tags_csv": {
+            "nullable": true,
+            "type": "string"
+          },
+          "telegram_deeplink": {
+            "nullable": true,
+            "type": "string"
+          },
+          "timezone": {
+            "type": "string"
+          },
+          "topic_id": {
+            "type": "integer"
+          },
+          "updated_at": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "point_id",
+          "run_id",
+          "package_run_id",
+          "date",
+          "timezone",
+          "source",
+          "account_id",
+          "origin_id",
+          "topic_id",
+          "occurred_at",
+          "tags",
+          "content",
+          "importance_score",
+          "origin_important",
+          "source_refs"
+        ],
+        "type": "object"
+      },
+      "DailyMessagePointListResponse": {
+        "properties": {
+          "items": {
+            "items": {
+              "$ref": "#/components/schemas/DailyMessagePoint"
+            },
+            "type": "array"
+          }
+        },
+        "required": [
+          "items"
+        ],
+        "type": "object"
+      },
+      "DailyMessagePointResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailyMessagePoint"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
       "DailyPackageRun": {
         "properties": {
           "date": {
@@ -1018,6 +1167,9 @@
             "nullable": true,
             "type": "string"
           },
+          "record_type": {
+            "type": "string"
+          },
           "run_id": {
             "type": "string"
           },
@@ -1056,6 +1208,7 @@
         "required": [
           "summary_id",
           "run_id",
+          "record_type",
           "content_preview"
         ],
         "type": "object"
@@ -2379,8 +2532,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-10.2",
-    "x-contract-hash": "28e087b419802ee3"
+    "version": "2026-07-10.4",
+    "x-contract-hash": "bf0d29cf60733f79"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3564,6 +3717,310 @@
         ]
       }
     },
+    "/manage/daily-message-points": {
+      "get": {
+        "operationId": "get_manage_daily_message_points",
+        "parameters": [
+          {
+            "description": "Filter by message point ID.",
+            "in": "query",
+            "name": "point_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by summary run ID.",
+            "in": "query",
+            "name": "run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by package run ID.",
+            "in": "query",
+            "name": "package_run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by local package date.",
+            "in": "query",
+            "name": "date",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter points on or after this local date.",
+            "in": "query",
+            "name": "date_from",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter points on or before this local date.",
+            "in": "query",
+            "name": "date_to",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by source system.",
+            "in": "query",
+            "name": "source",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Local Telegram account ID.",
+            "in": "query",
+            "name": "account_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Filter by Telegram origin ID.",
+            "in": "query",
+            "name": "origin_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by Telegram topic ID.",
+            "in": "query",
+            "name": "topic_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by primary source message ID.",
+            "in": "query",
+            "name": "message_id",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Required tag. Repeatable; all tags must match.",
+            "in": "query",
+            "name": "tag",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Comma-separated required tags; all tags must match.",
+            "in": "query",
+            "name": "tags",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Minimum importance score from 1 to 5.",
+            "in": "query",
+            "name": "importance_min",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Maximum importance score from 1 to 5.",
+            "in": "query",
+            "name": "importance_max",
+            "required": false,
+            "schema": {
+              "type": "integer"
+            }
+          },
+          {
+            "description": "Filter by the origin's important flag.",
+            "in": "query",
+            "name": "origin_important",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Filter by point content, origin title, or importance reason substring.",
+            "in": "query",
+            "name": "q",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Include points from running, failed, or canceled summary runs.",
+            "in": "query",
+            "name": "include_incomplete",
+            "required": false,
+            "schema": {
+              "default": false,
+              "type": "boolean"
+            }
+          },
+          {
+            "description": "Maximum message points to return.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 100,
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyMessagePointListResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "List stored daily message points.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-message-points/item": {
+      "get": {
+        "operationId": "get_manage_daily_message_points_item",
+        "parameters": [
+          {
+            "description": "Message point ID.",
+            "in": "query",
+            "name": "point_id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailyMessagePointResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return one stored daily message point.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
     "/manage/daily-package-runs": {
       "get": {
         "operationId": "get_manage_daily_package_runs",
@@ -4476,6 +4933,15 @@
             }
           },
           {
+            "description": "Filter by stored artifact type, such as important_daily or point_daily.",
+            "in": "query",
+            "name": "record_type",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Filter summaries that include important origins.",
             "in": "query",
             "name": "important",
@@ -4691,6 +5157,15 @@
             "description": "Summary run ID.",
             "in": "query",
             "name": "run_id",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Stored artifact type when a run has multiple records.",
+            "in": "query",
+            "name": "record_type",
             "required": false,
             "schema": {
               "type": "string"

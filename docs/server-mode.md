@@ -20,8 +20,8 @@ The server does:
 - Expose token-protected management endpoints for account state, origins,
   backup policies, participant metadata, and capture cursors.
 - Serve a built-in web console for account login, origin selection, backup
-  policy editing, participant refresh, cursor inspection, and media-file
-  inspection.
+  policy editing, participant refresh, cursor/media inspection, daily run
+  status, typed summary records, and message-point lookup.
 - Run bounded history backfill and reconnect catch-up using per-origin cursors.
 - Discover origins/topics and refresh participants from authenticated Telegram
   sessions on management request.
@@ -30,8 +30,8 @@ The server does:
 - Generate daily packages from archived messages by local date, timezone,
   origin, and tag group.
 - Run local Codex-backed daily analysis on demand: image OCR/visual analysis,
-  normal-origin key extraction, tag-group analysis, important-origin analysis,
-  final rollup, and stored summary content for direct API lookup/filtering.
+  all-origin structured message-point extraction, full-context important-origin
+  analysis, an important-only daily report, and a separate point-based digest.
 - Manage a daily package system timer through user-level systemd timer files.
 
 The server does not:
@@ -45,8 +45,8 @@ The server does not:
 Telegram account(s) -> Telethon adapter(s) -> SQLite archive -> Sync API -> Mac client
 Mac/web client -> Management API -> account/origin/policy/participant tables
 Systemd user timer -> CLI daily-package -> SQLite archive -> package files
-Manual/API trigger -> daily-summary -> staged local Codex CLI tasks -> summary files + SQLite summary records
-API/systemd trigger -> durable daily job queue -> package + summary -> delivery outbox -> Telegram target
+Manual/API trigger -> daily-summary -> staged local Codex CLI tasks -> important report + message points + point digest
+API/systemd trigger -> durable daily job queue -> package + analysis -> typed summary records + SQLite points -> delivery outbox -> Telegram target
 ```
 
 ## Runtime Ownership
@@ -110,7 +110,8 @@ daily:
   cli_path: "/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core"
   ai:
     provider: "codex-cli"
-    # command can use {output}, {images}, and {task}
+    model: "gpt-5.6-sol"
+    # command can use {model}, {output_schema}, {output}, {images}, and {task}
     timeout_seconds: 900
 ```
 
@@ -192,13 +193,17 @@ basic control-plane model for future Mac and web clients:
 10. Use `GET`/`PATCH /manage/daily-package-schedule` to inspect or update the
    daily package system timer settings.
 11. Use `GET`/`PATCH /manage/daily-summary-delivery` to inspect or persist the
-   account, group/channel, and optional topic that receives the final summary.
-   SQLite delivery settings override the YAML fallback.
+   account, group/channel, and optional topic that receives the important report
+   and the separate `#point` digest. SQLite delivery settings override the YAML
+   fallback.
 12. Use `POST /manage/daily-packages` to generate one package immediately, and
    `GET /manage/daily-package-runs` to inspect package run state.
 13. Use `POST /manage/daily-summaries` to enqueue or wait for one summary,
    `GET /manage/daily-summary-runs` to inspect run state, and
-   `GET /manage/daily-summary-records` to list/filter stored summary content.
+   `GET /manage/daily-summary-records` to list/filter typed important and point
+   summary content. Use `GET /manage/daily-message-points` and
+   `GET /manage/daily-message-points/item` to search or inspect the structured
+   points extracted from all eligible origins.
 14. Use `POST`/`GET /manage/daily-summary-jobs` to enqueue and inspect the
     durable package-plus-summary workflow, and
     `PATCH /manage/daily-summary-jobs/cancel` to request cancellation.

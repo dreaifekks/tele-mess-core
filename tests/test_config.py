@@ -75,6 +75,7 @@ daily:
   cli_path: ./bin/tele-mess-core
   ai:
     provider: disabled
+    model: gpt-5.6-terra
     command: [python3, -c, pass]
     timeout_seconds: 12
   delivery:
@@ -92,11 +93,33 @@ daily:
         self.assertEqual(config.daily.systemd_user_dir, Path(tmp) / "systemd-user")
         self.assertEqual(config.daily.cli_path, "./bin/tele-mess-core")
         self.assertEqual(config.daily.ai.provider, "disabled")
+        self.assertEqual(config.daily.ai.model, "gpt-5.6-terra")
         self.assertEqual(config.daily.ai.timeout_seconds, 12)
         self.assertTrue(config.daily.delivery.enabled)
         self.assertEqual(config.daily.delivery.account_id, "main")
         self.assertEqual(config.daily.delivery.origin_id, -1001)
         self.assertEqual(config.daily.delivery.topic_id, 42)
+
+    def test_daily_ai_defaults_to_gpt_5_6_sol_with_structured_output_placeholders(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yml"
+            config_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.daily.ai.provider, "codex-cli")
+        self.assertEqual(config.daily.ai.model, "gpt-5.6-sol")
+        self.assertIn("{model}", config.daily.ai.command)
+        self.assertIn("{output_schema}", config.daily.ai.command)
 
     def test_daily_delivery_requires_target_when_enabled(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

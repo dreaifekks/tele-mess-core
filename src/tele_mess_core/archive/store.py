@@ -14,6 +14,7 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailyMessagePointRecord,
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
     DailySummaryDeliveryRecord,
@@ -31,7 +32,7 @@ from tele_mess_core.models import (
 from tele_mess_core.archive.migrations import apply_migrations
 
 
-SCHEMA_VERSION = 15
+SCHEMA_VERSION = 16
 LEGACY_SCHEMA_BASELINE = 12
 
 
@@ -1119,6 +1120,7 @@ class ArchiveStore:
         window_start: str = "",
         window_end: str = "",
         limit: int = 10000,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         clauses = [
             "m.source = ?",
@@ -1152,9 +1154,10 @@ class ArchiveStore:
              AND o.topic_id = COALESCE(m.topic_id, 0)
             WHERE {" AND ".join(clauses)}
             ORDER BY m.sent_at ASC, m.message_id ASC
-            LIMIT ?
+            LIMIT ? OFFSET ?
         """
         params.append(_bounded_limit(limit, max_limit=50000))
+        params.append(max(0, int(offset)))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}, bool_fields={"has_media"}) for row in rows]
@@ -1748,8 +1751,238 @@ class ArchiveStore:
                     """,
                     (now, now, job_id),
                 )
+                self._conn.execute(
+                    "DELETE FROM delivery_outbox WHERE job_id = ? AND status != 'sent'",
+                    (job_id,),
+                )
                 self._conn.commit()
         return self.get_daily_summary_job(job_id)
+
+    def upsert_daily_message_point(
+        self,
+        point: DailyMessagePointRecord,
+        *,
+        commit: bool = True,
+    ) -> dict[str, Any]:
+        importance_score = int(point.importance_score)
+        if not 1 <= importance_score <= 5:
+            raise ValueError("daily message point importance_score must be between 1 and 5")
+        now = point.updated_at or utc_now_iso()
+        created_at = point.created_at or now
+        tags_json = _json_array_text(point.tags_json, "tags_json")
+        source_refs_json = _json_array_text(point.source_refs_json, "source_refs_json")
+        tags_csv = point.tags_csv if point.tags_csv is not None else _tags_csv_from_json(tags_json)
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_message_points(
+                  point_id, run_id, package_run_id, date, timezone, source, account_id,
+                  origin_id, topic_id, origin_title, message_id, occurred_at, tags_json,
+                  tags_csv, content, telegram_deeplink, permalink, importance_score,
+                  importance_reason, origin_important, source_refs_json, provider,
+                  created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(point_id) DO UPDATE SET
+                  run_id = excluded.run_id,
+                  package_run_id = excluded.package_run_id,
+                  date = excluded.date,
+                  timezone = excluded.timezone,
+                  source = excluded.source,
+                  account_id = excluded.account_id,
+                  origin_id = excluded.origin_id,
+                  topic_id = excluded.topic_id,
+                  origin_title = excluded.origin_title,
+                  message_id = excluded.message_id,
+                  occurred_at = excluded.occurred_at,
+                  tags_json = excluded.tags_json,
+                  tags_csv = excluded.tags_csv,
+                  content = excluded.content,
+                  telegram_deeplink = excluded.telegram_deeplink,
+                  permalink = excluded.permalink,
+                  importance_score = excluded.importance_score,
+                  importance_reason = excluded.importance_reason,
+                  origin_important = excluded.origin_important,
+                  source_refs_json = excluded.source_refs_json,
+                  provider = excluded.provider,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    point.point_id,
+                    point.run_id,
+                    point.package_run_id,
+                    point.date,
+                    point.timezone,
+                    point.source,
+                    point.account_id,
+                    int(point.origin_id),
+                    int(point.topic_id),
+                    point.origin_title,
+                    point.message_id,
+                    point.occurred_at,
+                    tags_json,
+                    tags_csv,
+                    point.content,
+                    point.telegram_deeplink,
+                    point.permalink,
+                    importance_score,
+                    point.importance_reason,
+                    int(point.origin_important),
+                    source_refs_json,
+                    point.provider,
+                    created_at,
+                    now,
+                ),
+            )
+            if commit:
+                self._conn.commit()
+        item = self.get_daily_message_point(point.point_id)
+        if item is None:
+            raise ValueError("daily message point was not persisted")
+        return item
+
+    def persist_daily_message_points(
+        self,
+        run_id: str,
+        points: list[DailyMessagePointRecord],
+    ) -> list[dict[str, Any]]:
+        clean_run_id = str(run_id or "").strip()
+        if not clean_run_id:
+            raise ValueError("daily message point run_id is required")
+        if any(point.run_id != clean_run_id for point in points):
+            raise ValueError("all daily message points must belong to the replacement run_id")
+        persisted: list[dict[str, Any]] = []
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                self._conn.execute("DELETE FROM daily_message_points WHERE run_id = ?", (clean_run_id,))
+                for point in points:
+                    persisted.append(self.upsert_daily_message_point(point, commit=False))
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return persisted
+
+    def get_daily_message_point(self, point_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT p.point_id, p.run_id, p.package_run_id, p.date, p.timezone, p.source, p.account_id,
+                       p.origin_id, p.topic_id, p.origin_title, p.message_id, p.occurred_at, p.tags_json,
+                       p.tags_csv, p.content, p.telegram_deeplink, p.permalink, p.importance_score,
+                       p.importance_reason, p.origin_important, p.source_refs_json, p.provider,
+                       p.created_at, p.updated_at, r.status AS run_status,
+                       (
+                         SELECT j.status FROM daily_summary_jobs j
+                         WHERE j.summary_run_id = p.run_id
+                         ORDER BY j.updated_at DESC LIMIT 1
+                       ) AS job_status
+                FROM daily_message_points p
+                LEFT JOIN daily_summary_runs r ON r.run_id = p.run_id
+                WHERE p.point_id = ?
+                """,
+                (point_id,),
+            ).fetchone()
+        return _daily_message_point_from_row(row) if row is not None else None
+
+    def list_daily_message_points(
+        self,
+        *,
+        point_id: str | None = None,
+        run_id: str | None = None,
+        package_run_id: str | None = None,
+        date: str | None = None,
+        date_from: str | None = None,
+        date_to: str | None = None,
+        source: str | None = None,
+        account_id: str | None = None,
+        origin_id: int | None = None,
+        topic_id: int | None = None,
+        message_id: int | None = None,
+        tags: list[str] | None = None,
+        importance_min: int | None = None,
+        importance_max: int | None = None,
+        origin_important: bool | None = None,
+        q: str | None = None,
+        include_incomplete: bool = False,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        if importance_min is not None and not 1 <= int(importance_min) <= 5:
+            raise ValueError("importance_min must be between 1 and 5")
+        if importance_max is not None and not 1 <= int(importance_max) <= 5:
+            raise ValueError("importance_max must be between 1 and 5")
+        if importance_min is not None and importance_max is not None and int(importance_min) > int(importance_max):
+            raise ValueError("importance_min must not exceed importance_max")
+        sql = """
+            SELECT p.point_id, p.run_id, p.package_run_id, p.date, p.timezone, p.source,
+                   p.account_id, p.origin_id, p.topic_id, p.origin_title, p.message_id,
+                   p.occurred_at, p.tags_json, p.tags_csv, p.content, p.telegram_deeplink,
+                   p.permalink, p.importance_score, p.importance_reason, p.origin_important,
+                   p.source_refs_json, p.provider, p.created_at, p.updated_at,
+                   r.status AS run_status,
+                   (
+                     SELECT j.status FROM daily_summary_jobs j
+                     WHERE j.summary_run_id = p.run_id
+                     ORDER BY j.updated_at DESC LIMIT 1
+                   ) AS job_status
+            FROM daily_message_points p
+            LEFT JOIN daily_summary_runs r ON r.run_id = p.run_id
+        """
+        clauses: list[str] = []
+        params: list[Any] = []
+        for column, value in (
+            ("p.point_id", point_id),
+            ("p.run_id", run_id),
+            ("p.package_run_id", package_run_id),
+            ("p.date", date),
+            ("p.source", source),
+            ("p.account_id", account_id),
+            ("p.origin_id", origin_id),
+            ("p.topic_id", topic_id),
+            ("p.message_id", message_id),
+        ):
+            if value is not None and value != "":
+                clauses.append(f"{column} = ?")
+                params.append(value)
+        if date_from:
+            clauses.append("p.date >= ?")
+            params.append(date_from)
+        if date_to:
+            clauses.append("p.date <= ?")
+            params.append(date_to)
+        if importance_min is not None:
+            clauses.append("p.importance_score >= ?")
+            params.append(int(importance_min))
+        if importance_max is not None:
+            clauses.append("p.importance_score <= ?")
+            params.append(int(importance_max))
+        if origin_important is not None:
+            clauses.append("p.origin_important = ?")
+            params.append(int(origin_important))
+        if q:
+            clauses.append("(p.content LIKE ? OR p.origin_title LIKE ? OR p.importance_reason LIKE ?)")
+            pattern = f"%{q}%"
+            params.extend((pattern, pattern, pattern))
+        if not include_incomplete:
+            clauses.append("r.status = 'completed'")
+            clauses.append(
+                "NOT EXISTS (SELECT 1 FROM daily_summary_jobs hidden_job "
+                "WHERE hidden_job.summary_run_id = p.run_id AND hidden_job.status != 'completed')"
+            )
+        for tag in {_normalize_tag(item) for item in (tags or []) if _normalize_tag(item)}:
+            clauses.append(
+                "EXISTS (SELECT 1 FROM json_each(p.tags_json) point_tag "
+                "WHERE lower(trim(CAST(point_tag.value AS TEXT))) = ?)"
+            )
+            params.append(tag)
+        if clauses:
+            sql += " WHERE " + " AND ".join(clauses)
+        sql += " ORDER BY p.date DESC, p.occurred_at DESC, p.point_id DESC LIMIT ?"
+        params.append(_bounded_limit(limit, max_limit=1000))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [_daily_message_point_from_row(row) for row in rows]
 
     def upsert_daily_summary_record(
         self,
@@ -1761,16 +1994,17 @@ class ArchiveStore:
         created_at = record.created_at or now
         content_length = record.content_length or len(record.content_md)
         tags_csv = record.tags_csv if record.tags_csv is not None else _tags_csv_from_json(record.tags_json)
+        record_type = _summary_record_type(record.record_type, record.content_json)
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO daily_summary_records(
                   summary_id, run_id, package_run_id, date, timezone, scope_json,
-                  tags_json, tags_csv, important, provider, title, content_md, content_json,
+                  tags_json, tags_csv, important, record_type, provider, title, content_md, content_json,
                   summary_path, origin_count, group_count, image_count, content_length,
                   deleted_at, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(summary_id) DO UPDATE SET
                   run_id = excluded.run_id,
                   package_run_id = excluded.package_run_id,
@@ -1780,6 +2014,7 @@ class ArchiveStore:
                   tags_json = excluded.tags_json,
                   tags_csv = excluded.tags_csv,
                   important = excluded.important,
+                  record_type = excluded.record_type,
                   provider = excluded.provider,
                   title = excluded.title,
                   content_md = excluded.content_md,
@@ -1802,6 +2037,7 @@ class ArchiveStore:
                     record.tags_json,
                     tags_csv,
                     int(record.important),
+                    record_type,
                     record.provider,
                     record.title,
                     record.content_md,
@@ -1827,6 +2063,7 @@ class ArchiveStore:
         self,
         records: list[DailySummaryRecord],
         outbox_items: list[dict[str, Any]] | None = None,
+        message_points: list[DailyMessagePointRecord] | None = None,
     ) -> list[dict[str, Any]]:
         persisted: list[dict[str, Any]] = []
         with self._lock:
@@ -1834,6 +2071,18 @@ class ArchiveStore:
             try:
                 for record in records:
                     persisted.append(self.upsert_daily_summary_record(record, commit=False))
+                if message_points is not None:
+                    point_run_ids = {point.run_id for point in message_points}
+                    if not point_run_ids:
+                        point_run_ids = {record.run_id for record in records}
+                    if len(point_run_ids) != 1:
+                        raise ValueError("daily message point batch must belong to exactly one run_id")
+                    point_run_id = next(iter(point_run_ids))
+                    if any(point.run_id != point_run_id for point in message_points):
+                        raise ValueError("all daily message points must belong to the replacement run_id")
+                    self._conn.execute("DELETE FROM daily_message_points WHERE run_id = ?", (point_run_id,))
+                    for point in message_points:
+                        self.upsert_daily_message_point(point, commit=False)
                 for item in outbox_items or []:
                     now = str(item.get("created_at") or utc_now_iso())
                     self._conn.execute(
@@ -1865,6 +2114,30 @@ class ArchiveStore:
                 self._conn.rollback()
                 raise
         return persisted
+
+    def discard_unsent_delivery_outbox(
+        self,
+        *,
+        job_id: str | None = None,
+        summary_run_id: str | None = None,
+    ) -> int:
+        clauses = ["status != 'sent'"]
+        params: list[Any] = []
+        if job_id:
+            clauses.append("job_id = ?")
+            params.append(job_id)
+        if summary_run_id:
+            clauses.append("summary_run_id = ?")
+            params.append(summary_run_id)
+        if len(clauses) == 1:
+            raise ValueError("job_id or summary_run_id is required to discard delivery outbox rows")
+        with self._lock:
+            cur = self._conn.execute(
+                "DELETE FROM delivery_outbox WHERE " + " AND ".join(clauses),
+                tuple(params),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
 
     def list_delivery_outbox(
         self,
@@ -1986,6 +2259,7 @@ class ArchiveStore:
         *,
         summary_id: str | None = None,
         run_id: str | None = None,
+        record_type: str | None = None,
         include_deleted: bool = False,
     ) -> dict[str, Any] | None:
         clauses: list[str] = []
@@ -1996,6 +2270,9 @@ class ArchiveStore:
         if run_id:
             clauses.append("run_id = ?")
             params.append(run_id)
+        if record_type:
+            clauses.append("record_type = ?")
+            params.append(record_type)
         if not clauses:
             return None
         if not include_deleted:
@@ -2004,7 +2281,7 @@ class ArchiveStore:
             row = self._conn.execute(
                 """
                 SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
-                       tags_json, tags_csv, important, provider, title, content_md, content_json,
+                       tags_json, tags_csv, important, record_type, provider, title, content_md, content_json,
                        summary_path, origin_count, group_count, image_count, content_length,
                        deleted_at, created_at, updated_at
                 FROM daily_summary_records
@@ -2028,6 +2305,7 @@ class ArchiveStore:
         date_from: str | None = None,
         date_to: str | None = None,
         provider: str | None = None,
+        record_type: str | None = None,
         important: bool | None = None,
         tags: list[str] | None = None,
         q: str | None = None,
@@ -2038,7 +2316,7 @@ class ArchiveStore:
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT summary_id, run_id, package_run_id, date, timezone, scope_json,
-                   tags_json, tags_csv, important, provider, title, content_md, content_json,
+                   tags_json, tags_csv, important, record_type, provider, title, content_md, content_json,
                    summary_path, origin_count, group_count, image_count, content_length,
                    deleted_at, created_at, updated_at
             FROM daily_summary_records
@@ -2066,6 +2344,9 @@ class ArchiveStore:
         if provider:
             clauses.append("provider = ?")
             params.append(provider)
+        if record_type:
+            clauses.append("record_type = ?")
+            params.append(record_type)
         if important is not None:
             clauses.append("important = ?")
             params.append(int(important))
@@ -2523,6 +2804,11 @@ class ArchiveStore:
                 """
             )
         self._ensure_column("daily_summary_records", "deleted_at", "TEXT")
+        if self._has_column("daily_summary_records", "record_type"):
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_daily_summary_records_type_date "
+                "ON daily_summary_records(record_type, date, created_at)"
+            )
         if self._has_table("messages"):
             self._ensure_message_fts_triggers()
 
@@ -2553,6 +2839,7 @@ class ArchiveStore:
               tags_json TEXT,
               tags_csv TEXT,
               important INTEGER NOT NULL DEFAULT 0,
+              record_type TEXT NOT NULL DEFAULT 'summary',
               provider TEXT,
               title TEXT,
               content_md TEXT NOT NULL,
@@ -2568,7 +2855,7 @@ class ArchiveStore:
             );
             INSERT INTO daily_summary_records(
               summary_id, run_id, package_run_id, date, timezone, scope_json,
-              tags_json, tags_csv, important, provider, title, content_md, content_json,
+              tags_json, tags_csv, important, record_type, provider, title, content_md, content_json,
               summary_path, origin_count, group_count, image_count, content_length,
               deleted_at, created_at, updated_at
             )
@@ -2582,7 +2869,13 @@ class ArchiveStore:
                   ELSE NULL
                 END
               ),
-              important, provider, title, content_md, content_json,
+              important,
+              CASE
+                WHEN content_json IS NOT NULL AND content_json != '' AND json_valid(content_json)
+                THEN COALESCE(CAST(json_extract(content_json, '$.record_type') AS TEXT), 'summary')
+                ELSE 'summary'
+              END,
+              provider, title, content_md, content_json,
               summary_path, origin_count, group_count, image_count, content_length,
               NULL, created_at, updated_at
             FROM daily_summary_records_old_unique;
@@ -2590,6 +2883,7 @@ class ArchiveStore:
             CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
             CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
             CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
+            CREATE INDEX IF NOT EXISTS idx_daily_summary_records_type_date ON daily_summary_records(record_type, date, created_at);
             COMMIT;
             """
         )
@@ -2747,6 +3041,19 @@ def _summary_record_from_row(row: sqlite3.Row, *, include_content: bool) -> dict
     return data
 
 
+def _daily_message_point_from_row(row: sqlite3.Row) -> dict[str, Any]:
+    data = _row_to_dict(
+        row,
+        json_fields={"tags_json", "source_refs_json"},
+        bool_fields={"origin_important"},
+    )
+    data["tags"] = data.pop("tags_json") or []
+    data["source_refs"] = data.pop("source_refs_json") or []
+    if not data.get("tags_csv"):
+        data["tags_csv"] = ",".join(str(tag) for tag in data["tags"])
+    return data
+
+
 def _summary_job_from_row(row: sqlite3.Row) -> dict[str, Any]:
     data = _row_to_dict(row, json_fields={"scope_json", "progress_json", "request_json"})
     data["scope"] = data.pop("scope_json") or {}
@@ -2765,6 +3072,34 @@ def _tags_csv_from_json(tags_json: str | None) -> str | None:
     if not isinstance(value, list):
         return None
     return ",".join(str(tag).strip() for tag in value if str(tag).strip())
+
+
+def _json_array_text(value: str | None, field: str) -> str:
+    if not value:
+        return "[]"
+    try:
+        payload = json.loads(value)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"daily message point {field} must be valid JSON") from exc
+    if not isinstance(payload, list):
+        raise ValueError(f"daily message point {field} must be a JSON array")
+    return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def _summary_record_type(record_type: str | None, content_json: str | None) -> str:
+    normalized = str(record_type or "").strip()
+    if normalized and normalized != "summary":
+        return normalized
+    if content_json:
+        try:
+            payload = json.loads(content_json)
+        except json.JSONDecodeError:
+            payload = None
+        if isinstance(payload, dict):
+            derived = str(payload.get("record_type") or "").strip()
+            if derived:
+                return derived
+    return normalized or "summary"
 
 
 def _normalize_tag(tag: Any) -> str:

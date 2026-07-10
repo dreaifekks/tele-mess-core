@@ -90,6 +90,7 @@
     .media-preview img, .media-preview video { display: block; max-width: 220px; max-height: 140px; border: 1px solid var(--line); border-radius: 6px; background: #f8fafc; }
     .media-preview audio { width: 220px; max-width: 100%; }
     .media-name { max-width: 260px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+    .point-content { min-width: 260px; max-width: 520px; white-space: pre-wrap; overflow-wrap: anywhere; }
     .status { min-height: 28px; border: 1px solid var(--line); border-radius: 6px; background: #fbfcfe; padding: 7px 9px; font-size: 13px; color: var(--muted); }
     .status.ok { color: var(--ok); border-color: #bbdfc5; background: #f0fdf4; }
     .status.warn { color: var(--warn); border-color: #dfc16d; background: #fffbea; }
@@ -203,7 +204,8 @@
         <label class="check"><input type="checkbox" name="activate_systemd"> Activate systemd user timer</label>
         <button class="primary" type="submit">Save schedule</button>
       </form>
-      <h3>Summary delivery</h3>
+      <h3>Daily delivery</h3>
+      <p class="muted">Important summaries and the separate <code>#point</code> daily digest use this Telegram target.</p>
       <form id="daily-delivery-form" class="form-grid">
         <label class="check"><input type="checkbox" name="enabled"> Enabled</label>
         <label>Sender account<input name="account_id" placeholder="main"></label>
@@ -240,7 +242,7 @@
       <div class="panel-head"><h2>Daily Runs</h2><button data-action="load-daily">Refresh</button></div>
       <h3>Schedule</h3>
       <pre id="daily-schedule-raw"></pre>
-      <h3>Summary delivery</h3>
+      <h3>Daily delivery</h3>
       <pre id="daily-delivery-raw"></pre>
       <h3>Summary jobs</h3>
       <div class="table-wrap"><table><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Package</th><th>Summary</th><th>Actions</th></tr></thead><tbody id="daily-summary-jobs-body"></tbody></table></div>
@@ -250,6 +252,17 @@
       <div class="table-wrap"><table><thead><tr><th>Run</th><th>Status</th><th>Package</th><th>Provider</th><th>Progress</th><th>Groups</th><th>Images</th><th>Output</th></tr></thead><tbody id="daily-summary-runs-body"></tbody></table></div>
       <div class="panel-head"><h3>Summary records</h3><div class="toolbar"><label class="check"><input id="show-deleted-summaries" type="checkbox"> Deleted</label><button data-action="toggle-summary-manage">Manage</button><span id="summary-bulk" class="toolbar bulk-toolbar hidden"><button data-action="select-visible-summaries">Select visible</button><button data-action="clear-summary-selection">Clear</button><button data-action="bulk-delete-summaries">Delete selected</button><button data-action="bulk-restore-summaries">Restore selected</button><span id="summary-selection" class="muted">0 selected</span></span></div></div>
       <div class="table-wrap"><table><thead id="daily-summary-records-head"></thead><tbody id="daily-summary-records-body"></tbody></table></div>
+      <div class="panel-head"><h3>Message Points</h3><button data-action="load-message-points">Refresh points</button></div>
+      <form id="message-points-filter-form" class="property-bar">
+        <label>Date<input id="point-date-filter" name="date" type="date"></label>
+        <label>Tag<input id="point-tag-filter" name="tag" list="tag-suggestions" placeholder="point tag"></label>
+        <label>Importance<select id="point-importance-filter" name="importance_min"><option value="">Any score</option><option value="5">5 only</option><option value="4">4+</option><option value="3">3+</option><option value="2">2+</option><option value="1">1+</option></select></label>
+        <label>Origin<select id="point-origin-important-filter" name="origin_important"><option value="">Any origin</option><option value="true">Important</option><option value="false">Other</option></select></label>
+        <label>Account<input id="point-account-filter" name="account_id" placeholder="main"></label>
+        <label>Search<input id="point-search" name="q" placeholder="Point content"></label>
+        <button type="submit">Apply filters</button>
+      </form>
+      <div class="table-wrap"><table><thead><tr><th>Time</th><th>Tags</th><th>Importance</th><th>Content</th><th>Origin</th><th>Telegram</th><th>Run</th></tr></thead><tbody id="daily-message-points-body"></tbody></table></div>
     </div>
   </section>
 
@@ -316,7 +329,7 @@
 <datalist id="tag-suggestions"></datalist>
 
 <script>
-const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailyDelivery: null, dailySummaryJobs: [], dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {}, manageSummaries: false, selectedSummaries: {} };
+const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailyDelivery: null, dailySummaryJobs: [], dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], dailyMessagePoints: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {}, manageSummaries: false, selectedSummaries: {} };
 let messageRefreshTimer = null;
 let dailyRefreshTimer = null;
 let messageRefreshInFlight = false;
@@ -487,6 +500,7 @@ function allTags() {
   return uniqueTags([
     ...state.policies.flatMap(item => splitTags(item.tags)),
     ...state.origins.flatMap(item => splitTags(originTags(item))),
+    ...state.dailyMessagePoints.flatMap(item => Array.isArray(item.tags) ? item.tags : splitTags(item.tags_csv)),
   ]).sort((a, b) => a.localeCompare(b));
 }
 function refreshTagSuggestions() {
@@ -645,6 +659,20 @@ function summaryRecordsPath() {
   const suffix = params.toString();
   return suffix ? `/manage/daily-summary-records?${suffix}` : '/manage/daily-summary-records';
 }
+function messagePointsPath() {
+  const params = new URLSearchParams();
+  const filters = {
+    date: $('point-date-filter')?.value,
+    tag: $('point-tag-filter')?.value.trim(),
+    importance_min: $('point-importance-filter')?.value,
+    origin_important: $('point-origin-important-filter')?.value,
+    account_id: $('point-account-filter')?.value.trim(),
+    q: $('point-search')?.value.trim(),
+  };
+  for (const [key, value] of Object.entries(filters)) if (value !== undefined && value !== '') params.set(key, value);
+  params.set('limit', '200');
+  return `/manage/daily-message-points?${params.toString()}`;
+}
 async function loadOrigins() {
   const data = await api(originPath());
   state.origins = data.items || [];
@@ -657,12 +685,13 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, dailyDelivery, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, dailyDelivery, summaryJobs, packageRuns, summaryRuns, summaryRecords, messagePoints] = await Promise.all([
       api('/manage/api-manifest'), api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
       api('/sync/messages?latest=true&limit=100&include_media=true'), api('/manage/daily-package-schedule'),
       api('/manage/daily-summary-delivery'),
-      api('/manage/daily-summary-jobs'), api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api(summaryRecordsPath())
+      api('/manage/daily-summary-jobs'), api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api(summaryRecordsPath()),
+      api(messagePointsPath())
     ]);
     const contractWarning = updateApiManifest(apiManifest);
     state.service = service;
@@ -681,6 +710,7 @@ async function loadAll() {
     state.dailyPackageRuns = packageRuns.items || [];
     state.dailySummaryRuns = summaryRuns.items || [];
     state.dailySummaryRecords = summaryRecords.items || [];
+    state.dailyMessagePoints = messagePoints.items || [];
     clearSummarySelection();
     refreshTagSuggestions();
     renderAll();
@@ -703,13 +733,14 @@ async function loadMessages(options={}) {
   }
 }
 async function loadDaily() {
-  const [schedule, delivery, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+  const [schedule, delivery, summaryJobs, packageRuns, summaryRuns, summaryRecords, messagePoints] = await Promise.all([
     api('/manage/daily-package-schedule'),
     api('/manage/daily-summary-delivery'),
     api('/manage/daily-summary-jobs'),
     api('/manage/daily-package-runs'),
     api('/manage/daily-summary-runs'),
     api(summaryRecordsPath()),
+    api(messagePointsPath()),
   ]);
   state.dailySchedule = schedule.item || null;
   state.dailyDelivery = delivery.item || null;
@@ -717,11 +748,21 @@ async function loadDaily() {
   state.dailyPackageRuns = packageRuns.items || [];
   state.dailySummaryRuns = summaryRuns.items || [];
   state.dailySummaryRecords = summaryRecords.items || [];
+  state.dailyMessagePoints = messagePoints.items || [];
   clearSummarySelection();
+  refreshTagSuggestions();
   renderDaily();
   renderRaw();
   startDailyAutoRefresh();
   setStatus('Daily runs loaded', 'ok');
+}
+async function loadMessagePoints() {
+  const data = await api(messagePointsPath());
+  state.dailyMessagePoints = data.items || [];
+  refreshTagSuggestions();
+  renderMessagePoints();
+  renderRaw();
+  setStatus(`${state.dailyMessagePoints.length} message points loaded`, 'ok');
 }
 function startMessageAutoRefresh() {
   if (messageRefreshTimer || !tokenValue()) return;
@@ -937,7 +978,8 @@ function renderDaily() {
   fillTable('daily-summary-jobs-body', (state.dailySummaryJobs || []).map(summaryJobRow), 6);
   fillTable('daily-package-runs-body', (state.dailyPackageRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.date)}<div class="muted">${text(item.timezone)}</div></td><td>${progressCell(item)}</td><td>${text(item.origin_count)}</td><td>${text(item.message_count)}</td><td title="${attr(item.output_dir)}">${text(item.package_md_path || item.output_dir)}</td></tr>`), 7);
   fillTable('daily-summary-runs-body', (state.dailySummaryRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.package_run_id)}</td><td>${text(item.provider)}</td><td>${progressCell(item)}</td><td>${text(item.group_count)}</td><td>${text(item.image_count)}</td><td title="${attr(item.output_dir)}">${text(item.summary_path || item.output_dir)}</td></tr>`), 8);
-  fillTable('daily-summary-records-body', (state.dailySummaryRecords || []).map(summaryRecordRow), state.manageSummaries ? 8 : 7);
+  fillTable('daily-summary-records-body', (state.dailySummaryRecords || []).map(summaryRecordRow), state.manageSummaries ? 9 : 8);
+  renderMessagePoints();
   updateSummaryBulk();
 }
 function summaryJobRow(item) {
@@ -953,7 +995,10 @@ function progressCell(item) {
   return `<div>${text(counts)}</div><div class="muted">${text(label)}</div>`;
 }
 function renderSummaryRecordHead() {
-  $('daily-summary-records-head').innerHTML = `<tr>${state.manageSummaries ? '<th>Select</th>' : ''}<th>Summary</th><th>Date</th><th>Tags</th><th>State</th><th>Content</th><th>Path</th><th>Actions</th></tr>`;
+  $('daily-summary-records-head').innerHTML = `<tr>${state.manageSummaries ? '<th>Select</th>' : ''}<th>Summary</th><th>Kind</th><th>Date</th><th>Tags</th><th>State</th><th>Content</th><th>Path</th><th>Actions</th></tr>`;
+}
+function summaryRecordType(item) {
+  return item.record_type || item.content_json?.record_type || (item.important ? 'important_origin' : 'summary');
 }
 function summaryRecordRow(item) {
   const selected = Boolean(state.selectedSummaries[item.summary_id]);
@@ -962,7 +1007,32 @@ function summaryRecordRow(item) {
   const action = item.deleted ? 'restore-summary-record' : 'delete-summary-record';
   const actionLabel = item.deleted ? 'Restore' : 'Delete';
   const rowClass = item.deleted ? 'deleted-row' : '';
-  return `<tr class="${attr(rowClass)}" data-summary="${attr(item.summary_id)}">${selectCell}<td>${text(item.summary_id)}<div class="muted">${text(item.provider)}</div></td><td>${text(item.date)}<div class="muted">${text(item.timezone)}</div></td><td>${text((item.tags || []).join(', '))}</td><td>${statePill}</td><td>${text(item.content_preview)}</td><td title="${attr(item.summary_path)}">${text(item.summary_path)}</td><td class="actions"><button class="${item.deleted ? '' : 'danger'}" data-action="${action}" data-summary="${attr(item.summary_id)}">${actionLabel}</button></td></tr>`;
+  return `<tr class="${attr(rowClass)}" data-summary="${attr(item.summary_id)}">${selectCell}<td>${text(item.summary_id)}<div class="muted">${text(item.provider)}</div></td><td>${pill(summaryRecordType(item))}</td><td>${text(item.date)}<div class="muted">${text(item.timezone)}</div></td><td>${text((item.tags || []).join(', '))}</td><td>${statePill}</td><td>${text(item.content_preview)}</td><td title="${attr(item.summary_path)}">${text(item.summary_path)}</td><td class="actions"><button class="${item.deleted ? '' : 'danger'}" data-action="${action}" data-summary="${attr(item.summary_id)}">${actionLabel}</button></td></tr>`;
+}
+function pointContentCell(item) {
+  const content = String(item.content || '');
+  if (content.length <= 180) return `<div class="point-content">${text(content)}</div>`;
+  return `<details><summary>${text(`${content.slice(0, 180)}...`)}</summary><div class="point-content">${text(content)}</div></details>`;
+}
+function telegramPointLink(item) {
+  const candidates = [item.telegram_deeplink, item.permalink];
+  for (const candidate of candidates) {
+    const url = String(candidate || '').trim();
+    if (!/^tg:\/\//i.test(url) && !/^https:\/\/t\.me\//i.test(url)) continue;
+    return `<a href="${attr(url)}" target="_blank" rel="noopener">Open</a>`;
+  }
+  return '<span class="muted">-</span>';
+}
+function messagePointRow(item) {
+  const score = item.importance_score ?? '-';
+  const originId = item.origin_id ?? '-';
+  const topicId = item.topic_id || 0;
+  const messageId = item.message_id ?? '-';
+  const originState = item.origin_important ? `<div>${pill('important origin')}</div>` : '';
+  return `<tr><td>${text(item.occurred_at || item.date)}<div class="muted">${text(item.timezone)}</div></td><td><div class="tag-list">${renderTags(item.tags || item.tags_csv)}</div></td><td>${pill(score)}<div class="muted">${text(item.importance_reason)}</div></td><td>${pointContentCell(item)}</td><td>${text(item.origin_title || originId)}${originState}<div class="muted">${text(`${item.account_id || '-'} / ${originId} / ${topicId} / msg ${messageId}`)}</div></td><td>${telegramPointLink(item)}</td><td>${text(item.run_id)}<div class="muted">${text(item.point_id)}</div></td></tr>`;
+}
+function renderMessagePoints() {
+  fillTable('daily-message-points-body', (state.dailyMessagePoints || []).map(messagePointRow), 7);
 }
 function updateSummaryBulk() {
   const bulk = $('summary-bulk');
@@ -1218,6 +1288,7 @@ document.addEventListener('click', async (event) => {
     else if (action === 'load-operation-events') { const data = await api('/manage/operation-events'); state.operationEvents = data.items || []; renderOperationEvents(); }
     else if (action === 'load-media') { const data = await api('/sync/media-files'); state.media = data.items || []; renderMedia(); }
     else if (action === 'load-daily') await loadDaily();
+    else if (action === 'load-message-points') await loadMessagePoints();
     else if (action === 'load-raw') renderRaw();
     else if (action === 'preview-media') await previewMedia(target);
     else if (action === 'open-media') await openMedia(target);
@@ -1317,6 +1388,10 @@ $('daily-summary-job-form').addEventListener('submit', async (event) => {
     await loadDaily();
     setStatus(`Summary job ${result.item?.job_id || ''} ${result.item?.status || ''}`, result.item?.status === 'failed' ? 'error' : 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
+});
+$('message-points-filter-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try { await loadMessagePoints(); } catch (error) { setStatus(String(error), 'error'); }
 });
 $('participant-refresh-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants/refresh', numberFields(formData(event.target), ['origin_id','limit'])); } catch (error) { setStatus(String(error), 'error'); } });
 $('participant-form').addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/participants', numberFields(formData(event.target), ['origin_id','user_id'])); } catch (error) { setStatus(String(error), 'error'); } });

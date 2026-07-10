@@ -40,19 +40,26 @@ daily:
   cli_path: "tele-mess-core"
   ai:
     provider: "codex-cli"
+    # Frontier default used by every AI stage unless this value is overridden.
+    model: "gpt-5.6-sol"
     command:
       - "codex"
       - "-a"
       - "never"
       - "exec"
+      # Expanded to "--model <daily.ai.model>".
+      - "{model}"
       - "--skip-git-repo-check"
       - "--output-last-message"
       - "{output}"
+      # Expanded to "--output-schema <path>" for structured stages and omitted
+      # for Markdown stages.
+      - "{output_schema}"
       # Expanded to repeated "--image <path>" args for image-analysis tasks.
       - "{images}"
       # Optional placeholder for wrappers/logging: media_image_analysis,
-      # normal_origin_key_extraction, normal_group_analysis,
-      # important_origin_analysis, or final_daily_summary.
+      # message_point_extraction, important_origin_analysis,
+      # important_daily_summary, or daily_point_summary.
       # - "{task}"
       - "-"
     timeout_seconds: 900
@@ -60,7 +67,7 @@ daily:
     # YAML is the fallback. PATCH /manage/daily-summary-delivery persists an
     # SQLite override that scheduled and background runs read automatically.
     enabled: false
-    # Send the final daily summary through this authenticated account.
+    # Send the important report and separate #point digest through this account.
     account_id: "main"
     # Telegram group/channel ID from GET /manage/origins?account_id=main.
     origin_id: -1001234567890

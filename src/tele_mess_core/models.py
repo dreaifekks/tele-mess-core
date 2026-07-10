@@ -256,6 +256,34 @@ class DailySummaryJobRecord:
 
 
 @dataclass(slots=True)
+class DailyMessagePointRecord:
+    point_id: str
+    run_id: str
+    package_run_id: str
+    date: str
+    timezone: str
+    source: str
+    account_id: str
+    origin_id: int
+    occurred_at: str
+    content: str
+    topic_id: int = 0
+    origin_title: str | None = None
+    message_id: int | None = None
+    tags_json: str | None = None
+    tags_csv: str | None = None
+    telegram_deeplink: str | None = None
+    permalink: str | None = None
+    importance_score: int = 3
+    importance_reason: str | None = None
+    origin_important: bool = False
+    source_refs_json: str | None = None
+    provider: str | None = None
+    created_at: str | None = None
+    updated_at: str | None = None
+
+
+@dataclass(slots=True)
 class DailySummaryRecord:
     summary_id: str
     run_id: str
@@ -278,6 +306,7 @@ class DailySummaryRecord:
     deleted_at: str | None = None
     created_at: str | None = None
     updated_at: str | None = None
+    record_type: str = "summary"
 
 
 @dataclass(slots=True)

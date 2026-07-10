@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-10.2`
-- Contract hash: `28e087b419802ee3`
+- Contract version: `2026-07-10.4`
+- Contract hash: `bf0d29cf60733f79`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -69,6 +69,8 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /manage/daily-summary-records/item` (management, token) - Return one stored daily summary content record.
 - `PATCH /manage/daily-summary-records` (management, token) - Soft-delete or restore one or more stored daily summary records.
 - `DELETE /manage/daily-summary-records` (management, token) - Soft-delete one or more stored daily summary records.
+- `GET /manage/daily-message-points` (management, token) - List stored daily message points.
+- `GET /manage/daily-message-points/item` (management, token) - Return one stored daily message point.
 - `POST /manage/discover-origins` (management, token) - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` (management, token) - Refresh participants for a Telegram origin.
 
@@ -786,6 +788,7 @@ Query parameters:
 - `date_from` (`string`, optional) - Filter summaries on or after this local date.
 - `date_to` (`string`, optional) - Filter summaries on or before this local date.
 - `provider` (`string`, optional) - Filter by AI provider.
+- `record_type` (`string`, optional) - Filter by stored artifact type, such as important_daily or point_daily.
 - `important` (`boolean`, optional) - Filter summaries that include important origins.
 - `tag` (`string`, optional) - Required tag. Repeatable; all tags must match.
 - `tags` (`string`, optional) - Comma-separated required tags; all tags must match.
@@ -811,6 +814,7 @@ Query parameters:
 
 - `summary_id` (`string`, optional) - Summary content ID.
 - `run_id` (`string`, optional) - Summary run ID.
+- `record_type` (`string`, optional) - Stored artifact type when a run has multiple records.
 - `include_deleted` (`boolean`, optional, default `False`) - Allow returning a soft-deleted record.
 
 Request body: none
@@ -840,6 +844,56 @@ Soft-delete one or more stored daily summary records.
 Request body: `DailySummaryRecordDeleteInput`
 
 Response: `DailySummaryRecordDeleteResponse`
+
+### GET /manage/daily-message-points
+
+List stored daily message points.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `point_id` (`string`, optional) - Filter by message point ID.
+- `run_id` (`string`, optional) - Filter by summary run ID.
+- `package_run_id` (`string`, optional) - Filter by package run ID.
+- `date` (`string`, optional) - Filter by local package date.
+- `date_from` (`string`, optional) - Filter points on or after this local date.
+- `date_to` (`string`, optional) - Filter points on or before this local date.
+- `source` (`string`, optional) - Filter by source system.
+- `account_id` (`string`, optional) - Local Telegram account ID.
+- `origin_id` (`integer`, optional) - Filter by Telegram origin ID.
+- `topic_id` (`integer`, optional) - Filter by Telegram topic ID.
+- `message_id` (`integer`, optional) - Filter by primary source message ID.
+- `tag` (`string`, optional) - Required tag. Repeatable; all tags must match.
+- `tags` (`string`, optional) - Comma-separated required tags; all tags must match.
+- `importance_min` (`integer`, optional) - Minimum importance score from 1 to 5.
+- `importance_max` (`integer`, optional) - Maximum importance score from 1 to 5.
+- `origin_important` (`boolean`, optional) - Filter by the origin's important flag.
+- `q` (`string`, optional) - Filter by point content, origin title, or importance reason substring.
+- `include_incomplete` (`boolean`, optional, default `False`) - Include points from running, failed, or canceled summary runs.
+- `limit` (`integer`, optional, default `100`) - Maximum message points to return.
+
+Request body: none
+
+Response: `DailyMessagePointListResponse`
+
+### GET /manage/daily-message-points/item
+
+Return one stored daily message point.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Query parameters:
+
+- `point_id` (`string`, required) - Message point ID.
+
+Request body: none
+
+Response: `DailyMessagePointResponse`
 
 ### POST /manage/discover-origins
 
@@ -1063,6 +1117,49 @@ Response: `ParticipantRefreshResultResponse`
 | --- | --- | --- |
 | `items` | `array<Chat>` | yes |
 
+### DailyMessagePoint
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `point_id` | `string` | yes |
+| `run_id` | `string` | yes |
+| `package_run_id` | `string` | yes |
+| `date` | `string` | yes |
+| `timezone` | `string` | yes |
+| `source` | `string` | yes |
+| `account_id` | `string` | yes |
+| `origin_id` | `integer` | yes |
+| `topic_id` | `integer` | yes |
+| `origin_title` | `string` | no |
+| `message_id` | `integer` | no |
+| `occurred_at` | `string` | yes |
+| `tags` | `array` | yes |
+| `tags_csv` | `string` | no |
+| `content` | `string` | yes |
+| `telegram_deeplink` | `string` | no |
+| `permalink` | `string` | no |
+| `importance_score` | `integer` | yes |
+| `importance_reason` | `string` | no |
+| `origin_important` | `boolean` | yes |
+| `source_refs` | `array` | yes |
+| `provider` | `string` | no |
+| `run_status` | `string` | no |
+| `job_status` | `string` | no |
+| `created_at` | `string` | no |
+| `updated_at` | `string` | no |
+
+### DailyMessagePointListResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `items` | `array<DailyMessagePoint>` | yes |
+
+### DailyMessagePointResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailyMessagePoint` | yes |
+
 ### DailyPackageRun
 
 | Field | Type | Required |
@@ -1230,6 +1327,7 @@ Response: `ParticipantRefreshResultResponse`
 | `tags` | `array` | no |
 | `tags_csv` | `string` | no |
 | `important` | `boolean` | no |
+| `record_type` | `string` | yes |
 | `provider` | `string` | no |
 | `title` | `string` | no |
 | `content_preview` | `string` | yes |

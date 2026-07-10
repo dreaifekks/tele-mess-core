@@ -354,6 +354,7 @@ class SyncApiServer:
                                 date_from=_optional_str_param(params, "date_from"),
                                 date_to=_optional_str_param(params, "date_to"),
                                 provider=_optional_str_param(params, "provider"),
+                                record_type=_optional_str_param(params, "record_type"),
                                 important=_optional_bool_param(params, "important"),
                                 tags=_tags_param(params),
                                 q=_optional_str_param(params, "q"),
@@ -368,10 +369,41 @@ class SyncApiServer:
                     item = store.get_daily_summary_record(
                         summary_id=_optional_str_param(params, "summary_id"),
                         run_id=_optional_str_param(params, "run_id"),
+                        record_type=_optional_str_param(params, "record_type"),
                         include_deleted=_bool_param(params, "include_deleted", False),
                     )
                     if item is None:
                         raise ValueError("Unknown daily summary record")
+                    self._json({"item": item})
+                elif path == "/manage/daily-message-points":
+                    self._json(
+                        {
+                            "items": store.list_daily_message_points(
+                                point_id=_optional_str_param(params, "point_id"),
+                                run_id=_optional_str_param(params, "run_id"),
+                                package_run_id=_optional_str_param(params, "package_run_id"),
+                                date=_optional_str_param(params, "date"),
+                                date_from=_optional_str_param(params, "date_from"),
+                                date_to=_optional_str_param(params, "date_to"),
+                                source=_optional_str_param(params, "source"),
+                                account_id=_optional_str_param(params, "account_id"),
+                                origin_id=_optional_int_param(params, "origin_id"),
+                                topic_id=_optional_int_param(params, "topic_id"),
+                                message_id=_optional_int_param(params, "message_id"),
+                                tags=_tags_param(params),
+                                importance_min=_optional_int_param(params, "importance_min"),
+                                importance_max=_optional_int_param(params, "importance_max"),
+                                origin_important=_optional_bool_param(params, "origin_important"),
+                                q=_optional_str_param(params, "q"),
+                                include_incomplete=_bool_param(params, "include_incomplete", False),
+                                limit=_int_param(params, "limit", 100),
+                            )
+                        }
+                    )
+                elif path == "/manage/daily-message-points/item":
+                    item = store.get_daily_message_point(_str_param(params, "point_id", ""))
+                    if item is None:
+                        raise ValueError("Unknown daily message point")
                     self._json({"item": item})
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
@@ -613,6 +645,7 @@ def _capabilities() -> dict[str, Any]:
             "daily_package_runs",
             "daily_summary_runs",
             "daily_summary_records",
+            "daily_message_points",
             "daily_summary_delivery",
             "web_console",
         ],

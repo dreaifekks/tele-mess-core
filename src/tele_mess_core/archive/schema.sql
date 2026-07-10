@@ -299,6 +299,7 @@ CREATE TABLE IF NOT EXISTS daily_summary_records (
   tags_json TEXT,
   tags_csv TEXT,
   important INTEGER NOT NULL DEFAULT 0,
+  record_type TEXT NOT NULL DEFAULT 'summary',
   provider TEXT,
   title TEXT,
   content_md TEXT NOT NULL,
@@ -309,6 +310,33 @@ CREATE TABLE IF NOT EXISTS daily_summary_records (
   image_count INTEGER NOT NULL DEFAULT 0,
   content_length INTEGER NOT NULL DEFAULT 0,
   deleted_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS daily_message_points (
+  point_id TEXT PRIMARY KEY,
+  run_id TEXT NOT NULL,
+  package_run_id TEXT NOT NULL,
+  date TEXT NOT NULL,
+  timezone TEXT NOT NULL,
+  source TEXT NOT NULL DEFAULT 'telegram',
+  account_id TEXT NOT NULL,
+  origin_id INTEGER NOT NULL,
+  topic_id INTEGER NOT NULL DEFAULT 0,
+  origin_title TEXT,
+  message_id INTEGER,
+  occurred_at TEXT NOT NULL,
+  tags_json TEXT NOT NULL DEFAULT '[]',
+  tags_csv TEXT,
+  content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+  telegram_deeplink TEXT,
+  permalink TEXT,
+  importance_score INTEGER NOT NULL DEFAULT 3 CHECK (importance_score BETWEEN 1 AND 5),
+  importance_reason TEXT,
+  origin_important INTEGER NOT NULL DEFAULT 0 CHECK (origin_important IN (0, 1)),
+  source_refs_json TEXT NOT NULL DEFAULT '[]',
+  provider TEXT,
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL
 );
@@ -338,6 +366,9 @@ CREATE INDEX IF NOT EXISTS idx_daily_summary_runs_package ON daily_summary_runs(
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_message_points_run ON daily_message_points(run_id, occurred_at, point_id);
+CREATE INDEX IF NOT EXISTS idx_daily_message_points_lookup ON daily_message_points(date, source, account_id, origin_id, topic_id, occurred_at);
+CREATE INDEX IF NOT EXISTS idx_daily_message_points_importance ON daily_message_points(date, importance_score, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_chat_msg ON events(source, account_id, chat_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at);

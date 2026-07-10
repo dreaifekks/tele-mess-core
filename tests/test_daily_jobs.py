@@ -108,6 +108,32 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(second["date"], "2026-07-04")
         self.assertNotEqual(first["job_id"], second["job_id"])
 
+    def test_job_dedupe_changes_when_effective_model_changes(self) -> None:
+        first = DailyJobWorker(self.store, self.config).enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        alternate_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(provider="disabled", model="gpt-5.6-terra"),
+            ),
+        )
+
+        second = DailyJobWorker(self.store, alternate_config).enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        self.assertNotEqual(first["job_id"], second["job_id"])
+        self.assertNotEqual(first["dedupe_key"], second["dedupe_key"])
+
     def test_expired_lease_is_reclaimed_after_restart(self) -> None:
         old_worker = DailyJobWorker(self.store, self.config, worker_id="old")
         job = old_worker.enqueue(
@@ -227,6 +253,7 @@ class DailyJobWorkerTest(unittest.TestCase):
         )
 
     def test_delivery_outbox_records_sent_message_id(self) -> None:
+        self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 0, True)
         delivery_config = AppConfig(
             storage=self.config.storage,
             telegram=self.config.telegram,
@@ -245,7 +272,7 @@ class DailyJobWorkerTest(unittest.TestCase):
 
             def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
                 self.calls.append((account_id, operation, str(kwargs.get("content") or "")))
-                return {"status": "sent", "message_ids": [321], "message_count": 1}
+                return {"status": "sent", "message_ids": [320 + len(self.calls)], "message_count": 1}
 
         runtime = SuccessfulRuntime()
         worker = DailyJobWorker(self.store, delivery_config, telegram_runtime=runtime)
@@ -260,9 +287,59 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(completed["job_id"], job["job_id"])
         self.assertEqual(completed["status"], "completed")
         outbox = self.store.list_delivery_outbox(summary_run_id=completed["summary_run_id"])
-        self.assertEqual(outbox[0]["status"], "sent")
-        self.assertEqual(outbox[0]["message_id"], 321)
-        self.assertEqual(runtime.calls[0][0:2], ("main", "deliver_chunk"))
+        self.assertEqual(len(outbox), 2)
+        self.assertTrue(all(item["status"] == "sent" for item in outbox))
+        self.assertEqual([item["message_id"] for item in outbox], [321, 322])
+        self.assertEqual([item["chunk_index"] for item in outbox], [1, 2])
+        self.assertEqual(len(runtime.calls), 2)
+        self.assertTrue(all(item[0:2] == ("main", "deliver_chunk") for item in runtime.calls))
+        self.assertIn("# Important Daily Summary", runtime.calls[0][2])
+        self.assertNotIn("- Tags: #point", runtime.calls[0][2])
+        self.assertIn("# Daily Message Point Summary", runtime.calls[1][2])
+        self.assertIn("- Tags: #point", runtime.calls[1][2])
+
+    def test_cancel_during_delivery_discards_remaining_outbox_chunks(self) -> None:
+        self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 0, True)
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+
+        class CancelOnFirstRuntime:
+            def __init__(self) -> None:
+                self.calls = 0
+                self.worker: DailyJobWorker | None = None
+                self.job_id = ""
+
+            def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
+                self.calls += 1
+                assert self.worker is not None
+                self.worker.cancel(self.job_id)
+                return {"status": "sent", "message_ids": [777], "message_count": 1}
+
+        runtime = CancelOnFirstRuntime()
+        worker = DailyJobWorker(self.store, delivery_config, telegram_runtime=runtime)
+        runtime.worker = worker
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        runtime.job_id = job["job_id"]
+
+        canceled = worker.run_once()
+
+        assert canceled is not None
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(runtime.calls, 1)
+        self.assertEqual(self.store.list_delivery_outbox(summary_run_id=canceled["summary_run_id"]), [])
 
 
 if __name__ == "__main__":

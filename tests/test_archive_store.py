@@ -15,9 +15,11 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailyMessagePointRecord,
     DailySummaryDeliveryRecord,
     DailySummaryJobRecord,
     DailySummaryRecord,
+    DailySummaryRunRecord,
     MediaFileRecord,
     MessageRecord,
     OperationEventRecord,
@@ -638,6 +640,7 @@ class ArchiveStoreTest(unittest.TestCase):
 
         run_records = self.store.list_daily_summary_records(run_id="sum_a")
         self.assertEqual(len(run_records), 2)
+        self.assertEqual(self.store.list_daily_summary_records(record_type="tag_group")[0]["summary_id"], "sum_a_group_ai")
 
         self.assertEqual(self.store.list_daily_summary_records(tags=["web3", "ai"]), [])
 
@@ -655,6 +658,181 @@ class ArchiveStoreTest(unittest.TestCase):
         restored = self.store.set_daily_summary_records_deleted(["sum_a"], deleted=False)
         self.assertEqual(restored, 1)
         self.assertEqual(len(self.store.list_daily_summary_records(run_id="sum_a")), 1)
+
+    def test_daily_message_points_replace_and_filter_by_daily_origin_fields(self) -> None:
+        self.store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id="sum_points",
+                status="completed",
+                package_run_id="pkg_points",
+                date="2026-07-03",
+                timezone="UTC",
+            )
+        )
+        point_a = DailyMessagePointRecord(
+            point_id="point_a",
+            run_id="sum_points",
+            package_run_id="pkg_points",
+            date="2026-07-03",
+            timezone="UTC",
+            source=SOURCE_TELEGRAM,
+            account_id="main",
+            origin_id=-1001,
+            topic_id=7,
+            origin_title="Point Origin",
+            message_id=42,
+            occurred_at="2026-07-03T01:02:03+00:00",
+            tags_json='["ai", "release"]',
+            content="A high-value release point",
+            telegram_deeplink="tg://privatepost?channel=1&post=42",
+            permalink="https://t.me/c/1/42",
+            importance_score=5,
+            importance_reason="Actionable release",
+            origin_important=True,
+            source_refs_json='[{"message_id":42}]',
+            provider="fake",
+        )
+        point_b = DailyMessagePointRecord(
+            point_id="point_b",
+            run_id="sum_points",
+            package_run_id="pkg_points",
+            date="2026-07-03",
+            timezone="UTC",
+            source=SOURCE_TELEGRAM,
+            account_id="secondary",
+            origin_id=-1001,
+            occurred_at="2026-07-03T02:00:00+00:00",
+            tags_json='["release"]',
+            content="A lower-value point",
+            importance_score=2,
+            source_refs_json="[]",
+            provider="fake",
+        )
+
+        summary_records = self.store.persist_daily_summary_batch(
+            [
+                DailySummaryRecord(
+                    summary_id="sum_points--point-daily",
+                    run_id="sum_points",
+                    package_run_id="pkg_points",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    record_type="point_daily",
+                    tags_json='["point"]',
+                    content_md="# Point Daily",
+                )
+            ],
+            message_points=[point_a, point_b],
+        )
+
+        self.assertEqual(summary_records[0]["record_type"], "point_daily")
+        self.assertEqual(len(self.store.list_daily_message_points(run_id="sum_points")), 2)
+        filtered = self.store.list_daily_message_points(
+            date="2026-07-03",
+            account_id="main",
+            origin_id=-1001,
+            topic_id=7,
+            tags=["AI", "release"],
+            importance_min=4,
+            origin_important=True,
+            q="high-value",
+        )
+        self.assertEqual([item["point_id"] for item in filtered], ["point_a"])
+        self.assertEqual(filtered[0]["tags"], ["ai", "release"])
+        self.assertEqual(filtered[0]["source_refs"], [{"message_id": 42}])
+        self.assertEqual(filtered[0]["run_status"], "completed")
+        self.assertTrue(filtered[0]["origin_important"])
+
+        fetched = self.store.get_daily_message_point("point_a")
+        assert fetched is not None
+        self.assertEqual(fetched["telegram_deeplink"], "tg://privatepost?channel=1&post=42")
+
+        point_a.content = "Updated release point"
+        replaced = self.store.persist_daily_message_points("sum_points", [point_a])
+        self.assertEqual(len(replaced), 1)
+        self.assertEqual(self.store.list_daily_message_points(run_id="sum_points")[0]["content"], "Updated release point")
+        self.assertIsNone(self.store.get_daily_message_point("point_b"))
+
+        point_a.importance_score = 6
+        with self.assertRaisesRegex(ValueError, "between 1 and 5"):
+            self.store.persist_daily_message_points("sum_points", [point_a])
+
+    def test_daily_message_points_hide_incomplete_runs_by_default(self) -> None:
+        self.store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id="sum_failed_points",
+                status="failed",
+                package_run_id="pkg_failed_points",
+                date="2026-07-03",
+                timezone="UTC",
+            )
+        )
+        self.store.persist_daily_message_points(
+            "sum_failed_points",
+            [
+                DailyMessagePointRecord(
+                    point_id="point_failed",
+                    run_id="sum_failed_points",
+                    package_run_id="pkg_failed_points",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=-1001,
+                    occurred_at="2026-07-03T01:00:00+00:00",
+                    content="Partial point from a failed run",
+                )
+            ],
+        )
+
+        self.assertEqual(self.store.list_daily_message_points(run_id="sum_failed_points"), [])
+        incomplete = self.store.list_daily_message_points(
+            run_id="sum_failed_points",
+            include_incomplete=True,
+        )
+        self.assertEqual([item["point_id"] for item in incomplete], ["point_failed"])
+        self.assertEqual(incomplete[0]["run_status"], "failed")
+
+        self.store.upsert_daily_summary_run(
+            DailySummaryRunRecord(
+                run_id="sum_canceled_job",
+                status="completed",
+                package_run_id="pkg_canceled_job",
+                date="2026-07-03",
+                timezone="UTC",
+            )
+        )
+        self.store.upsert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_canceled_points",
+                status="canceled",
+                summary_run_id="sum_canceled_job",
+            )
+        )
+        self.store.persist_daily_message_points(
+            "sum_canceled_job",
+            [
+                DailyMessagePointRecord(
+                    point_id="point_canceled_job",
+                    run_id="sum_canceled_job",
+                    package_run_id="pkg_canceled_job",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=-1001,
+                    occurred_at="2026-07-03T02:00:00+00:00",
+                    content="Valid analysis from a canceled delivery-stage job",
+                )
+            ],
+        )
+        self.assertEqual(self.store.list_daily_message_points(run_id="sum_canceled_job"), [])
+        canceled = self.store.list_daily_message_points(
+            run_id="sum_canceled_job",
+            include_incomplete=True,
+        )
+        self.assertEqual(canceled[0]["run_status"], "completed")
+        self.assertEqual(canceled[0]["job_status"], "canceled")
 
     def test_daily_summary_jobs_track_progress_and_cancel_request(self) -> None:
         self.store.upsert_daily_summary_job(
@@ -729,14 +907,14 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 15)
+                self.assertEqual(store.state()["schema_version"], 16)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
             finally:
                 store.close()
 
-    def test_v12_job_schema_migrates_to_durable_queue_outbox_and_delivery_config(self) -> None:
+    def test_v12_job_schema_migrates_to_durable_queue_outbox_delivery_and_message_points(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:
             conn.executescript(
@@ -765,10 +943,25 @@ class ArchiveMigrationTest(unittest.TestCase):
                 );
                 INSERT INTO daily_summary_jobs(job_id, status, started_at, updated_at)
                 VALUES('legacy_job', 'queued', '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00');
+                CREATE TABLE daily_summary_records (
+                  summary_id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  date TEXT,
+                  content_json TEXT,
+                  created_at TEXT NOT NULL
+                );
+                INSERT INTO daily_summary_records(summary_id, run_id, date, content_json, created_at)
+                VALUES(
+                  'legacy_summary',
+                  'sum_legacy',
+                  '2026-07-01',
+                  '{"record_type":"important_origin"}',
+                  '2026-07-01T00:00:00+00:00'
+                );
                 """
             )
 
-            apply_migrations(conn, 12, 15)
+            apply_migrations(conn, 12, 16)
 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
             self.assertTrue({"request_json", "dedupe_key", "worker_id", "lease_until", "heartbeat_at", "attempt"} <= columns)
@@ -778,10 +971,17 @@ class ArchiveMigrationTest(unittest.TestCase):
             self.assertIsNotNone(
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_summary_delivery'").fetchone()
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 15)
+            self.assertIsNotNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_message_points'").fetchone()
+            )
+            self.assertEqual(
+                conn.execute("SELECT record_type FROM daily_summary_records WHERE summary_id='legacy_summary'").fetchone()[0],
+                "important_origin",
+            )
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "15",
+                "16",
             )
             self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
 
@@ -793,11 +993,66 @@ class ArchiveMigrationTest(unittest.TestCase):
         finally:
             conn.close()
 
+    def test_v15_archive_initialize_adds_record_type_before_indexing_it(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "archive.db"
+            conn = sqlite3.connect(db_path)
+            conn.executescript(
+                """
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '15');
+                PRAGMA user_version = 15;
+                CREATE TABLE daily_summary_records (
+                  summary_id TEXT PRIMARY KEY,
+                  run_id TEXT NOT NULL,
+                  package_run_id TEXT,
+                  date TEXT,
+                  timezone TEXT,
+                  scope_json TEXT,
+                  tags_json TEXT,
+                  tags_csv TEXT,
+                  important INTEGER NOT NULL DEFAULT 0,
+                  provider TEXT,
+                  title TEXT,
+                  content_md TEXT NOT NULL,
+                  content_json TEXT,
+                  summary_path TEXT,
+                  origin_count INTEGER NOT NULL DEFAULT 0,
+                  group_count INTEGER NOT NULL DEFAULT 0,
+                  image_count INTEGER NOT NULL DEFAULT 0,
+                  content_length INTEGER NOT NULL DEFAULT 0,
+                  deleted_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL
+                );
+                INSERT INTO daily_summary_records(
+                  summary_id, run_id, date, content_md, content_json, created_at, updated_at
+                ) VALUES(
+                  'legacy_v15', 'sum_v15', '2026-07-01', '# legacy',
+                  '{"record_type":"important_origin"}',
+                  '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00'
+                );
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = ArchiveStore(db_path)
+            try:
+                store.initialize()
+                self.assertEqual(store.state()["schema_version"], 16)
+                record = store.get_daily_summary_record(summary_id="legacy_v15")
+                assert record is not None
+                self.assertEqual(record["record_type"], "important_origin")
+                self.assertEqual(store.list_daily_message_points(), [])
+            finally:
+                store.close()
+
     def test_failed_versioned_migration_rolls_back_schema_and_version(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
-        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '14')")
-        conn.execute("PRAGMA user_version = 14")
+        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '15')")
+        conn.execute("PRAGMA user_version = 15")
         conn.commit()
 
         def failing_migration(connection: sqlite3.Connection) -> None:
@@ -805,16 +1060,16 @@ class ArchiveMigrationTest(unittest.TestCase):
             raise RuntimeError("migration failed")
 
         try:
-            with patch.dict(MIGRATIONS, {15: failing_migration}):
+            with patch.dict(MIGRATIONS, {16: failing_migration}):
                 with self.assertRaisesRegex(RuntimeError, "migration failed"):
-                    apply_migrations(conn, 14, 15)
+                    apply_migrations(conn, 15, 16)
             self.assertIsNone(
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'").fetchone()
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 15)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "14",
+                "15",
             )
         finally:
             conn.close()

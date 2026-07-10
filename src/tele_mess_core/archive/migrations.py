@@ -149,6 +149,69 @@ def _migration_15(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_16(connection: sqlite3.Connection) -> None:
+    _ensure_column(connection, "daily_summary_records", "record_type", "TEXT NOT NULL DEFAULT 'summary'")
+    connection.execute(
+        """
+        UPDATE daily_summary_records
+        SET record_type = CASE
+          WHEN content_json IS NOT NULL
+           AND content_json != ''
+           AND json_valid(content_json)
+          THEN COALESCE(CAST(json_extract(content_json, '$.record_type') AS TEXT), 'summary')
+          ELSE 'summary'
+        END
+        WHERE record_type = 'summary'
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_message_points (
+          point_id TEXT PRIMARY KEY,
+          run_id TEXT NOT NULL,
+          package_run_id TEXT NOT NULL,
+          date TEXT NOT NULL,
+          timezone TEXT NOT NULL,
+          source TEXT NOT NULL DEFAULT 'telegram',
+          account_id TEXT NOT NULL,
+          origin_id INTEGER NOT NULL,
+          topic_id INTEGER NOT NULL DEFAULT 0,
+          origin_title TEXT,
+          message_id INTEGER,
+          occurred_at TEXT NOT NULL,
+          tags_json TEXT NOT NULL DEFAULT '[]',
+          tags_csv TEXT,
+          content TEXT NOT NULL CHECK (length(trim(content)) > 0),
+          telegram_deeplink TEXT,
+          permalink TEXT,
+          importance_score INTEGER NOT NULL DEFAULT 3 CHECK (importance_score BETWEEN 1 AND 5),
+          importance_reason TEXT,
+          origin_important INTEGER NOT NULL DEFAULT 0 CHECK (origin_important IN (0, 1)),
+          source_refs_json TEXT NOT NULL DEFAULT '[]',
+          provider TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_summary_records_type_date "
+        "ON daily_summary_records(record_type, date, created_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_message_points_run "
+        "ON daily_message_points(run_id, occurred_at, point_id)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_message_points_lookup "
+        "ON daily_message_points(date, source, account_id, origin_id, topic_id, occurred_at)"
+    )
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_daily_message_points_importance "
+        "ON daily_message_points(date, importance_score, occurred_at)"
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -160,4 +223,5 @@ MIGRATIONS: dict[int, Migration] = {
     13: _migration_13,
     14: _migration_14,
     15: _migration_15,
+    16: _migration_16,
 }
