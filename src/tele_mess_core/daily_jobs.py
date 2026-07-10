@@ -19,6 +19,7 @@ from tele_mess_core.daily import (
     _terminate_process,
     _zoneinfo,
     build_daily_package,
+    resolve_daily_summary_delivery,
     run_daily_summary,
 )
 from tele_mess_core.models import DailySummaryJobRecord, utc_now_iso
@@ -57,14 +58,15 @@ def enqueue_daily_summary_job(
         "scope": scope,
         "force": bool(force),
     }
+    delivery = resolve_daily_summary_delivery(store, config)
     dedupe_payload = {
         **request,
         "provider": config.daily.ai.provider,
         "delivery": {
-            "enabled": config.daily.delivery.enabled,
-            "account_id": config.daily.delivery.account_id,
-            "origin_id": config.daily.delivery.origin_id,
-            "topic_id": config.daily.delivery.topic_id,
+            "enabled": delivery.enabled,
+            "account_id": delivery.account_id,
+            "origin_id": delivery.origin_id,
+            "topic_id": delivery.topic_id,
         },
     }
     canonical = json.dumps(dedupe_payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))

@@ -242,6 +242,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("Important", html)
         self.assertIn("/manage/origins/important", html)
         self.assertIn("/manage/daily-package-schedule", html)
+        self.assertIn("/manage/daily-summary-delivery", html)
         self.assertIn("/manage/daily-packages", html)
         self.assertIn("/manage/daily-summaries", html)
         self.assertIn("/manage/daily-summary-jobs", html)
@@ -305,6 +306,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(openapi["info"]["x-contract-hash"], API_CONTRACT_HASH)
         self.assertIn("/manage/api-manifest", openapi["paths"])
         self.assertIn("/sync/messages", openapi["paths"])
+        self.assertIn("/manage/daily-summary-delivery", openapi["paths"])
 
         markdown = self.request_text_no_auth("/docs/api.md")
         self.assertIn(f"Contract hash: `{API_CONTRACT_HASH}`", markdown)
@@ -425,6 +427,57 @@ class SyncApiTest(unittest.TestCase):
         self.assertTrue(job_items[0]["package_run_id"].startswith("pkg_"))
         self.assertTrue(job_items[0]["summary_run_id"].startswith("sum_"))
         self.assertEqual(job_items[0]["progress_label"], "completed")
+
+    def test_daily_summary_delivery_api_and_schedule_compatibility(self) -> None:
+        initial = self.request_json("/manage/daily-summary-delivery")["item"]
+        self.assertFalse(initial["enabled"])
+        self.assertEqual(initial["source"], "config")
+        self.config.telegram.accounts.append(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="test",
+                session_name="main",
+                session_dir=Path(self.tmp.name) / "sessions",
+            )
+        )
+
+        saved = self.request_json(
+            "/manage/daily-summary-delivery",
+            method="PATCH",
+            payload={"enabled": True, "account_id": "main", "origin_id": -9001, "topic_id": 42},
+        )["item"]
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(saved["origin_id"], -9001)
+        self.assertEqual(saved["topic_id"], 42)
+        self.assertEqual(saved["source"], "database")
+        self.assertEqual(self.request_json("/manage/daily-summary-delivery")["item"], saved)
+
+        schedule = self.request_json(
+            "/manage/daily-package-schedule",
+            method="PATCH",
+            payload={
+                "enabled": True,
+                "time_of_day": "08:00",
+                "timezone": "UTC",
+                "scope": {},
+                "delivery": {"enabled": True, "account_id": "main", "origin_id": -9002, "topic_id": 99},
+            },
+        )["item"]
+        self.assertEqual(schedule["delivery"]["origin_id"], -9002)
+        self.assertEqual(schedule["delivery"]["topic_id"], 99)
+
+        req = Request(
+            f"http://127.0.0.1:{self.port}/manage/daily-package-schedule",
+            data=json.dumps({"enabled": True, "unknown_delivery_field": "ignored-before"}).encode("utf-8"),
+            method="PATCH",
+        )
+        req.add_header("Authorization", "Bearer secret")
+        req.add_header("Content-Type", "application/json")
+        with self.assertRaises(HTTPError) as raised:
+            urlopen(req, timeout=3)
+        self.assertEqual(raised.exception.code, 400)
+        raised.exception.close()
 
     def test_api_manifest_requires_token(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/manage/api-manifest")

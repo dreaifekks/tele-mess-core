@@ -291,7 +291,9 @@ class SyncApiServer:
                         }
                     )
                 elif path == "/manage/daily-package-schedule":
-                    self._json({"item": store.get_daily_package_schedule()})
+                    self._json({"item": _daily_package_schedule_item(config, store)})
+                elif path == "/manage/daily-summary-delivery":
+                    self._json({"item": _daily_summary_delivery(config, store)})
                 elif path == "/manage/daily-package-runs":
                     self._json(
                         {
@@ -430,6 +432,9 @@ class SyncApiServer:
                     self._json({"item": item})
                 elif path == "/manage/daily-package-schedule" and method == "PATCH":
                     item = _update_daily_package_schedule(config, store, payload)
+                    self._json({"item": item})
+                elif path == "/manage/daily-summary-delivery" and method == "PATCH":
+                    item = _update_daily_summary_delivery(config, store, payload)
                     self._json({"item": item})
                 elif path == "/manage/daily-packages" and method == "POST":
                     item = _create_daily_package(config, store, payload)
@@ -1144,9 +1149,46 @@ def _update_daily_package_schedule(
 ) -> dict[str, Any]:
     if config is None:
         raise ValueError("Server config is required for daily package scheduling")
-    from tele_mess_core.daily import update_daily_package_schedule
+    from tele_mess_core.daily import update_daily_package_schedule, update_daily_summary_delivery
 
-    return update_daily_package_schedule(store, config, payload)
+    if "delivery" in payload:
+        update_daily_summary_delivery(store, config, dict(payload.get("delivery") or {}))
+    schedule_payload = {key: value for key, value in payload.items() if key != "delivery"}
+    update_daily_package_schedule(store, config, schedule_payload)
+    return _daily_package_schedule_item(config, store)
+
+
+def _daily_package_schedule_item(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+) -> dict[str, Any]:
+    item = store.get_daily_package_schedule()
+    if config is not None:
+        item["delivery"] = _daily_summary_delivery(config, store)
+    return item
+
+
+def _daily_summary_delivery(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily summary delivery")
+    from tele_mess_core.daily import daily_summary_delivery_state
+
+    return daily_summary_delivery_state(store, config)
+
+
+def _update_daily_summary_delivery(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    if config is None:
+        raise ValueError("Server config is required for daily summary delivery")
+    from tele_mess_core.daily import update_daily_summary_delivery
+
+    return update_daily_summary_delivery(store, config, payload)
 
 
 def _create_daily_package(

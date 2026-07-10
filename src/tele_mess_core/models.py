@@ -174,6 +174,15 @@ class DailyPackageScheduleRecord:
 
 
 @dataclass(slots=True)
+class DailySummaryDeliveryRecord:
+    enabled: bool = False
+    account_id: str | None = None
+    origin_id: int | None = None
+    topic_id: int = 0
+    updated_at: str | None = None
+
+
+@dataclass(slots=True)
 class DailyPackageRunRecord:
     run_id: str
     status: str

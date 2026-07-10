@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-07-10.1`
-- Contract hash: `697610641890d591`
+- Contract version: `2026-07-10.2`
+- Contract hash: `28e087b419802ee3`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -35,6 +35,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `DELETE /manage/participants` body `ParticipantInput` - Delete a participant profile.
 - `DELETE /manage/operation-events` body `OperationEventDeleteInput` - Delete one or more operation events.
 - `PATCH /manage/daily-package-schedule` body `DailyPackageScheduleInput` - Update the daily package system schedule.
+- `PATCH /manage/daily-summary-delivery` body `DailySummaryDeliveryInput` - Persist the daily summary Telegram delivery target.
 - `POST /manage/daily-packages` body `DailyPackageRunInput` - Generate a daily package immediately.
 - `POST /manage/daily-summaries` body `DailySummaryRunInput` - Run or enqueue a daily summary.
 - `POST /manage/daily-summary-jobs` body `DailySummaryRunInput` - Start a background daily package and summary job.

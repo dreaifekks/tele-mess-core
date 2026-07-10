@@ -203,6 +203,14 @@
         <label class="check"><input type="checkbox" name="activate_systemd"> Activate systemd user timer</label>
         <button class="primary" type="submit">Save schedule</button>
       </form>
+      <h3>Summary delivery</h3>
+      <form id="daily-delivery-form" class="form-grid">
+        <label class="check"><input type="checkbox" name="enabled"> Enabled</label>
+        <label>Sender account<input name="account_id" placeholder="main"></label>
+        <label>Target origin ID<input name="origin_id" inputmode="numeric"></label>
+        <label>Topic ID<input name="topic_id" value="0" inputmode="numeric"></label>
+        <button class="primary" type="submit">Save delivery</button>
+      </form>
       <h3>Run package</h3>
       <form id="daily-package-form" class="form-grid">
         <label>Date<input name="date" placeholder="YYYY-MM-DD"></label>
@@ -232,6 +240,8 @@
       <div class="panel-head"><h2>Daily Runs</h2><button data-action="load-daily">Refresh</button></div>
       <h3>Schedule</h3>
       <pre id="daily-schedule-raw"></pre>
+      <h3>Summary delivery</h3>
+      <pre id="daily-delivery-raw"></pre>
       <h3>Summary jobs</h3>
       <div class="table-wrap"><table><thead><tr><th>Job</th><th>Status</th><th>Progress</th><th>Package</th><th>Summary</th><th>Actions</th></tr></thead><tbody id="daily-summary-jobs-body"></tbody></table></div>
       <h3>Package runs</h3>
@@ -306,7 +316,7 @@
 <datalist id="tag-suggestions"></datalist>
 
 <script>
-const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailySummaryJobs: [], dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {}, manageSummaries: false, selectedSummaries: {} };
+const state = { apiManifest: null, accounts: [], origins: [], policies: [], participants: [], cursors: [], media: [], operationEvents: [], service: null, messages: [], dailySchedule: null, dailyDelivery: null, dailySummaryJobs: [], dailyPackageRuns: [], dailySummaryRuns: [], dailySummaryRecords: [], expandedOrigins: {}, manageOrigins: false, selectedOrigins: {}, manageSummaries: false, selectedSummaries: {} };
 let messageRefreshTimer = null;
 let dailyRefreshTimer = null;
 let messageRefreshInFlight = false;
@@ -647,10 +657,11 @@ async function loadOrigins() {
 async function loadAll() {
   try {
     setStatus('Loading');
-    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+    const [apiManifest, service, accounts, origins, policies, participants, cursors, operationEvents, media, messages, dailySchedule, dailyDelivery, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
       api('/manage/api-manifest'), api('/sync/state'), api('/manage/accounts'), api(originPath()), api('/manage/backup-policies'),
       api('/manage/participants'), api('/manage/capture-cursors'), api('/manage/operation-events'), api('/sync/media-files'),
       api('/sync/messages?latest=true&limit=100&include_media=true'), api('/manage/daily-package-schedule'),
+      api('/manage/daily-summary-delivery'),
       api('/manage/daily-summary-jobs'), api('/manage/daily-package-runs'), api('/manage/daily-summary-runs'), api(summaryRecordsPath())
     ]);
     const contractWarning = updateApiManifest(apiManifest);
@@ -665,6 +676,7 @@ async function loadAll() {
     state.media = media.items || [];
     state.messages = messages.items || [];
     state.dailySchedule = dailySchedule.item || null;
+    state.dailyDelivery = dailyDelivery.item || null;
     state.dailySummaryJobs = summaryJobs.items || [];
     state.dailyPackageRuns = packageRuns.items || [];
     state.dailySummaryRuns = summaryRuns.items || [];
@@ -691,14 +703,16 @@ async function loadMessages(options={}) {
   }
 }
 async function loadDaily() {
-  const [schedule, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
+  const [schedule, delivery, summaryJobs, packageRuns, summaryRuns, summaryRecords] = await Promise.all([
     api('/manage/daily-package-schedule'),
+    api('/manage/daily-summary-delivery'),
     api('/manage/daily-summary-jobs'),
     api('/manage/daily-package-runs'),
     api('/manage/daily-summary-runs'),
     api(summaryRecordsPath()),
   ]);
   state.dailySchedule = schedule.item || null;
+  state.dailyDelivery = delivery.item || null;
   state.dailySummaryJobs = summaryJobs.items || [];
   state.dailyPackageRuns = packageRuns.items || [];
   state.dailySummaryRuns = summaryRuns.items || [];
@@ -909,6 +923,16 @@ function renderDaily() {
   }
   const raw = $('daily-schedule-raw');
   if (raw) raw.textContent = JSON.stringify(schedule, null, 2);
+  const delivery = state.dailyDelivery || schedule.delivery || {};
+  const deliveryForm = $('daily-delivery-form');
+  if (deliveryForm) {
+    deliveryForm.enabled.checked = Boolean(delivery.enabled);
+    deliveryForm.account_id.value = delivery.account_id || '';
+    deliveryForm.origin_id.value = delivery.origin_id ?? '';
+    deliveryForm.topic_id.value = delivery.topic_id ?? 0;
+  }
+  const deliveryRaw = $('daily-delivery-raw');
+  if (deliveryRaw) deliveryRaw.textContent = JSON.stringify(delivery, null, 2);
   renderSummaryRecordHead();
   fillTable('daily-summary-jobs-body', (state.dailySummaryJobs || []).map(summaryJobRow), 6);
   fillTable('daily-package-runs-body', (state.dailyPackageRuns || []).map(item => `<tr><td>${text(item.run_id)}</td><td>${pill(item.status)}</td><td>${text(item.date)}<div class="muted">${text(item.timezone)}</div></td><td>${progressCell(item)}</td><td>${text(item.origin_count)}</td><td>${text(item.message_count)}</td><td title="${attr(item.output_dir)}">${text(item.package_md_path || item.output_dir)}</td></tr>`), 7);
@@ -1251,6 +1275,23 @@ $('daily-schedule-form').addEventListener('submit', async (event) => {
     state.dailySchedule = result.item;
     await loadDaily();
     setStatus('Daily schedule saved', result.item?.last_error ? 'warn' : 'ok');
+  } catch (error) { setStatus(String(error), 'error'); }
+});
+$('daily-delivery-form').addEventListener('submit', async (event) => {
+  event.preventDefault();
+  try {
+    const data = numberFields(formData(event.target), ['origin_id', 'topic_id']);
+    const payload = {
+      enabled: Boolean(data.enabled),
+      account_id: data.account_id || null,
+      origin_id: data.origin_id === '' ? null : data.origin_id,
+      topic_id: data.topic_id === '' ? 0 : data.topic_id,
+    };
+    const result = await api('/manage/daily-summary-delivery', { method: 'PATCH', body: JSON.stringify(payload) });
+    state.dailyDelivery = result.item;
+    renderDaily();
+    renderRaw();
+    setStatus('Daily summary delivery saved', 'ok');
   } catch (error) { setStatus(String(error), 'error'); }
 });
 $('daily-package-form').addEventListener('submit', async (event) => {

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-10.1"
+API_CONTRACT_VERSION = "2026-07-10.2"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -48,12 +48,15 @@ def _object(
     *,
     required: list[str] | None = None,
     description: str = "",
+    additional_properties: bool | None = None,
 ) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": "object", "properties": properties}
     if required:
         schema["required"] = required
     if description:
         schema["description"] = description
+    if additional_properties is not None:
+        schema["additionalProperties"] = additional_properties
     return schema
 
 
@@ -503,12 +506,33 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         },
         required=["source", "account_id", "chat_id", "message_id", "file_index"],
     ),
+    "DailySummaryDelivery": _object(
+        {
+            "enabled": {"type": "boolean"},
+            "account_id": {"type": "string", "nullable": True},
+            "origin_id": {"type": "integer", "nullable": True},
+            "topic_id": {"type": "integer", "default": 0},
+            "source": {"type": "string", "enum": ["config", "database"]},
+            "updated_at": {"type": "string", "nullable": True},
+        },
+        required=["enabled", "account_id", "origin_id", "topic_id", "source"],
+    ),
+    "DailySummaryDeliveryInput": _object(
+        {
+            "enabled": {"type": "boolean", "default": False},
+            "account_id": {"type": "string", "nullable": True},
+            "origin_id": {"type": "integer", "nullable": True},
+            "topic_id": {"type": "integer", "default": 0},
+        },
+        additional_properties=False,
+    ),
     "DailyPackageSchedule": _object(
         {
             "enabled": {"type": "boolean"},
             "time_of_day": {"type": "string"},
             "timezone": {"type": "string"},
             "scope": {"type": "object"},
+            "delivery": {"$ref": "#/components/schemas/DailySummaryDelivery"},
             "system_manager": {"type": "string"},
             "installed": {"type": "boolean"},
             "last_installed_at": {"type": "string", "nullable": True},
@@ -523,9 +547,11 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "time_of_day": {"type": "string", "default": "08:00"},
             "timezone": {"type": "string", "default": "Asia/Tokyo"},
             "scope": {"type": "object"},
+            "delivery": {"$ref": "#/components/schemas/DailySummaryDeliveryInput"},
             "system_manager": {"type": "string", "default": "systemd-user"},
             "activate_systemd": {"type": "boolean", "default": False},
         },
+        additional_properties=False,
     ),
     "DailyPackageRunInput": _object(
         {
@@ -687,6 +713,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "ParticipantListResponse": _items_response("Participant"),
     "CaptureCursorListResponse": _items_response("CaptureCursor"),
     "OperationEventListResponse": _items_response("OperationEvent"),
+    "DailySummaryDeliveryResponse": _item_response("DailySummaryDelivery"),
     "DailyPackageScheduleResponse": _item_response("DailyPackageSchedule"),
     "DailyPackageRunListResponse": _items_response("DailyPackageRun"),
     "DailyPackageRunResponse": _item_response("DailyPackageRun"),
@@ -939,6 +966,8 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
     ApiEndpoint("DELETE", "/manage/operation-events", "management", "Delete one or more operation events.", body_schema="OperationEventDeleteInput", response_schema="OperationEventDeleteResponse"),
     ApiEndpoint("GET", "/manage/daily-package-schedule", "management", "Return the daily package system schedule.", response_schema="DailyPackageScheduleResponse"),
     ApiEndpoint("PATCH", "/manage/daily-package-schedule", "management", "Update the daily package system schedule.", body_schema="DailyPackageScheduleInput", response_schema="DailyPackageScheduleResponse"),
+    ApiEndpoint("GET", "/manage/daily-summary-delivery", "management", "Return the effective daily summary Telegram delivery target.", response_schema="DailySummaryDeliveryResponse"),
+    ApiEndpoint("PATCH", "/manage/daily-summary-delivery", "management", "Persist the daily summary Telegram delivery target.", body_schema="DailySummaryDeliveryInput", response_schema="DailySummaryDeliveryResponse"),
     ApiEndpoint("POST", "/manage/daily-packages", "management", "Generate a daily package immediately.", body_schema="DailyPackageRunInput", response_schema="DailyPackageRunResponse", status=201),
     ApiEndpoint(
         "GET",
@@ -1150,6 +1179,10 @@ def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> Non
             if key not in value or value[key] is None or value[key] == "":
                 raise ValueError(f"Missing required field: {path}.{key}")
         properties = schema.get("properties") or {}
+        if schema.get("additionalProperties") is False:
+            unknown = sorted(set(value) - set(properties))
+            if unknown:
+                raise ValueError(f"Unknown field: {path}.{unknown[0]}")
         for key, item in value.items():
             if key in properties:
                 _validate_schema_value(item, properties[key], f"{path}.{key}")

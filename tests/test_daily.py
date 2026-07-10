@@ -12,10 +12,10 @@ from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
-from tele_mess_core.config import AppConfig, DailyAiConfig, DailyDeliveryConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
+from tele_mess_core.config import AppConfig, DailyAiConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
 from tele_mess_core.daily import build_daily_package, run_daily_summary, update_daily_package_schedule
 from tele_mess_core.daily_jobs import DailyJobWorker
-from tele_mess_core.models import BackupPolicyRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.models import BackupPolicyRecord, DailySummaryDeliveryRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
 
 class DailyPackagingTest(unittest.TestCase):
@@ -248,18 +248,13 @@ class DailyPackagingTest(unittest.TestCase):
             event_type="new",
         )
         package = build_daily_package(self.store, self.config, run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
-        delivery_config = AppConfig(
-            storage=self.config.storage,
-            telegram=self.config.telegram,
-            server=self.config.server,
-            logging=self.config.logging,
-            daily=DailyPackagingConfig(
-                output_dir=self.config.daily.output_dir,
-                systemd_user_dir=self.config.daily.systemd_user_dir,
-                ai=DailyAiConfig(provider="disabled"),
-                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001, topic_id=88),
-            ),
-            config_path=self.config.config_path,
+        self.store.set_daily_summary_delivery(
+            DailySummaryDeliveryRecord(
+                enabled=True,
+                account_id="main",
+                origin_id=-9001,
+                topic_id=88,
+            )
         )
 
         delivery_result = {
@@ -271,7 +266,7 @@ class DailyPackagingTest(unittest.TestCase):
             "message_ids": [123],
         }
         with patch("tele_mess_core.daily.deliver_daily_summary", return_value=delivery_result) as deliver:
-            summary = run_daily_summary(self.store, delivery_config, package_run_id=package["run_id"])
+            summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
 
         deliver.assert_called_once()
         delivered_content = deliver.call_args.args[2]
@@ -281,6 +276,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("- Tags: #info", delivered_content)
         self.assertIn("- Summary provider: `disabled`", delivered_content)
         self.assertIn("AI provider is disabled", delivered_content)
+        self.assertEqual(deliver.call_args.kwargs["delivery"].origin_id, -9001)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["progress_current"], summary["progress_total"])
         self.assertEqual(summary["progress"]["delivery_count"], 1)

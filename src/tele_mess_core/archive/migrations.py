@@ -133,6 +133,22 @@ def _migration_14(connection: sqlite3.Connection) -> None:
         connection.execute(statement)
 
 
+def _migration_15(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS daily_summary_delivery (
+          id INTEGER PRIMARY KEY CHECK (id = 1),
+          enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+          account_id TEXT,
+          origin_id INTEGER,
+          topic_id INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL,
+          CHECK (enabled = 0 OR (account_id IS NOT NULL AND account_id != '' AND origin_id IS NOT NULL))
+        )
+        """
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -143,4 +159,5 @@ def _ensure_column(connection: sqlite3.Connection, table: str, column: str, defi
 MIGRATIONS: dict[int, Migration] = {
     13: _migration_13,
     14: _migration_14,
+    15: _migration_15,
 }

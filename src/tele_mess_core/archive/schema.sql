@@ -188,6 +188,16 @@ CREATE TABLE IF NOT EXISTS daily_package_schedule (
   updated_at TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS daily_summary_delivery (
+  id INTEGER PRIMARY KEY CHECK (id = 1),
+  enabled INTEGER NOT NULL DEFAULT 0 CHECK (enabled IN (0, 1)),
+  account_id TEXT,
+  origin_id INTEGER,
+  topic_id INTEGER NOT NULL DEFAULT 0,
+  updated_at TEXT NOT NULL,
+  CHECK (enabled = 0 OR (account_id IS NOT NULL AND account_id != '' AND origin_id IS NOT NULL))
+);
+
 CREATE TABLE IF NOT EXISTS daily_package_runs (
   run_id TEXT PRIMARY KEY,
   status TEXT NOT NULL,

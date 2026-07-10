@@ -191,15 +191,18 @@ basic control-plane model for future Mac and web clients:
    specific origin.
 10. Use `GET`/`PATCH /manage/daily-package-schedule` to inspect or update the
    daily package system timer settings.
-11. Use `POST /manage/daily-packages` to generate one package immediately, and
+11. Use `GET`/`PATCH /manage/daily-summary-delivery` to inspect or persist the
+   account, group/channel, and optional topic that receives the final summary.
+   SQLite delivery settings override the YAML fallback.
+12. Use `POST /manage/daily-packages` to generate one package immediately, and
    `GET /manage/daily-package-runs` to inspect package run state.
-12. Use `POST /manage/daily-summaries` to enqueue or wait for one summary,
+13. Use `POST /manage/daily-summaries` to enqueue or wait for one summary,
    `GET /manage/daily-summary-runs` to inspect run state, and
    `GET /manage/daily-summary-records` to list/filter stored summary content.
-13. Use `POST`/`GET /manage/daily-summary-jobs` to enqueue and inspect the
+14. Use `POST`/`GET /manage/daily-summary-jobs` to enqueue and inspect the
     durable package-plus-summary workflow, and
     `PATCH /manage/daily-summary-jobs/cancel` to request cancellation.
-13. Use `GET /console` for the built-in web console. The console can be opened
+15. Use `GET /console` for the built-in web console. The console can be opened
    in a browser without a token header, then the operator enters `server.token`;
    all API calls still use the token-protected sync and management endpoints.
 

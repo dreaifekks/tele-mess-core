@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Added SQLite-backed `GET`/`PATCH /manage/daily-summary-delivery` configuration for clients.
+- Allowed schedule updates to persist a nested `delivery` target and reject unknown fields instead of returning a false success.
+- Changed scheduled and background summary jobs to resolve the persisted delivery target before creating the Telegram outbox.
+
 ## 0.2.5 - 2026-07-09
 
 - Added configurable Telegram delivery for final daily summaries, targeting a chosen account, group/channel, and optional forum topic.

@@ -18,10 +18,11 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig
+from tele_mess_core.config import AppConfig, DailyDeliveryConfig
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
+    DailySummaryDeliveryRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
     SOURCE_TELEGRAM,
@@ -489,7 +490,8 @@ def run_daily_summary(
         raise ValueError(f"Package JSON is missing for run: {package_run_id}")
 
     package_payload = json.loads(package_json_path.read_text(encoding="utf-8"))
-    progress_counts = _summary_progress_counts(package_payload, include_delivery=_daily_delivery_enabled(config))
+    delivery = resolve_daily_summary_delivery(store, config)
+    progress_counts = _summary_progress_counts(package_payload, include_delivery=delivery.enabled)
     image_count_estimate = len(_collect_image_paths(package_payload))
     run_id = run_id or _new_run_id("sum")
     output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
@@ -577,7 +579,7 @@ def run_daily_summary(
         delivery_result = None
         delivery_content = None
         outbox_items: list[dict[str, Any]] = []
-        if _daily_delivery_enabled(config):
+        if delivery.enabled:
             delivery_content = _summary_delivery_markdown(
                 package_run=package_run,
                 package_payload=package_payload,
@@ -595,25 +597,25 @@ def run_daily_summary(
                             "outbox_id": f"out_{run_id}_{index}",
                             "summary_run_id": run_id,
                             "job_id": job_id,
-                            "account_id": config.daily.delivery.account_id,
-                            "origin_id": config.daily.delivery.origin_id,
-                            "topic_id": config.daily.delivery.topic_id,
+                            "account_id": delivery.account_id,
+                            "origin_id": delivery.origin_id,
+                            "topic_id": delivery.topic_id,
                             "chunk_index": index,
                             "chunk_count": len(chunks),
                             "content": body,
                         }
                     )
         store.persist_daily_summary_batch(summary_records, outbox_items)
-        if _daily_delivery_enabled(config):
+        if delivery.enabled:
             update_progress(
                 max(0, int(progress_counts.get("total") or 0) - 1),
                 "queueing daily summary delivery" if defer_delivery else "delivering daily summary",
                 "delivery",
-                {"delivery": _delivery_target_payload(config)},
+                {"delivery": _delivery_target_payload(delivery)},
             )
             if defer_delivery:
                 delivery_result = {
-                    **_delivery_target_payload(config),
+                    **_delivery_target_payload(delivery),
                     "status": "queued",
                     "message_count": len(outbox_items),
                     "outbox_ids": [item["outbox_id"] for item in outbox_items],
@@ -624,6 +626,7 @@ def run_daily_summary(
                     config,
                     str(delivery_content or ""),
                     telegram_runtime=telegram_runtime,
+                    delivery=delivery,
                 )
             _write_summary_analysis_json(
                 output_root / "summary.json",
@@ -767,8 +770,9 @@ def deliver_daily_summary(
     content: str,
     *,
     telegram_runtime: Any | None = None,
+    delivery: DailyDeliveryConfig | None = None,
 ) -> dict[str, Any] | None:
-    delivery = config.daily.delivery
+    delivery = delivery or resolve_daily_summary_delivery(store, config)
     if not delivery.enabled:
         return None
     if delivery.origin_id is None:
@@ -780,26 +784,80 @@ def deliver_daily_summary(
             delivery=delivery,
             content=content,
         )
-    account = _delivery_account_config(config)
+    account = _delivery_account_config(config, delivery)
     from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
     return asyncio.run(TelegramSummaryDeliveryService(account, store).send_summary(delivery, content))
 
 
-def _daily_delivery_enabled(config: AppConfig) -> bool:
-    return bool(config.daily.delivery.enabled)
+def daily_summary_delivery_state(store: ArchiveStore, config: AppConfig) -> dict[str, Any]:
+    stored = store.get_daily_summary_delivery()
+    if stored is not None:
+        return {**stored, "source": "database"}
+    delivery = config.daily.delivery
+    return {
+        "enabled": bool(delivery.enabled),
+        "account_id": delivery.account_id or None,
+        "origin_id": delivery.origin_id,
+        "topic_id": int(delivery.topic_id),
+        "updated_at": None,
+        "source": "config",
+    }
 
 
-def _delivery_account_config(config: AppConfig):
-    account_id = config.daily.delivery.account_id
+def resolve_daily_summary_delivery(store: ArchiveStore, config: AppConfig) -> DailyDeliveryConfig:
+    state = daily_summary_delivery_state(store, config)
+    return DailyDeliveryConfig(
+        enabled=bool(state.get("enabled")),
+        account_id=str(state.get("account_id") or ""),
+        origin_id=int(state["origin_id"]) if state.get("origin_id") is not None else None,
+        topic_id=int(state.get("topic_id") or 0),
+    )
+
+
+def update_daily_summary_delivery(
+    store: ArchiveStore,
+    config: AppConfig,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
+    current = daily_summary_delivery_state(store, config)
+    enabled = _payload_bool(payload, "enabled", bool(current.get("enabled", False)))
+    account_id_raw = payload["account_id"] if "account_id" in payload else current.get("account_id")
+    origin_id_raw = payload["origin_id"] if "origin_id" in payload else current.get("origin_id")
+    topic_id_raw = payload["topic_id"] if "topic_id" in payload else current.get("topic_id", 0)
+    account_id = str(account_id_raw or "").strip() or None
+    origin_id = None if origin_id_raw in (None, "") else int(origin_id_raw)
+    topic_id = 0 if topic_id_raw in (None, "") else int(topic_id_raw)
+    if topic_id < 0:
+        raise ValueError("daily summary delivery topic_id must be zero or positive")
+    if enabled:
+        if not account_id:
+            raise ValueError("daily summary delivery account_id is required when enabled is true")
+        if origin_id is None:
+            raise ValueError("daily summary delivery origin_id is required when enabled is true")
+        if not any(account.account_id == account_id for account in config.telegram.accounts):
+            raise ValueError(f"Unknown daily summary delivery account_id: {account_id}")
+    stored = store.set_daily_summary_delivery(
+        DailySummaryDeliveryRecord(
+            enabled=enabled,
+            account_id=account_id,
+            origin_id=origin_id,
+            topic_id=topic_id,
+            updated_at=utc_now_iso(),
+        )
+    )
+    return {**stored, "source": "database"}
+
+
+def _delivery_account_config(config: AppConfig, delivery: DailyDeliveryConfig):
+    account_id = delivery.account_id
     for account in config.telegram.accounts:
         if account.account_id == account_id:
             return account
     raise ValueError(f"Unknown daily.delivery.account_id: {account_id}")
 
 
-def _delivery_target_payload(config: AppConfig) -> dict[str, Any]:
-    delivery = config.daily.delivery
+def _delivery_target_payload(delivery: DailyDeliveryConfig) -> dict[str, Any]:
     return {
         "account_id": delivery.account_id,
         "origin_id": delivery.origin_id,

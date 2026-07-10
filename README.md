@@ -107,6 +107,7 @@ the freed pages for later messages.
 - `GET /manage/capture-cursors?account_id=main`
 - `GET /manage/operation-events?account_id=main&status=failed`
 - `GET` or `PATCH /manage/daily-package-schedule`
+- `GET` or `PATCH /manage/daily-summary-delivery`
 - `POST /manage/daily-packages`
 - `GET /manage/daily-package-runs`
 - `POST /manage/daily-summaries`

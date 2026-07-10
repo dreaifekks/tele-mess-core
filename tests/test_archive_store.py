@@ -15,6 +15,7 @@ from tele_mess_core.models import (
     BackupPolicyRecord,
     CaptureCursorRecord,
     ChatRecord,
+    DailySummaryDeliveryRecord,
     DailySummaryJobRecord,
     DailySummaryRecord,
     MediaFileRecord,
@@ -100,6 +101,23 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(len(set(connection_ids)), 2)
         self.assertNotIn(main_connection_id, connection_ids)
         self.assertEqual({item["account_id"] for item in self.store.list_accounts()}, {"one", "two"})
+
+    def test_daily_summary_delivery_round_trip(self) -> None:
+        self.assertIsNone(self.store.get_daily_summary_delivery())
+        saved = self.store.set_daily_summary_delivery(
+            DailySummaryDeliveryRecord(
+                enabled=True,
+                account_id="main",
+                origin_id=-1001,
+                topic_id=42,
+                updated_at="2026-07-10T00:00:00+00:00",
+            )
+        )
+
+        self.assertTrue(saved["enabled"])
+        self.assertEqual(saved["account_id"], "main")
+        self.assertEqual(saved["origin_id"], -1001)
+        self.assertEqual(saved["topic_id"], 42)
 
     def test_delete_creates_tombstone(self) -> None:
         seqs = self.store.mark_deleted(SOURCE_TELEGRAM, -1002, [99], event_at=utc_now_iso())
@@ -711,14 +729,14 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 14)
+                self.assertEqual(store.state()["schema_version"], 15)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
             finally:
                 store.close()
 
-    def test_v12_job_schema_migrates_to_durable_queue_and_outbox(self) -> None:
+    def test_v12_job_schema_migrates_to_durable_queue_outbox_and_delivery_config(self) -> None:
         conn = sqlite3.connect(":memory:")
         try:
             conn.executescript(
@@ -750,17 +768,20 @@ class ArchiveMigrationTest(unittest.TestCase):
                 """
             )
 
-            apply_migrations(conn, 12, 14)
+            apply_migrations(conn, 12, 15)
 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
             self.assertTrue({"request_json", "dedupe_key", "worker_id", "lease_until", "heartbeat_at", "attempt"} <= columns)
             self.assertIsNotNone(
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_outbox'").fetchone()
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertIsNotNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='daily_summary_delivery'").fetchone()
+            )
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 15)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "14",
+                "15",
             )
             self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
 

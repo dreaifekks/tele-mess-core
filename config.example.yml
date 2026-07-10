@@ -57,6 +57,8 @@ daily:
       - "-"
     timeout_seconds: 900
   delivery:
+    # YAML is the fallback. PATCH /manage/daily-summary-delivery persists an
+    # SQLite override that scheduled and background runs read automatically.
     enabled: false
     # Send the final daily summary through this authenticated account.
     account_id: "main"

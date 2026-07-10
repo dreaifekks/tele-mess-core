@@ -170,12 +170,21 @@ username, and forum metadata. Delivered messages use the final Markdown rollup
 with a generated header containing the summary date, timezone, Telegram
 searchable hashtags, and summary provider.
 
+YAML remains the fallback for existing deployments. Management clients should
+use `GET` and `PATCH /manage/daily-summary-delivery`; the API stores the target
+in SQLite and that database value takes precedence for scheduled and background
+runs. `PATCH /manage/daily-package-schedule` also accepts the same object under
+the nested `delivery` field for clients that save schedule and destination in
+one request. Unknown schedule fields return an error instead of being silently
+ignored.
+
 ## Persistence And API
 
 SQLite stores run state and queryable summary content:
 
 - `origins.important`;
 - `daily_package_schedule`;
+- `daily_summary_delivery`;
 - `daily_package_runs`;
 - `daily_summary_runs`;
 - `daily_summary_records`;
@@ -215,6 +224,7 @@ Markdown.
 Primary management endpoints:
 
 - `GET` / `PATCH` `/manage/daily-package-schedule`;
+- `GET` / `PATCH` `/manage/daily-summary-delivery`;
 - `POST` `/manage/daily-packages`;
 - `GET` `/manage/daily-package-runs`;
 - `GET` `/manage/daily-package-runs/content`;

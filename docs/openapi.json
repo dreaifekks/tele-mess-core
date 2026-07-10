@@ -682,6 +682,9 @@
       },
       "DailyPackageSchedule": {
         "properties": {
+          "delivery": {
+            "$ref": "#/components/schemas/DailySummaryDelivery"
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -724,10 +727,14 @@
         "type": "object"
       },
       "DailyPackageScheduleInput": {
+        "additionalProperties": false,
         "properties": {
           "activate_systemd": {
             "default": false,
             "type": "boolean"
+          },
+          "delivery": {
+            "$ref": "#/components/schemas/DailySummaryDeliveryInput"
           },
           "enabled": {
             "default": false,
@@ -755,6 +762,77 @@
         "properties": {
           "item": {
             "$ref": "#/components/schemas/DailyPackageSchedule"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailySummaryDelivery": {
+        "properties": {
+          "account_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "origin_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "source": {
+            "enum": [
+              "config",
+              "database"
+            ],
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "account_id",
+          "origin_id",
+          "topic_id",
+          "source"
+        ],
+        "type": "object"
+      },
+      "DailySummaryDeliveryInput": {
+        "additionalProperties": false,
+        "properties": {
+          "account_id": {
+            "nullable": true,
+            "type": "string"
+          },
+          "enabled": {
+            "default": false,
+            "type": "boolean"
+          },
+          "origin_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "type": "object"
+      },
+      "DailySummaryDeliveryResponse": {
+        "properties": {
+          "item": {
+            "$ref": "#/components/schemas/DailySummaryDelivery"
           }
         },
         "required": [
@@ -2301,8 +2379,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-10.1",
-    "x-contract-hash": "697610641890d591"
+    "version": "2026-07-10.2",
+    "x-contract-hash": "28e087b419802ee3"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3907,6 +3985,132 @@
           }
         ],
         "summary": "Run or enqueue a daily summary.",
+        "tags": [
+          "management"
+        ]
+      }
+    },
+    "/manage/daily-summary-delivery": {
+      "get": {
+        "operationId": "get_manage_daily_summary_delivery",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryDeliveryResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Return the effective daily summary Telegram delivery target.",
+        "tags": [
+          "management"
+        ]
+      },
+      "patch": {
+        "operationId": "patch_manage_daily_summary_delivery",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DailySummaryDeliveryInput"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DailySummaryDeliveryResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Persist the daily summary Telegram delivery target.",
         "tags": [
           "management"
         ]

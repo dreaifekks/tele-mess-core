@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-10.1`
-- Contract hash: `697610641890d591`
+- Contract version: `2026-07-10.2`
+- Contract hash: `28e087b419802ee3`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -54,6 +54,8 @@ The built-in console and generated documentation endpoints are public on the loc
 - `DELETE /manage/operation-events` (management, token) - Delete one or more operation events.
 - `GET /manage/daily-package-schedule` (management, token) - Return the daily package system schedule.
 - `PATCH /manage/daily-package-schedule` (management, token) - Update the daily package system schedule.
+- `GET /manage/daily-summary-delivery` (management, token) - Return the effective daily summary Telegram delivery target.
+- `PATCH /manage/daily-summary-delivery` (management, token) - Persist the daily summary Telegram delivery target.
 - `POST /manage/daily-packages` (management, token) - Generate a daily package immediately.
 - `GET /manage/daily-package-runs` (management, token) - List daily package runs.
 - `GET /manage/daily-package-runs/content` (management, token) - Return daily package run content.
@@ -609,6 +611,30 @@ Request body: `DailyPackageScheduleInput`
 
 Response: `DailyPackageScheduleResponse`
 
+### GET /manage/daily-summary-delivery
+
+Return the effective daily summary Telegram delivery target.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: none
+
+Response: `DailySummaryDeliveryResponse`
+
+### PATCH /manage/daily-summary-delivery
+
+Persist the daily summary Telegram delivery target.
+
+- Tag: `management`
+- Auth: `required`
+- Success: `200`
+
+Request body: `DailySummaryDeliveryInput`
+
+Response: `DailySummaryDeliveryResponse`
+
 ### POST /manage/daily-packages
 
 Generate a daily package immediately.
@@ -1094,6 +1120,7 @@ Response: `ParticipantRefreshResultResponse`
 | `time_of_day` | `string` | yes |
 | `timezone` | `string` | yes |
 | `scope` | `object` | yes |
+| `delivery` | `DailySummaryDelivery` | no |
 | `system_manager` | `string` | yes |
 | `installed` | `boolean` | yes |
 | `last_installed_at` | `string` | no |
@@ -1108,6 +1135,7 @@ Response: `ParticipantRefreshResultResponse`
 | `time_of_day` | `string` | no |
 | `timezone` | `string` | no |
 | `scope` | `object` | no |
+| `delivery` | `DailySummaryDeliveryInput` | no |
 | `system_manager` | `string` | no |
 | `activate_systemd` | `boolean` | no |
 
@@ -1116,6 +1144,32 @@ Response: `ParticipantRefreshResultResponse`
 | Field | Type | Required |
 | --- | --- | --- |
 | `item` | `DailyPackageSchedule` | yes |
+
+### DailySummaryDelivery
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `enabled` | `boolean` | yes |
+| `account_id` | `string` | yes |
+| `origin_id` | `integer` | yes |
+| `topic_id` | `integer` | yes |
+| `source` | `string` | yes |
+| `updated_at` | `string` | no |
+
+### DailySummaryDeliveryInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `enabled` | `boolean` | no |
+| `account_id` | `string` | no |
+| `origin_id` | `integer` | no |
+| `topic_id` | `integer` | no |
+
+### DailySummaryDeliveryResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `DailySummaryDelivery` | yes |
 
 ### DailySummaryJob
 

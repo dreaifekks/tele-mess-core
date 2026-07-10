@@ -16,6 +16,7 @@ from tele_mess_core.models import (
     ChatRecord,
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
+    DailySummaryDeliveryRecord,
     DailySummaryJobRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
@@ -30,7 +31,7 @@ from tele_mess_core.models import (
 from tele_mess_core.archive.migrations import apply_migrations
 
 
-SCHEMA_VERSION = 14
+SCHEMA_VERSION = 15
 LEGACY_SCHEMA_BASELINE = 12
 
 
@@ -1219,6 +1220,49 @@ class ArchiveStore:
             )
             self._conn.commit()
         return self.get_daily_package_schedule()
+
+    def get_daily_summary_delivery(self) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT enabled, account_id, origin_id, topic_id, updated_at
+                FROM daily_summary_delivery
+                WHERE id = 1
+                """
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_dict(row, bool_fields={"enabled"})
+
+    def set_daily_summary_delivery(self, delivery: DailySummaryDeliveryRecord) -> dict[str, Any]:
+        now = delivery.updated_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute(
+                """
+                INSERT INTO daily_summary_delivery(
+                  id, enabled, account_id, origin_id, topic_id, updated_at
+                )
+                VALUES (1, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  enabled = excluded.enabled,
+                  account_id = excluded.account_id,
+                  origin_id = excluded.origin_id,
+                  topic_id = excluded.topic_id,
+                  updated_at = excluded.updated_at
+                """,
+                (
+                    int(delivery.enabled),
+                    delivery.account_id,
+                    delivery.origin_id,
+                    int(delivery.topic_id),
+                    now,
+                ),
+            )
+            self._conn.commit()
+        item = self.get_daily_summary_delivery()
+        if item is None:
+            raise ValueError("daily summary delivery was not persisted")
+        return item
 
     def upsert_daily_package_run(self, run: DailyPackageRunRecord) -> dict[str, Any]:
         started_at = run.started_at or utc_now_iso()
