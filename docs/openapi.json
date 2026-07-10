@@ -764,11 +764,18 @@
       },
       "DailySummaryJob": {
         "properties": {
+          "attempt": {
+            "type": "integer"
+          },
           "cancel_requested_at": {
             "nullable": true,
             "type": "string"
           },
           "date": {
+            "nullable": true,
+            "type": "string"
+          },
+          "dedupe_key": {
             "nullable": true,
             "type": "string"
           },
@@ -780,7 +787,15 @@
             "nullable": true,
             "type": "string"
           },
+          "heartbeat_at": {
+            "nullable": true,
+            "type": "string"
+          },
           "job_id": {
+            "type": "string"
+          },
+          "lease_until": {
+            "nullable": true,
             "type": "string"
           },
           "package_run_id": {
@@ -804,6 +819,9 @@
             "nullable": true,
             "type": "string"
           },
+          "request": {
+            "type": "object"
+          },
           "scope": {
             "type": "object"
           },
@@ -823,6 +841,10 @@
             "type": "string"
           },
           "updated_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "worker_id": {
             "nullable": true,
             "type": "string"
           }
@@ -1130,6 +1152,10 @@
           "date": {
             "type": "string"
           },
+          "force": {
+            "default": false,
+            "type": "boolean"
+          },
           "origin_id": {
             "type": "integer"
           },
@@ -1176,6 +1202,24 @@
         "properties": {
           "item": {
             "$ref": "#/components/schemas/DailySummaryRun"
+          }
+        },
+        "required": [
+          "item"
+        ],
+        "type": "object"
+      },
+      "DailySummarySubmitResponse": {
+        "properties": {
+          "item": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DailySummaryRun"
+              },
+              {
+                "$ref": "#/components/schemas/DailySummaryJob"
+              }
+            ]
           }
         },
         "required": [
@@ -2257,8 +2301,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-04.2",
-    "x-contract-hash": "914f4499ab500f2c"
+    "version": "2026-07-10.1",
+    "x-contract-hash": "697610641890d591"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3800,6 +3844,7 @@
     },
     "/manage/daily-summaries": {
       "post": {
+        "description": "Returns a daily summary job when background=true, otherwise waits and returns the resulting summary run.",
         "operationId": "post_manage_daily_summaries",
         "requestBody": {
           "content": {
@@ -3816,7 +3861,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/DailySummaryRunResponse"
+                  "$ref": "#/components/schemas/DailySummarySubmitResponse"
                 }
               }
             },
@@ -3861,7 +3906,7 @@
             "ApiTokenAuth": []
           }
         ],
-        "summary": "Run a daily summary immediately.",
+        "summary": "Run or enqueue a daily summary.",
         "tags": [
           "management"
         ]

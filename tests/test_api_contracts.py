@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from tele_mess_core.cli import main
+from tele_mess_core.server.api import ENDPOINTS_BY_ROUTE, METHODS_BY_PATH
 from tele_mess_core.server.contracts import (
     API_CONTRACT_HASH,
     API_ENDPOINTS,
@@ -13,6 +14,8 @@ from tele_mess_core.server.contracts import (
     markdown_document,
     openapi_document,
     openapi_json,
+    validate_query_params,
+    validate_request_payload,
 )
 
 
@@ -33,6 +36,14 @@ class ApiContractTest(unittest.TestCase):
         self.assertEqual(openapi_routes, expected)
         self.assertIn("/manage/api-manifest", openapi["paths"])
         self.assertIn("ApiManifest", openapi["components"]["schemas"])
+        self.assertEqual(set(ENDPOINTS_BY_ROUTE), {(method.upper(), path) for method, path in expected})
+        self.assertEqual(
+            METHODS_BY_PATH,
+            {
+                path: {method.upper() for method, route_path in expected if route_path == path}
+                for _, path in expected
+            },
+        )
 
     def test_generated_docs_are_current(self) -> None:
         root = Path(__file__).resolve().parents[1]
@@ -54,6 +65,22 @@ class ApiContractTest(unittest.TestCase):
 
         self.assertEqual(parsed["info"]["x-contract-hash"], API_CONTRACT_HASH)
         self.assertIn("/sync/messages", parsed["paths"])
+
+    def test_contract_validates_runtime_request_inputs(self) -> None:
+        account_endpoint = next(
+            endpoint for endpoint in API_ENDPOINTS if endpoint.method == "POST" and endpoint.path == "/manage/accounts"
+        )
+        validate_request_payload(account_endpoint, {"account_id": "main"})
+        with self.assertRaisesRegex(ValueError, "body.account_id must be a string"):
+            validate_request_payload(account_endpoint, {"account_id": 123})
+
+        media_endpoint = next(
+            endpoint
+            for endpoint in API_ENDPOINTS
+            if endpoint.method == "GET" and endpoint.path == "/sync/media-files/content"
+        )
+        with self.assertRaisesRegex(ValueError, "account_id"):
+            validate_query_params(media_endpoint, {"chat_id": ["-1001"], "message_id": ["1"]})
 
 
 if __name__ == "__main__":

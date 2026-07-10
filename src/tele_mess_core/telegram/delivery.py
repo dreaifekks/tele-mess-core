@@ -20,12 +20,19 @@ class TelegramSummaryDeliveryService:
         self.store = store
         self.logger = logging.getLogger(__name__)
 
-    async def send_summary(self, delivery: DailyDeliveryConfig, content: str) -> dict[str, Any]:
+    async def send_summary(
+        self,
+        delivery: DailyDeliveryConfig,
+        content: str,
+        client: Any | None = None,
+        split_content: bool = True,
+    ) -> dict[str, Any]:
         if delivery.origin_id is None:
             raise ValueError("daily.delivery.origin_id is required")
-        client = None
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 raise TelegramOperationError(
@@ -36,7 +43,7 @@ class TelegramSummaryDeliveryService:
 
             self._set_auth_state("authorized")
             entity = await client.get_entity(delivery.origin_id)
-            chunks = split_telegram_message(content)
+            chunks = split_telegram_message(content) if split_content else [str(content)]
             message_ids: list[int] = []
             for index, chunk in enumerate(chunks, start=1):
                 body = chunk
@@ -85,7 +92,7 @@ class TelegramSummaryDeliveryService:
             )
             raise TelegramOperationError(error.code, error.message, error.auth_state, error.http_status, error.retry_after, error.error_type) from exc
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
     async def _connected_client(self) -> Any:

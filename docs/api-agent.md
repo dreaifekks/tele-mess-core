@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-07-04.2`
-- Contract hash: `914f4499ab500f2c`
+- Contract version: `2026-07-10.1`
+- Contract hash: `697610641890d591`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -36,7 +36,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `DELETE /manage/operation-events` body `OperationEventDeleteInput` - Delete one or more operation events.
 - `PATCH /manage/daily-package-schedule` body `DailyPackageScheduleInput` - Update the daily package system schedule.
 - `POST /manage/daily-packages` body `DailyPackageRunInput` - Generate a daily package immediately.
-- `POST /manage/daily-summaries` body `DailySummaryRunInput` - Run a daily summary immediately.
+- `POST /manage/daily-summaries` body `DailySummaryRunInput` - Run or enqueue a daily summary.
 - `POST /manage/daily-summary-jobs` body `DailySummaryRunInput` - Start a background daily package and summary job.
 - `PATCH /manage/daily-summary-jobs/cancel` body `DailySummaryJobCancelInput` - Request cancellation of a running daily summary job.
 - `PATCH /manage/daily-summary-records` body `DailySummaryRecordDeleteInput` - Soft-delete or restore one or more stored daily summary records.

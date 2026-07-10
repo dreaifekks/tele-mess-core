@@ -117,7 +117,6 @@ The stages are:
 
 For groups or origins tagged `info`, the prompts add an explicit information
 collection instruction: collect facts, announcements, events, resources, links,
-numbers, times, action items, controversies, and source references instead of
 only producing a chat atmosphere summary.
 
 The default AI provider is a local Codex command template:
@@ -179,7 +178,9 @@ SQLite stores run state and queryable summary content:
 - `daily_package_schedule`;
 - `daily_package_runs`;
 - `daily_summary_runs`;
-- `daily_summary_records`.
+- `daily_summary_records`;
+- `daily_summary_jobs`;
+- `delivery_outbox`.
 
 Package and summary run rows include progress counters (`progress_current`,
 `progress_total`), the current label, and a structured `progress` object so
@@ -187,11 +188,19 @@ clients can monitor how many package units or AI analysis tasks are queued and
 how far the current run has advanced.
 
 For UI clients that need one button to run the full workflow, daily summary
-jobs wrap package generation plus summary analysis in one background job. A job
-records the package run ID, summary run ID, current stage, counters, and the
-active provider process when one is running. Cancellation marks the job as
-cancel-requested, stops the active provider process when possible, and leaves
-the package/summary run rows with their last recorded state.
+jobs wrap package generation plus summary analysis in one durable job. A job
+stores its canonical request, deduplication key, package/summary run IDs,
+current stage, counters, worker lease, heartbeat, and attempt count.
+Cancellation marks the job as cancel-requested, stops the active provider
+process when possible, and leaves the package/summary run rows with their last
+recorded state. Expired running leases are reclaimed after service restart.
+
+When Telegram delivery is enabled, summary records and deterministic delivery
+chunks are committed in one transaction. The worker sends chunks in order and
+stores returned Telegram message IDs. A send failure moves only the outbox row
+to retry state with backoff; it does not roll back or fail the completed
+summary. Repeating an equivalent request returns its active or completed job by
+default; use API `force: true` or CLI `--force` for an intentional rerun.
 
 Summary records store group-level Markdown plus metadata and stage output
 references. One daily summary run can create multiple `daily_summary_records`

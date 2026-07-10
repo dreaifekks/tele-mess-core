@@ -245,11 +245,38 @@ CREATE TABLE IF NOT EXISTS daily_summary_jobs (
   progress_current INTEGER NOT NULL DEFAULT 0,
   progress_label TEXT,
   progress_json TEXT,
+  request_json TEXT,
+  dedupe_key TEXT,
+  worker_id TEXT,
+  lease_until TEXT,
+  heartbeat_at TEXT,
+  attempt INTEGER NOT NULL DEFAULT 0,
   cancel_requested_at TEXT,
   error TEXT,
   started_at TEXT NOT NULL,
   finished_at TEXT,
   updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS delivery_outbox (
+  outbox_id TEXT PRIMARY KEY,
+  summary_run_id TEXT NOT NULL,
+  job_id TEXT,
+  account_id TEXT NOT NULL,
+  origin_id INTEGER NOT NULL,
+  topic_id INTEGER NOT NULL DEFAULT 0,
+  chunk_index INTEGER NOT NULL,
+  chunk_count INTEGER NOT NULL,
+  content TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  message_id INTEGER,
+  last_error TEXT,
+  next_attempt_at TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  sent_at TEXT,
+  UNIQUE(summary_run_id, account_id, origin_id, topic_id, chunk_index)
 );
 
 CREATE TABLE IF NOT EXISTS daily_summary_records (
@@ -301,7 +328,6 @@ CREATE INDEX IF NOT EXISTS idx_daily_summary_runs_package ON daily_summary_runs(
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
-
 CREATE INDEX IF NOT EXISTS idx_events_seq ON events(seq);
 CREATE INDEX IF NOT EXISTS idx_events_chat_msg ON events(source, account_id, chat_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_messages_sent_at ON messages(sent_at);

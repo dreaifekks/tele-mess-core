@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-04.2`
-- Contract hash: `914f4499ab500f2c`
+- Contract version: `2026-07-10.1`
+- Contract hash: `697610641890d591`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -57,7 +57,7 @@ The built-in console and generated documentation endpoints are public on the loc
 - `POST /manage/daily-packages` (management, token) - Generate a daily package immediately.
 - `GET /manage/daily-package-runs` (management, token) - List daily package runs.
 - `GET /manage/daily-package-runs/content` (management, token) - Return daily package run content.
-- `POST /manage/daily-summaries` (management, token) - Run a daily summary immediately.
+- `POST /manage/daily-summaries` (management, token) - Run or enqueue a daily summary.
 - `POST /manage/daily-summary-jobs` (management, token) - Start a background daily package and summary job.
 - `GET /manage/daily-summary-jobs` (management, token) - List background daily package and summary jobs.
 - `PATCH /manage/daily-summary-jobs/cancel` (management, token) - Request cancellation of a running daily summary job.
@@ -657,7 +657,7 @@ Response: `text/markdown`
 
 ### POST /manage/daily-summaries
 
-Run a daily summary immediately.
+Run or enqueue a daily summary.
 
 - Tag: `management`
 - Auth: `required`
@@ -665,7 +665,7 @@ Run a daily summary immediately.
 
 Request body: `DailySummaryRunInput`
 
-Response: `DailySummaryRunResponse`
+Response: `DailySummarySubmitResponse`
 
 ### POST /manage/daily-summary-jobs
 
@@ -1133,6 +1133,12 @@ Response: `ParticipantRefreshResultResponse`
 | `progress_current` | `integer` | no |
 | `progress_label` | `string` | no |
 | `progress` | `object` | no |
+| `request` | `object` | no |
+| `dedupe_key` | `string` | no |
+| `worker_id` | `string` | no |
+| `lease_until` | `string` | no |
+| `heartbeat_at` | `string` | no |
+| `attempt` | `integer` | no |
 | `cancel_requested_at` | `string` | no |
 | `error` | `string` | no |
 | `started_at` | `string` | no |
@@ -1258,6 +1264,7 @@ Response: `ParticipantRefreshResultResponse`
 | `tags` | `string` | no |
 | `tag_groups` | `array` | no |
 | `background` | `boolean` | no |
+| `force` | `boolean` | no |
 
 ### DailySummaryRunListResponse
 
@@ -1270,6 +1277,12 @@ Response: `ParticipantRefreshResultResponse`
 | Field | Type | Required |
 | --- | --- | --- |
 | `item` | `DailySummaryRun` | yes |
+
+### DailySummarySubmitResponse
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `item` | `object` | yes |
 
 ### DiscoveryInput
 

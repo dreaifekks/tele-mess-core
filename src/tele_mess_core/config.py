@@ -49,6 +49,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     token: str = ""
+    allow_unauthenticated_localhost: bool = False
 
 
 @dataclass(slots=True)
@@ -130,6 +131,9 @@ def load_config(path: str | Path) -> AppConfig:
         host=str(server_raw.get("host", "127.0.0.1")),
         port=int(server_raw.get("port", 8765)),
         token=str(server_raw.get("token", "") or ""),
+        allow_unauthenticated_localhost=_parse_bool(
+            server_raw.get("allow_unauthenticated_localhost", False)
+        ),
     )
     log_file = logging_raw.get("file", "./logs/tele-mess-core.log")
     logging_config = LoggingConfig(

@@ -8,7 +8,6 @@ import re
 import shlex
 import signal
 import subprocess
-import threading
 import time as time_module
 import uuid
 from dataclasses import dataclass
@@ -23,7 +22,6 @@ from tele_mess_core.config import AppConfig
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
-    DailySummaryJobRecord,
     DailySummaryRecord,
     DailySummaryRunRecord,
     SOURCE_TELEGRAM,
@@ -36,51 +34,6 @@ DAILY_SYSTEMD_BASENAME = "tele-mess-core-daily-package"
 
 class DailyJobCancelled(RuntimeError):
     pass
-
-
-class _DailyJobRuntime:
-    def __init__(self) -> None:
-        self.cancel_requested = threading.Event()
-        self.process: subprocess.Popen[str] | None = None
-
-
-_JOB_RUNTIME_LOCK = threading.RLock()
-_JOB_RUNTIMES: dict[str, _DailyJobRuntime] = {}
-
-
-def _register_job_runtime(job_id: str) -> _DailyJobRuntime:
-    runtime = _DailyJobRuntime()
-    with _JOB_RUNTIME_LOCK:
-        _JOB_RUNTIMES[job_id] = runtime
-    return runtime
-
-
-def _get_job_runtime(job_id: str) -> _DailyJobRuntime | None:
-    with _JOB_RUNTIME_LOCK:
-        return _JOB_RUNTIMES.get(job_id)
-
-
-def _unregister_job_runtime(job_id: str) -> None:
-    with _JOB_RUNTIME_LOCK:
-        _JOB_RUNTIMES.pop(job_id, None)
-
-
-def _set_runtime_process(runtime: _DailyJobRuntime, process: subprocess.Popen[str] | None) -> None:
-    with _JOB_RUNTIME_LOCK:
-        runtime.process = process
-    if process is not None and runtime.cancel_requested.is_set() and process.poll() is None:
-        _terminate_process(process)
-
-
-def _request_runtime_cancel(job_id: str) -> bool:
-    runtime = _get_job_runtime(job_id)
-    if runtime is None:
-        return False
-    runtime.cancel_requested.set()
-    process = runtime.process
-    if process is not None and process.poll() is None:
-        _terminate_process(process)
-    return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -521,6 +474,9 @@ def run_daily_summary(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
+    telegram_runtime: Any | None = None,
+    defer_delivery: bool = False,
+    job_id: str | None = None,
 ) -> dict[str, Any]:
     package_run = store.get_daily_package_run(package_run_id) if package_run_id else None
     if package_run is None:
@@ -618,9 +574,9 @@ def run_daily_summary(
             image_paths=image_paths,
             analysis=analysis,
         )
-        for summary_record in summary_records:
-            store.upsert_daily_summary_record(summary_record)
         delivery_result = None
+        delivery_content = None
+        outbox_items: list[dict[str, Any]] = []
         if _daily_delivery_enabled(config):
             delivery_content = _summary_delivery_markdown(
                 package_run=package_run,
@@ -628,13 +584,47 @@ def run_daily_summary(
                 provider=config.daily.ai.provider,
                 summary_text=summary_text,
             )
+            if defer_delivery:
+                from tele_mess_core.telegram.delivery import split_telegram_message
+
+                chunks = split_telegram_message(delivery_content)
+                for index, chunk in enumerate(chunks, start=1):
+                    body = f"[{index}/{len(chunks)}]\n\n{chunk}" if len(chunks) > 1 else chunk
+                    outbox_items.append(
+                        {
+                            "outbox_id": f"out_{run_id}_{index}",
+                            "summary_run_id": run_id,
+                            "job_id": job_id,
+                            "account_id": config.daily.delivery.account_id,
+                            "origin_id": config.daily.delivery.origin_id,
+                            "topic_id": config.daily.delivery.topic_id,
+                            "chunk_index": index,
+                            "chunk_count": len(chunks),
+                            "content": body,
+                        }
+                    )
+        store.persist_daily_summary_batch(summary_records, outbox_items)
+        if _daily_delivery_enabled(config):
             update_progress(
                 max(0, int(progress_counts.get("total") or 0) - 1),
-                "delivering daily summary",
+                "queueing daily summary delivery" if defer_delivery else "delivering daily summary",
                 "delivery",
                 {"delivery": _delivery_target_payload(config)},
             )
-            delivery_result = deliver_daily_summary(store, config, delivery_content)
+            if defer_delivery:
+                delivery_result = {
+                    **_delivery_target_payload(config),
+                    "status": "queued",
+                    "message_count": len(outbox_items),
+                    "outbox_ids": [item["outbox_id"] for item in outbox_items],
+                }
+            else:
+                delivery_result = deliver_daily_summary(
+                    store,
+                    config,
+                    str(delivery_content or ""),
+                    telegram_runtime=telegram_runtime,
+                )
             _write_summary_analysis_json(
                 output_root / "summary.json",
                 run_id=run_id,
@@ -647,7 +637,7 @@ def run_daily_summary(
             )
             update_progress(
                 int(progress_counts.get("total") or 0),
-                "delivered daily summary",
+                "queued daily summary delivery" if defer_delivery else "delivered daily summary",
                 "delivery",
                 {"delivery": delivery_result},
             )
@@ -771,12 +761,25 @@ def run_daily_package_and_summary(
     return result
 
 
-def deliver_daily_summary(store: ArchiveStore, config: AppConfig, content: str) -> dict[str, Any] | None:
+def deliver_daily_summary(
+    store: ArchiveStore,
+    config: AppConfig,
+    content: str,
+    *,
+    telegram_runtime: Any | None = None,
+) -> dict[str, Any] | None:
     delivery = config.daily.delivery
     if not delivery.enabled:
         return None
     if delivery.origin_id is None:
         raise ValueError("daily.delivery.origin_id is required when daily.delivery.enabled is true")
+    if telegram_runtime is not None:
+        return telegram_runtime.call(
+            delivery.account_id,
+            "deliver_summary",
+            delivery=delivery,
+            content=content,
+        )
     account = _delivery_account_config(config)
     from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
@@ -860,213 +863,6 @@ def _summary_delivery_markdown(
 def _telegram_hashtag(tag: str) -> str:
     cleaned = re.sub(r"[^\w]+", "_", str(tag or "").strip(), flags=re.UNICODE).strip("_")
     return f"#{cleaned}" if cleaned else ""
-
-
-def start_daily_summary_job(
-    store: ArchiveStore,
-    config: AppConfig,
-    *,
-    package_run_id: str | None = None,
-    run_date: str | None = None,
-    timezone_name: str | None = None,
-    scope: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    scope = dict(scope or {})
-    job_id = _new_run_id("job")
-    runtime = _register_job_runtime(job_id)
-    scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
-    started_at = utc_now_iso()
-
-    def write_job(
-        *,
-        status: str,
-        progress: dict[str, Any],
-        package_run_id_value: str | None = None,
-        summary_run_id_value: str | None = None,
-        error: str | None = None,
-        finished_at: str | None = None,
-    ) -> dict[str, Any]:
-        current = store.get_daily_summary_job(job_id) or {}
-        if runtime.cancel_requested.is_set() and status == "running":
-            status = "cancel_requested"
-        return store.upsert_daily_summary_job(
-            DailySummaryJobRecord(
-                job_id=job_id,
-                status=status,
-                date=str(progress.get("date") or run_date or current.get("date") or "") or None,
-                timezone=str(progress.get("timezone") or timezone_name or current.get("timezone") or "") or None,
-                scope_json=scope_json,
-                package_run_id=package_run_id_value or current.get("package_run_id"),
-                summary_run_id=summary_run_id_value or current.get("summary_run_id"),
-                provider=config.daily.ai.provider,
-                progress_total=int(progress.get("total") or 0),
-                progress_current=int(progress.get("current") or 0),
-                progress_label=str(progress.get("label") or status),
-                progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
-                error=error,
-                started_at=started_at,
-                finished_at=finished_at,
-                updated_at=utc_now_iso(),
-            )
-        )
-
-    def check_cancel() -> None:
-        if runtime.cancel_requested.is_set():
-            raise DailyJobCancelled("canceled")
-
-    def progress_callback(progress: dict[str, Any]) -> None:
-        write_job(status="running", progress=progress)
-
-    def process_callback(process: subprocess.Popen[str] | None, task_name: str) -> None:
-        _set_runtime_process(runtime, process)
-        progress = (store.get_daily_summary_job(job_id) or {}).get("progress") or {}
-        if process is not None:
-            progress = {**progress, "task": task_name, "pid": process.pid}
-        else:
-            progress = {**progress, "task": task_name, "pid": None}
-        write_job(status="running", progress=progress)
-
-    initial_progress = {
-        "stage": "queued",
-        "phase": "queued",
-        "current": 0,
-        "total": 0,
-        "label": "queued",
-        "package_run_id": package_run_id,
-        "date": run_date,
-        "timezone": timezone_name,
-    }
-    item = write_job(status="running", progress=initial_progress, package_run_id_value=package_run_id)
-
-    def worker() -> None:
-        package: dict[str, Any] | None = None
-        summary: dict[str, Any] | None = None
-        try:
-            check_cancel()
-            package = store.get_daily_package_run(package_run_id) if package_run_id else None
-            if package is None:
-                planned_package_run_id = _new_run_id("pkg")
-                write_job(
-                    status="running",
-                    package_run_id_value=planned_package_run_id,
-                    progress={**initial_progress, "stage": "package", "phase": "queued", "label": "package queued"},
-                )
-                package = build_daily_package(
-                    store,
-                    config,
-                    run_date=run_date,
-                    timezone_name=timezone_name,
-                    scope=scope,
-                    run_id=planned_package_run_id,
-                    progress_callback=progress_callback,
-                    cancel_check=check_cancel,
-                )
-            if package.get("status") != "completed":
-                if package.get("status") == "canceled":
-                    raise DailyJobCancelled("canceled")
-                raise RuntimeError(package.get("error") or "Daily package did not complete")
-            write_job(
-                status="running",
-                package_run_id_value=str(package["run_id"]),
-                progress={
-                    "stage": "package",
-                    "phase": "completed",
-                    "current": int(package.get("progress_current") or 0),
-                    "total": int(package.get("progress_total") or 0),
-                    "label": "package completed",
-                    "date": package.get("date"),
-                    "timezone": package.get("timezone"),
-                },
-            )
-            check_cancel()
-            planned_summary_run_id = _new_run_id("sum")
-            write_job(
-                status="running",
-                package_run_id_value=str(package["run_id"]),
-                summary_run_id_value=planned_summary_run_id,
-                progress={
-                    "stage": "summary",
-                    "phase": "queued",
-                    "current": 0,
-                    "total": 0,
-                    "label": "summary queued",
-                    "date": package.get("date"),
-                    "timezone": package.get("timezone"),
-                },
-            )
-            summary = run_daily_summary(
-                store,
-                config,
-                package_run_id=str(package["run_id"]),
-                scope=scope,
-                run_id=planned_summary_run_id,
-                progress_callback=progress_callback,
-                cancel_check=check_cancel,
-                process_callback=process_callback,
-            )
-            if summary.get("status") != "completed":
-                if summary.get("status") == "canceled":
-                    raise DailyJobCancelled("canceled")
-                raise RuntimeError(summary.get("error") or "Daily summary did not complete")
-            write_job(
-                status="completed",
-                package_run_id_value=str(package["run_id"]),
-                summary_run_id_value=str(summary["run_id"]),
-                progress={
-                    "stage": "summary",
-                    "phase": "completed",
-                    "current": int(summary.get("progress_current") or 0),
-                    "total": int(summary.get("progress_total") or 0),
-                    "label": "completed",
-                    "date": summary.get("date"),
-                    "timezone": summary.get("timezone"),
-                },
-                finished_at=utc_now_iso(),
-            )
-        except DailyJobCancelled as exc:
-            write_job(
-                status="canceled",
-                package_run_id_value=str((package or {}).get("run_id") or package_run_id or "") or None,
-                summary_run_id_value=str((summary or {}).get("run_id") or "") or None,
-                progress={
-                    **((store.get_daily_summary_job(job_id) or {}).get("progress") or {}),
-                    "label": "canceled",
-                    "phase": "canceled",
-                },
-                error=str(exc) or "canceled",
-                finished_at=utc_now_iso(),
-            )
-        except Exception as exc:
-            write_job(
-                status="failed",
-                package_run_id_value=str((package or {}).get("run_id") or package_run_id or "") or None,
-                summary_run_id_value=str((summary or {}).get("run_id") or "") or None,
-                progress={
-                    **((store.get_daily_summary_job(job_id) or {}).get("progress") or {}),
-                    "label": "failed",
-                    "phase": "failed",
-                },
-                error=str(exc),
-                finished_at=utc_now_iso(),
-            )
-        finally:
-            _set_runtime_process(runtime, None)
-            _unregister_job_runtime(job_id)
-
-    thread = threading.Thread(target=worker, name=f"daily-summary-job-{job_id}", daemon=True)
-    thread.start()
-    return item
-
-
-def cancel_daily_summary_job(store: ArchiveStore, job_id: str) -> dict[str, Any]:
-    item = store.request_daily_summary_job_cancel(job_id)
-    if item is None:
-        raise ValueError("Unknown daily summary job")
-    _request_runtime_cancel(job_id)
-    refreshed = store.get_daily_summary_job(job_id)
-    if refreshed is None:
-        raise ValueError("Unknown daily summary job")
-    return refreshed
 
 
 def _build_summary_records(
@@ -1883,67 +1679,6 @@ def _truncate_text(value: str, limit: int) -> str:
     if len(value) <= limit:
         return value
     return value[:limit] + "\n...[truncated]"
-
-
-def start_daily_summary_thread(
-    store: ArchiveStore,
-    config: AppConfig,
-    *,
-    package_run_id: str | None = None,
-    run_date: str | None = None,
-    timezone_name: str | None = None,
-    scope: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    package_run = store.get_daily_package_run(package_run_id) if package_run_id else None
-    if package_run is None:
-        package_run = build_daily_package(store, config, run_date=run_date, timezone_name=timezone_name, scope=scope)
-    run_id = _new_run_id("sum")
-    output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
-    summary_path = output_root / "summary.md"
-    output_root.mkdir(parents=True, exist_ok=True)
-    scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
-    package_json_path = Path(str(package_run.get("package_json_path") or ""))
-    package_payload = json.loads(package_json_path.read_text(encoding="utf-8")) if package_json_path.is_file() else {}
-    progress_counts = (
-        _summary_progress_counts(package_payload, include_delivery=_daily_delivery_enabled(config))
-        if package_payload
-        else {"total": 0}
-    )
-    progress = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
-    item = store.upsert_daily_summary_run(
-        DailySummaryRunRecord(
-            run_id=run_id,
-            status="running",
-            package_run_id=str(package_run["run_id"]),
-            date=package_run.get("date"),
-            timezone=package_run.get("timezone"),
-            scope_json=scope_json,
-            output_dir=str(output_root),
-            summary_path=str(summary_path),
-            provider=config.daily.ai.provider,
-            origin_count=int((package_payload.get("stats") or {}).get("origin_count") or 0),
-            group_count=len(package_payload.get("normal_groups") or []),
-            image_count=len(_collect_image_paths(package_payload)) if package_payload else 0,
-            progress_total=int(progress_counts.get("total") or 0),
-            progress_current=0,
-            progress_label="queued",
-            progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
-            started_at=utc_now_iso(),
-        )
-    )
-
-    def worker() -> None:
-        run_daily_summary(
-            store,
-            config,
-            package_run_id=str(package_run["run_id"]),
-            scope=scope,
-            run_id=run_id,
-        )
-
-    thread = threading.Thread(target=worker, name=f"daily-summary-{run_id}", daemon=True)
-    thread.start()
-    return item
 
 
 def update_daily_package_schedule(

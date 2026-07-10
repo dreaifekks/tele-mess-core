@@ -46,15 +46,35 @@ class TelegramArchiveService:
         self.store = store
         self.logger = logging.getLogger(__name__)
         self.client = None
+        self._handlers_registered = False
 
     async def run(self) -> None:
-        from telethon import TelegramClient, events, utils
-        from telethon.tl.types import MessageService, UpdateMessageReactions
+        from telethon import TelegramClient
 
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         session_file = self.config.session_dir / self.config.session_name
-        self.client = TelegramClient(str(session_file), self.config.api_id, self.config.api_hash)
-        await self.client.start()
+        client = TelegramClient(str(session_file), self.config.api_id, self.config.api_hash)
+        self.client = client
+        try:
+            await client.start()
+            await self.attach(client)
+            await client.run_until_disconnected()
+        finally:
+            if client.is_connected():
+                await client.disconnect()
+
+    async def attach(self, client: Any) -> None:
+        from telethon import TelegramClient, events, utils
+        from telethon.tl.types import MessageService, UpdateMessageReactions
+
+        if not isinstance(client, TelegramClient):
+            # Tests and compatible adapters may provide a duck-typed client.
+            self.logger.debug("Attaching non-TelegramClient adapter for account %s", self.account_id)
+        self.client = client
+        if self._handlers_registered:
+            return
+        if not await client.is_user_authorized():
+            raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
         now = utc_now_iso()
         self.store.upsert_account(
             AccountRecord(
@@ -76,21 +96,13 @@ class TelegramArchiveService:
             )
         )
 
-        capture_targets = self._capture_targets()
-
-        self.logger.info(
-            "Monitoring Telegram messages for account %s with %s enabled capture targets",
-            self.account_id,
-            len(capture_targets),
-        )
-
-        @self.client.on(events.NewMessage())
+        @client.on(events.NewMessage())
         async def on_new(event: Any) -> None:
             if isinstance(event.message, MessageService):
                 return
             await self._store_message(event.message, event_type="new")
 
-        @self.client.on(events.MessageEdited())
+        @client.on(events.MessageEdited())
         async def on_edit(event: Any) -> None:
             original_update = getattr(event, "original_update", None)
             if isinstance(original_update, UpdateMessageReactions):
@@ -99,7 +111,7 @@ class TelegramArchiveService:
                 return
             await self._store_message(event.message, event_type="edit")
 
-        @self.client.on(events.MessageDeleted())
+        @client.on(events.MessageDeleted())
         async def on_delete(event: Any) -> None:
             chat_id = getattr(event, "chat_id", None)
             if chat_id is None or not self._has_enabled_policy_for_chat(int(chat_id)):
@@ -113,7 +125,7 @@ class TelegramArchiveService:
                 raw_payload={"deleted_ids": list(event.deleted_ids)},
             )
 
-        @self.client.on(events.Raw)
+        @client.on(events.Raw)
         async def on_raw(event: Any) -> None:
             if not isinstance(event, UpdateMessageReactions):
                 return
@@ -131,8 +143,17 @@ class TelegramArchiveService:
                 raw_payload=_safe_dict(event),
             )
 
+        self._handlers_registered = True
+        await self.refresh_capture_targets()
+
+    async def refresh_capture_targets(self) -> None:
+        capture_targets = self._capture_targets()
+        self.logger.info(
+            "Monitoring Telegram messages for account %s with %s enabled capture targets",
+            self.account_id,
+            len(capture_targets),
+        )
         await self._backfill_capture_targets(capture_targets)
-        await self.client.run_until_disconnected()
 
     def _capture_targets(self) -> list[CaptureTarget]:
         targets: list[CaptureTarget] = []

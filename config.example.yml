@@ -28,7 +28,10 @@ telegram:
 server:
   host: "127.0.0.1"
   port: 8765
-  token: ""
+  # Required by default, including on localhost. Generate a long random value.
+  token: "replace-with-a-long-random-token"
+  # For isolated local development only. This is rejected on non-loopback hosts.
+  allow_unauthenticated_localhost: false
 
 daily:
   output_dir: "./data/daily-packages"

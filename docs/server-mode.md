@@ -46,7 +46,25 @@ Telegram account(s) -> Telethon adapter(s) -> SQLite archive -> Sync API -> Mac 
 Mac/web client -> Management API -> account/origin/policy/participant tables
 Systemd user timer -> CLI daily-package -> SQLite archive -> package files
 Manual/API trigger -> daily-summary -> staged local Codex CLI tasks -> summary files + SQLite summary records
+API/systemd trigger -> durable daily job queue -> package + summary -> delivery outbox -> Telegram target
 ```
+
+## Runtime Ownership
+
+`run-server` is the lifecycle owner for three explicit components:
+
+- `TelegramRuntimeManager`, which keeps one long-lived client per account and
+  shares it across ingestion, auth, discovery, participant refresh, and summary
+  delivery. Account reconnect failures are isolated and retried independently.
+- `DailyJobWorker`, which claims durable SQLite jobs with leases, recovers work
+  after restart, observes cancellation, and drains retryable delivery-outbox
+  chunks.
+- `SyncApiServer`, whose route authorization and request shape checks are read
+  from the same contract registry that generates the OpenAPI and Markdown docs.
+
+`ArchiveStore` gives each request/worker thread its own SQLite connection. WAL,
+busy timeouts, and short `BEGIN IMMEDIATE` claim/commit sections keep long AI or
+Telegram operations outside database transactions.
 
 ## Config
 
@@ -80,7 +98,8 @@ telegram:
 server:
   host: "127.0.0.1"
   port: 8765
-  token: "change-this"
+  token: "replace-with-a-long-random-token"
+  allow_unauthenticated_localhost: false
 
 logging:
   file: "/home/dreaife/.local/state/tele-mess-core/tele-mess-core.log"
@@ -97,6 +116,11 @@ daily:
 
 For Mac access from another machine, bind `server.host` to a LAN/Tailscale
 address or put a reverse proxy in front of the local server.
+
+`server.token` is required by default. For isolated local development only,
+you can set `allow_unauthenticated_localhost: true` while keeping `host` on a
+loopback address. The server refuses to start unauthenticated on LAN, Tailscale,
+or wildcard bind addresses.
 
 Telegram chat/channel/private/topic sources are not configured in YAML. Use
 `/console` or the management API to discover origins and enable backup policies;
@@ -169,9 +193,12 @@ basic control-plane model for future Mac and web clients:
    daily package system timer settings.
 11. Use `POST /manage/daily-packages` to generate one package immediately, and
    `GET /manage/daily-package-runs` to inspect package run state.
-12. Use `POST /manage/daily-summaries` to run one summary immediately,
+12. Use `POST /manage/daily-summaries` to enqueue or wait for one summary,
    `GET /manage/daily-summary-runs` to inspect run state, and
    `GET /manage/daily-summary-records` to list/filter stored summary content.
+13. Use `POST`/`GET /manage/daily-summary-jobs` to enqueue and inspect the
+    durable package-plus-summary workflow, and
+    `PATCH /manage/daily-summary-jobs/cancel` to request cancellation.
 13. Use `GET /console` for the built-in web console. The console can be opened
    in a browser without a token header, then the operator enters `server.token`;
    all API calls still use the token-protected sync and management endpoints.

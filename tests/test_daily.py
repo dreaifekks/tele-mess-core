@@ -13,7 +13,8 @@ from unittest.mock import patch
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
 from tele_mess_core.config import AppConfig, DailyAiConfig, DailyDeliveryConfig, DailyPackagingConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramConfig
-from tele_mess_core.daily import build_daily_package, cancel_daily_summary_job, run_daily_summary, start_daily_summary_job, update_daily_package_schedule
+from tele_mess_core.daily import build_daily_package, run_daily_summary, update_daily_package_schedule
+from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.models import BackupPolicyRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
 
@@ -605,33 +606,36 @@ daily:
             config_path=self.config.config_path,
         )
 
-        job = start_daily_summary_job(
-            self.store,
-            slow_config,
-            run_date="2026-07-03",
-            timezone_name="UTC",
-            scope={"account_id": "main"},
-        )
-        deadline = time.time() + 3
-        current = job
-        while time.time() < deadline:
-            current = self.store.get_daily_summary_job(job["job_id"])
-            assert current is not None
-            if (current.get("progress") or {}).get("pid"):
-                break
-            time.sleep(0.05)
+        worker = DailyJobWorker(self.store, slow_config, poll_interval=0.05)
+        worker.start()
+        try:
+            job = worker.enqueue(
+                run_date="2026-07-03",
+                timezone_name="UTC",
+                scope={"account_id": "main"},
+            )
+            deadline = time.time() + 3
+            current = job
+            while time.time() < deadline:
+                current = self.store.get_daily_summary_job(job["job_id"])
+                assert current is not None
+                if (current.get("progress") or {}).get("pid"):
+                    break
+                time.sleep(0.05)
 
-        canceled = cancel_daily_summary_job(self.store, job["job_id"])
-        self.assertIn(canceled["status"], {"cancel_requested", "canceled"})
-        deadline = time.time() + 3
-        while time.time() < deadline:
-            current = self.store.get_daily_summary_job(job["job_id"])
-            assert current is not None
-            if current["status"] == "canceled":
-                break
-            time.sleep(0.05)
-        self.assertEqual(current["status"], "canceled")
-        self.assertEqual(current["progress_label"], "canceled")
+            canceled = worker.cancel(job["job_id"])
+            self.assertIn(canceled["status"], {"cancel_requested", "canceled"})
+            deadline = time.time() + 3
+            while time.time() < deadline:
+                current = self.store.get_daily_summary_job(job["job_id"])
+                assert current is not None
+                if current["status"] == "canceled":
+                    break
+                time.sleep(0.05)
+            self.assertEqual(current["status"], "canceled")
+            self.assertEqual(current["progress_label"], "canceled")
+        finally:
+            worker.stop()
 
     def _origin(self, origin_id: int, title: str, tags: str, important: bool = False) -> None:
         self.store.upsert_origin(

@@ -35,10 +35,12 @@ class TelegramDiscoveryService:
         include_topics: bool = True,
         topic_limit: int = 100,
         include_private: bool = False,
+        client: Any | None = None,
     ) -> dict[str, Any]:
-        client = None
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 return {"account_id": self.account_id, "authorized": False, "status": "needs_login", "origins": 0, "topics": 0}
@@ -125,13 +127,19 @@ class TelegramDiscoveryService:
                 "topics_truncated": False,
             }
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
-    async def refresh_participants(self, origin_id: int, limit: int = 500) -> dict[str, Any]:
-        client = None
+    async def refresh_participants(
+        self,
+        origin_id: int,
+        limit: int = 500,
+        client: Any | None = None,
+    ) -> dict[str, Any]:
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 return {
@@ -215,7 +223,7 @@ class TelegramDiscoveryService:
                 "errors": [payload],
             }
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
     async def _connected_client(self) -> Any:

@@ -1,5 +1,5 @@
 [build-system]
-requires = ["setuptools>=69", "wheel"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -8,7 +8,7 @@ version = "0.2.5"
 description = "Telegram message archive core with SQLite storage and sync API"
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 dependencies = [
   "Telethon>=1.38,<2",
   "PyYAML>=6,<7",
@@ -21,4 +21,4 @@ tele-mess-core = "tele_mess_core.cli:main"
 where = ["src"]
 
 [tool.setuptools.package-data]
-tele_mess_core = ["archive/schema.sql"]
+tele_mess_core = ["archive/schema.sql", "server/console.html"]

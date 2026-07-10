@@ -17,10 +17,11 @@ class TelegramAuthService:
         self.store = store
         self.logger = logging.getLogger(__name__)
 
-    async def status(self) -> dict[str, Any]:
-        client = None
+    async def status(self, client: Any | None = None) -> dict[str, Any]:
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
             self._record_state(state)
@@ -36,13 +37,14 @@ class TelegramAuthService:
                 "error": error.to_public_dict(),
             }
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
-    async def request_code(self, phone: str) -> dict[str, Any]:
-        client = None
+    async def request_code(self, phone: str, client: Any | None = None) -> dict[str, Any]:
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             result = await client.send_code_request(phone)
             phone_code_hash = getattr(result, "phone_code_hash", None)
             if phone_code_hash:
@@ -65,13 +67,20 @@ class TelegramAuthService:
                 "error": error.to_public_dict(),
             }
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
-    async def submit_code(self, phone: str, code: str, password: str | None = None) -> dict[str, Any]:
-        client = None
+    async def submit_code(
+        self,
+        phone: str,
+        code: str,
+        password: str | None = None,
+        client: Any | None = None,
+    ) -> dict[str, Any]:
+        owns_client = client is None
         try:
-            client = await self._connected_client()
+            if client is None:
+                client = await self._connected_client()
             phone_code_hash = self.store.get_meta(_phone_code_hash_key(self.account_id))
             try:
                 if phone_code_hash:
@@ -119,7 +128,7 @@ class TelegramAuthService:
             self._record_state("authorized", phone=phone)
             return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
         finally:
-            if client is not None:
+            if owns_client and client is not None:
                 await client.disconnect()
 
     async def _connected_client(self) -> Any:

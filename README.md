@@ -19,6 +19,8 @@ daily package and AI analysis details.
 
 - Telegram ingestion with Telethon.
 - Multiple Telegram accounts feeding one archive.
+- One supervised, long-lived Telethon client per account, shared by ingestion,
+  auth, discovery, participant refresh, and summary delivery.
 - SQLite archive for chats, users, messages, reactions, and event cursors.
 - Cursor-based HTTP sync API for LAN or Tailscale use.
 - Token-protected management API for account state, origins, backup policies,
@@ -31,6 +33,8 @@ daily package and AI analysis details.
 - Server daemon mode for devNuc-style always-on deployment.
 - Daily package generation by origin, tag group, timezone, and local date.
 - Local Codex-backed daily summary runs with configurable AI command templates.
+- Durable daily package-and-summary jobs with deduplication, cancellation,
+  restart recovery, leases, and a retryable Telegram delivery outbox.
 - System-managed daily package and summary scheduling through user-level systemd
   timer files.
 - Optional raw Telegram JSON retention cleanup for keeping the SQLite archive
@@ -106,6 +110,8 @@ the freed pages for later messages.
 - `POST /manage/daily-packages`
 - `GET /manage/daily-package-runs`
 - `POST /manage/daily-summaries`
+- `POST` or `GET /manage/daily-summary-jobs`
+- `PATCH /manage/daily-summary-jobs/cancel`
 - `GET /manage/daily-summary-runs`
 - `GET /manage/daily-summary-records`
 - `GET /manage/daily-summary-records/item`
@@ -134,7 +140,8 @@ tele-mess-core generate-api-docs --check
 `GET /console` serves the built-in management console. The page can be opened in
 a browser without a token header, then the operator enters `server.token` in the
 page. API calls from the console still use the same token-protected management
-and sync endpoints as external clients.
+and sync endpoints as external clients. The console keeps the token in tab
+session storage rather than persistent browser storage.
 
 If `server.token` is configured, pass it as:
 
@@ -147,6 +154,10 @@ or:
 ```text
 X-Api-Token: <token>
 ```
+
+The server requires a token by default. An empty token is accepted only when
+`server.allow_unauthenticated_localhost: true` is explicitly configured and the
+server is bound to a loopback address.
 
 ## Media Backup Semantics
 
@@ -188,6 +199,27 @@ pipeline:
 Package and summary artifacts are written under the configured daily output
 directory, while SQLite stores run status, paths, counts, errors, and completed
 group-level summary Markdown for API lookup/filtering.
+
+API and scheduled package-plus-summary requests use the same durable SQLite job
+queue. Equivalent active or completed requests are deduplicated unless
+`force: true` or CLI `--force` is supplied. Summary records and delivery outbox
+chunks are committed atomically; delivery failures remain retryable without
+turning an already completed summary into a failed run.
+
+## Runtime Architecture
+
+- `TelegramRuntimeManager` supervises each account independently and reuses one
+  connected client for all Telegram operations.
+- `DailyJobWorker` owns package-plus-summary execution, lease recovery,
+  cancellation, and delivery-outbox draining. No background job depends on an
+  untracked daemon thread.
+- `ArchiveStore` uses WAL, busy timeouts, explicit short transactions, and one
+  SQLite connection per worker/request thread.
+- Numbered, transactional migrations upgrade the archive schema. Job and
+  outbox state transitions have database-level validation triggers.
+- The HTTP route/auth registry and request validation are driven by
+  `server/contracts.py`; generated Markdown/OpenAPI files and runtime docs share
+  the same contract hash.
 
 The default AI provider is a configurable local `codex exec` command template
 using `--output-last-message`. Templates can use `{output}`, `{images}`, and

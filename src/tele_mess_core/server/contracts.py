@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-04.2"
+API_CONTRACT_VERSION = "2026-07-10.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -575,6 +575,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "tags": {"type": "string"},
             "tag_groups": {"type": "array", "items": {"type": "string"}},
             "background": {"type": "boolean", "default": True},
+            "force": {"type": "boolean", "default": False},
         },
     ),
     "DailySummaryRun": _object(
@@ -615,6 +616,12 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "progress_current": {"type": "integer"},
             "progress_label": {"type": "string", "nullable": True},
             "progress": {"type": "object"},
+            "request": {"type": "object"},
+            "dedupe_key": {"type": "string", "nullable": True},
+            "worker_id": {"type": "string", "nullable": True},
+            "lease_until": {"type": "string", "nullable": True},
+            "heartbeat_at": {"type": "string", "nullable": True},
+            "attempt": {"type": "integer"},
             "cancel_requested_at": {"type": "string", "nullable": True},
             "error": {"type": "string", "nullable": True},
             "started_at": {"type": "string", "nullable": True},
@@ -685,6 +692,17 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "DailyPackageRunResponse": _item_response("DailyPackageRun"),
     "DailySummaryRunListResponse": _items_response("DailySummaryRun"),
     "DailySummaryRunResponse": _item_response("DailySummaryRun"),
+    "DailySummarySubmitResponse": _object(
+        {
+            "item": {
+                "oneOf": [
+                    {"$ref": "#/components/schemas/DailySummaryRun"},
+                    {"$ref": "#/components/schemas/DailySummaryJob"},
+                ]
+            }
+        },
+        required=["item"],
+    ),
     "DailySummaryJobListResponse": _items_response("DailySummaryJob"),
     "DailySummaryJobResponse": _item_response("DailySummaryJob"),
     "DailySummaryRecordListResponse": _items_response("DailySummaryRecord"),
@@ -945,7 +963,16 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
         response_schema=None,
         response_content_type="text/markdown",
     ),
-    ApiEndpoint("POST", "/manage/daily-summaries", "management", "Run a daily summary immediately.", body_schema="DailySummaryRunInput", response_schema="DailySummaryRunResponse", status=201),
+    ApiEndpoint(
+        "POST",
+        "/manage/daily-summaries",
+        "management",
+        "Run or enqueue a daily summary.",
+        body_schema="DailySummaryRunInput",
+        response_schema="DailySummarySubmitResponse",
+        status=201,
+        notes="Returns a daily summary job when background=true, otherwise waits and returns the resulting summary run.",
+    ),
     ApiEndpoint(
         "POST",
         "/manage/daily-summary-jobs",
@@ -1067,6 +1094,86 @@ def _contract_hash() -> str:
 
 
 API_CONTRACT_HASH = _contract_hash()
+
+
+def validate_request_payload(endpoint: ApiEndpoint, payload: dict[str, Any]) -> None:
+    if endpoint.body_schema is None:
+        return
+    schema = SCHEMAS.get(endpoint.body_schema)
+    if schema is None:
+        raise RuntimeError(f"Unknown request schema: {endpoint.body_schema}")
+    _validate_schema_value(payload, schema, "body")
+
+
+def validate_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -> None:
+    for item in endpoint.query:
+        values = params.get(item.name)
+        if item.required and (not values or not values[0]):
+            raise ValueError(f"Missing required query parameter: {item.name}")
+        if not values:
+            continue
+        for value in values:
+            if item.type == "integer":
+                try:
+                    int(value)
+                except (TypeError, ValueError) as exc:
+                    raise ValueError(f"Query parameter {item.name} must be an integer") from exc
+            elif item.type == "boolean" and value.strip().lower() not in {
+                "1",
+                "0",
+                "true",
+                "false",
+                "yes",
+                "no",
+                "on",
+                "off",
+            }:
+                raise ValueError(f"Query parameter {item.name} must be a boolean")
+
+
+def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+    if value is None and schema.get("nullable"):
+        return
+    reference = schema.get("$ref")
+    if reference:
+        name = str(reference).rsplit("/", 1)[-1]
+        target = SCHEMAS.get(name)
+        if target is None:
+            raise RuntimeError(f"Unknown schema reference: {reference}")
+        _validate_schema_value(value, target, path)
+        return
+    value_type = schema.get("type")
+    if value_type == "object":
+        if not isinstance(value, dict):
+            raise ValueError(f"{path} must be an object")
+        for key in schema.get("required") or []:
+            if key not in value or value[key] is None or value[key] == "":
+                raise ValueError(f"Missing required field: {path}.{key}")
+        properties = schema.get("properties") or {}
+        for key, item in value.items():
+            if key in properties:
+                _validate_schema_value(item, properties[key], f"{path}.{key}")
+    elif value_type == "array":
+        if not isinstance(value, list):
+            raise ValueError(f"{path} must be an array")
+        item_schema = schema.get("items")
+        if item_schema:
+            for index, item in enumerate(value):
+                _validate_schema_value(item, item_schema, f"{path}[{index}]")
+    elif value_type == "string":
+        if not isinstance(value, str):
+            raise ValueError(f"{path} must be a string")
+    elif value_type == "integer":
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ValueError(f"{path} must be an integer")
+    elif value_type == "number":
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{path} must be a number")
+    elif value_type == "boolean":
+        if not isinstance(value, bool):
+            raise ValueError(f"{path} must be a boolean")
+    if "enum" in schema and value not in schema["enum"]:
+        raise ValueError(f"{path} must be one of {schema['enum']}")
 
 
 def api_manifest() -> dict[str, Any]:

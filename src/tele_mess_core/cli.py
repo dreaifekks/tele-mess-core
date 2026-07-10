@@ -31,7 +31,7 @@ def main(argv: list[str] | None = None) -> int:
         subparser.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
 
     add_config_arg(sub.add_parser("init-db", help="Initialize the SQLite archive"))
-    add_config_arg(sub.add_parser("serve-api", help="Run only the read-only sync API"))
+    add_config_arg(sub.add_parser("serve-api", help="Run HTTP API and durable daily worker without Telegram ingestion"))
     add_config_arg(sub.add_parser("run-telegram", help="Run only Telegram ingestion"))
     add_config_arg(sub.add_parser("run-server", help="Run Telegram ingestion and sync API"))
     smoke_parser = sub.add_parser("smoke-telegram", help="Check Telegram account auth and optional live discovery")
@@ -61,6 +61,7 @@ def main(argv: list[str] | None = None) -> int:
     daily_summary_parser.add_argument("--topic-id", type=int, help="Filter to one topic when building a package first")
     daily_summary_parser.add_argument("--tags", help="Comma-separated tags when building a package first")
     daily_summary_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
+    daily_summary_parser.add_argument("--force", action="store_true", help="Run even when an identical completed job exists")
 
     daily_run_parser = sub.add_parser("daily-run", help="Generate a daily package and then run its AI summary")
     add_config_arg(daily_run_parser)
@@ -72,6 +73,7 @@ def main(argv: list[str] | None = None) -> int:
     daily_run_parser.add_argument("--tags", help="Comma-separated tags that all selected origins must have")
     daily_run_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
     daily_run_parser.add_argument("--scheduled", action="store_true", help="Use saved daily package schedule scope/timezone")
+    daily_run_parser.add_argument("--force", action="store_true", help="Run even when an identical completed job exists")
 
     daily_schedule_parser = sub.add_parser("daily-schedule", help="Install or remove the system daily package timer")
     add_config_arg(daily_schedule_parser)
@@ -198,18 +200,35 @@ def _generate_api_docs(output_dir: Path, check: bool = False) -> int:
 
 
 def _serve_api(config: AppConfig, store: ArchiveStore) -> int:
-    api = SyncApiServer(store, config.server.host, config.server.port, config.server.token, config)
+    from tele_mess_core.daily_jobs import DailyJobWorker
+
+    daily_worker = DailyJobWorker(store, config)
+    api = SyncApiServer(
+        store,
+        config.server.host,
+        config.server.port,
+        config.server.token,
+        config,
+        allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
+        daily_worker=daily_worker,
+    )
+    daily_worker.start()
     try:
         api.serve_forever()
     except KeyboardInterrupt:
         logging.getLogger(__name__).info("Stopping API server")
     finally:
         api.stop()
+        daily_worker.stop()
     return 0
 
 
 def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
     now = utc_now_iso()
+    existing = {
+        (str(item.get("source") or ""), str(item.get("account_id") or "")): item
+        for item in store.list_management_accounts()
+    }
     for account in config.telegram.accounts:
         store.upsert_account(
             AccountRecord(
@@ -220,17 +239,19 @@ def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
                 updated_at=now,
             )
         )
-        session_present = _telethon_session_exists(account.session_dir, account.session_name)
-        store.upsert_account_auth(
-            AccountAuthRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=account.account_id,
-                auth_state="session_present" if session_present else "needs_login",
-                session_name=account.session_name,
-                session_dir=str(account.session_dir),
-                updated_at=now,
+        current = existing.get((SOURCE_TELEGRAM, account.account_id))
+        if current is None or current.get("auth_state") in {None, "unknown"}:
+            session_present = _telethon_session_exists(account.session_dir, account.session_name)
+            store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=account.account_id,
+                    auth_state="session_present" if session_present else "needs_login",
+                    session_name=account.session_name,
+                    session_dir=str(account.session_dir),
+                    updated_at=now,
+                )
             )
-        )
 
 
 def _telethon_session_exists(session_dir: Path, session_name: str) -> bool:
@@ -239,15 +260,18 @@ def _telethon_session_exists(session_dir: Path, session_name: str) -> bool:
 
 
 async def _run_telegram(config: AppConfig, store: ArchiveStore) -> None:
-    from tele_mess_core.telegram import TelegramArchiveService
+    from tele_mess_core.telegram.manager import TelegramRuntimeManager
 
     if not config.telegram.accounts:
         raise RuntimeError("No telegram.accounts configured")
-    services = [
-        TelegramArchiveService(account, store, config.telegram.backfill, config.telegram.media_download)
-        for account in config.telegram.accounts
-    ]
-    await asyncio.gather(*(service.run() for service in services))
+    runtime = TelegramRuntimeManager(config, store)
+    stop_event = asyncio.Event()
+    _install_stop_handlers(stop_event)
+    await runtime.start()
+    try:
+        await stop_event.wait()
+    finally:
+        await runtime.stop()
 
 
 async def _smoke_telegram(
@@ -286,33 +310,65 @@ async def _smoke_telegram(
 
 
 async def _run_server(config: AppConfig, store: ArchiveStore) -> None:
-    api = SyncApiServer(store, config.server.host, config.server.port, config.server.token, config)
-    api.start_background()
+    from tele_mess_core.daily_jobs import DailyJobWorker
+    from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+    runtime = TelegramRuntimeManager(config, store)
+    daily_worker: DailyJobWorker | None = None
+    api: SyncApiServer | None = None
     stop_event = asyncio.Event()
+    _install_stop_handlers(stop_event)
+    stop_task: asyncio.Task[bool] | None = None
+    api_task: asyncio.Task[None] | None = None
+    try:
+        await runtime.start()
+        daily_worker = DailyJobWorker(store, config, telegram_runtime=runtime)
+        api = SyncApiServer(
+            store,
+            config.server.host,
+            config.server.port,
+            config.server.token,
+            config,
+            allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
+            telegram_runtime=runtime,
+            daily_worker=daily_worker,
+        )
+        daily_worker.start()
+        api.start_background()
+        stop_task = asyncio.create_task(stop_event.wait(), name="server-stop-signal")
+        api_task = asyncio.create_task(api.wait_stopped(), name="sync-api-stopped")
+        done, pending = await asyncio.wait({stop_task, api_task}, return_when=asyncio.FIRST_COMPLETED)
+        for task in pending:
+            task.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
+        if api_task in done and not stop_event.is_set():
+            raise RuntimeError("Sync API stopped unexpectedly")
+    finally:
+        if api is not None:
+            api.stop()
+        if daily_worker is not None:
+            daily_worker.stop()
+        await runtime.stop()
+        for task in (stop_task, api_task):
+            if task is not None and not task.done():
+                task.cancel()
+        await asyncio.gather(
+            *(task for task in (stop_task, api_task) if task is not None),
+            return_exceptions=True,
+        )
+
+
+def _install_stop_handlers(stop_event: asyncio.Event) -> None:
+    loop = asyncio.get_running_loop()
 
     def request_stop() -> None:
         stop_event.set()
 
-    loop = asyncio.get_running_loop()
     for sig in (signal.SIGINT, signal.SIGTERM):
         try:
             loop.add_signal_handler(sig, request_stop)
         except NotImplementedError:
             pass
-
-    telegram_task = asyncio.create_task(_run_telegram(config, store))
-    stop_task = asyncio.create_task(stop_event.wait())
-    done, pending = await asyncio.wait(
-        {telegram_task, stop_task},
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
-    api.stop()
-    for task in done:
-        exc = task.exception()
-        if exc:
-            raise exc
 
 
 def _run_async(coro: object) -> int:
@@ -335,34 +391,48 @@ def _daily_package(config: AppConfig, store: ArchiveStore, args: argparse.Namesp
 
 
 def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
-    from tele_mess_core.daily import run_daily_summary
+    from tele_mess_core.daily_jobs import DailyJobWorker
 
     scope = _daily_scope_from_args(args)
-    item = run_daily_summary(
-        store,
-        config,
+    worker = DailyJobWorker(store, config)
+    job = worker.enqueue(
         package_run_id=args.package_run_id,
         run_date=args.date,
         timezone_name=args.timezone,
         scope=scope,
+        force=bool(args.force),
     )
+    terminal = worker.wait_for_terminal(str(job["job_id"]), timeout=max(300, config.daily.ai.timeout_seconds * 20))
+    item = store.get_daily_summary_run(str(terminal.get("summary_run_id") or "")) or terminal
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
 
 
 def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> int:
-    from tele_mess_core.daily import run_daily_package_and_summary
+    from tele_mess_core.daily_jobs import DailyJobWorker
 
     schedule = store.get_daily_package_schedule() if args.scheduled else {}
     scope = dict(schedule.get("scope") or {}) if args.scheduled else {}
     scope.update(_daily_scope_from_args(args))
     timezone_name = args.timezone or schedule.get("timezone") or scope.get("timezone")
-    item = run_daily_package_and_summary(
-        store,
-        config,
+    worker = DailyJobWorker(store, config)
+    job = worker.enqueue(
         run_date=args.date,
         timezone_name=timezone_name,
         scope=scope,
+        force=bool(args.force),
     )
+    terminal = worker.wait_for_terminal(str(job["job_id"]), timeout=max(300, config.daily.ai.timeout_seconds * 20))
+    package = store.get_daily_package_run(str(terminal.get("package_run_id") or ""))
+    summary = store.get_daily_summary_run(str(terminal.get("summary_run_id") or ""))
+    item = {
+        "status": terminal.get("status"),
+        "job_id": terminal.get("job_id"),
+        "package_run_id": terminal.get("package_run_id"),
+        "summary_run_id": terminal.get("summary_run_id"),
+        "package": package,
+        "summary": summary,
+        "error": terminal.get("error"),
+    }
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
     return 0 if item.get("status") == "completed" else 1
 

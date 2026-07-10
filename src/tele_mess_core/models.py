@@ -233,6 +233,12 @@ class DailySummaryJobRecord:
     progress_current: int = 0
     progress_label: str | None = None
     progress_json: str | None = None
+    request_json: str | None = None
+    dedupe_key: str | None = None
+    worker_id: str | None = None
+    lease_until: str | None = None
+    heartbeat_at: str | None = None
+    attempt: int = 0
     cancel_requested_at: str | None = None
     error: str | None = None
     started_at: str | None = None

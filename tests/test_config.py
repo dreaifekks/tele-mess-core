@@ -37,6 +37,27 @@ server:
         self.assertEqual(config.storage.raw_json_retention_days, 10)
         self.assertEqual(account.account_id, "main")
         self.assertFalse(hasattr(account, "chats"))
+        self.assertFalse(config.server.allow_unauthenticated_localhost)
+
+    def test_local_unauthenticated_server_opt_in_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yml"
+            config_path.write_text(
+                """
+telegram:
+  api_id: 1
+  api_hash: hash
+server:
+  host: 127.0.0.1
+  token: ""
+  allow_unauthenticated_localhost: true
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertTrue(config.server.allow_unauthenticated_localhost)
 
     def test_daily_packaging_config_is_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

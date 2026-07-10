@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import unittest
 import sqlite3
 from pathlib import Path
+from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
+from tele_mess_core.archive.migrations import MIGRATIONS, apply_migrations
 from tele_mess_core.models import (
     AccountAuthRecord,
     AccountRecord,
@@ -69,6 +72,34 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(messages["items"][0]["chat_title"], "Source")
         accounts = self.store.list_accounts()
         self.assertEqual(accounts[0]["account_id"], "main")
+
+    def test_each_thread_uses_its_own_sqlite_connection(self) -> None:
+        main_connection_id = id(self.store._conn)
+        connection_ids: list[int] = []
+        errors: list[BaseException] = []
+        barrier = threading.Barrier(3)
+
+        def write_account(account_id: str) -> None:
+            try:
+                barrier.wait()
+                connection_ids.append(id(self.store._conn))
+                self.store.upsert_account(
+                    AccountRecord(source=SOURCE_TELEGRAM, account_id=account_id, display_name=account_id)
+                )
+            except BaseException as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=write_account, args=(account_id,)) for account_id in ("one", "two")]
+        for thread in threads:
+            thread.start()
+        barrier.wait()
+        for thread in threads:
+            thread.join(timeout=5)
+
+        self.assertEqual(errors, [])
+        self.assertEqual(len(set(connection_ids)), 2)
+        self.assertNotIn(main_connection_id, connection_ids)
+        self.assertEqual({item["account_id"] for item in self.store.list_accounts()}, {"one", "two"})
 
     def test_delete_creates_tombstone(self) -> None:
         seqs = self.store.mark_deleted(SOURCE_TELEGRAM, -1002, [99], event_at=utc_now_iso())
@@ -680,12 +711,92 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], "12")
+                self.assertEqual(store.state()["schema_version"], 14)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
             finally:
                 store.close()
+
+    def test_v12_job_schema_migrates_to_durable_queue_and_outbox(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        try:
+            conn.executescript(
+                """
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '12');
+                PRAGMA user_version = 12;
+                CREATE TABLE daily_summary_jobs (
+                  job_id TEXT PRIMARY KEY,
+                  status TEXT NOT NULL,
+                  date TEXT,
+                  timezone TEXT,
+                  scope_json TEXT,
+                  package_run_id TEXT,
+                  summary_run_id TEXT,
+                  provider TEXT,
+                  progress_total INTEGER NOT NULL DEFAULT 0,
+                  progress_current INTEGER NOT NULL DEFAULT 0,
+                  progress_label TEXT,
+                  progress_json TEXT,
+                  cancel_requested_at TEXT,
+                  error TEXT,
+                  started_at TEXT NOT NULL,
+                  finished_at TEXT,
+                  updated_at TEXT NOT NULL
+                );
+                INSERT INTO daily_summary_jobs(job_id, status, started_at, updated_at)
+                VALUES('legacy_job', 'queued', '2026-07-01T00:00:00+00:00', '2026-07-01T00:00:00+00:00');
+                """
+            )
+
+            apply_migrations(conn, 12, 14)
+
+            columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
+            self.assertTrue({"request_json", "dedupe_key", "worker_id", "lease_until", "heartbeat_at", "attempt"} <= columns)
+            self.assertIsNotNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_outbox'").fetchone()
+            )
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(
+                conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+                "14",
+            )
+            self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
+
+            with self.assertRaises(sqlite3.IntegrityError):
+                conn.execute(
+                    "INSERT INTO daily_summary_jobs(job_id, status, started_at, updated_at) VALUES(?, ?, ?, ?)",
+                    ("bad_job", "unknown", "2026-07-01T00:00:00+00:00", "2026-07-01T00:00:00+00:00"),
+                )
+        finally:
+            conn.close()
+
+    def test_failed_versioned_migration_rolls_back_schema_and_version(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.execute("CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL)")
+        conn.execute("INSERT INTO meta(key, value) VALUES('schema_version', '14')")
+        conn.execute("PRAGMA user_version = 14")
+        conn.commit()
+
+        def failing_migration(connection: sqlite3.Connection) -> None:
+            connection.execute("CREATE TABLE should_rollback(id INTEGER PRIMARY KEY)")
+            raise RuntimeError("migration failed")
+
+        try:
+            with patch.dict(MIGRATIONS, {15: failing_migration}):
+                with self.assertRaisesRegex(RuntimeError, "migration failed"):
+                    apply_migrations(conn, 14, 15)
+            self.assertIsNone(
+                conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='should_rollback'").fetchone()
+            )
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 14)
+            self.assertEqual(
+                conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+                "14",
+            )
+        finally:
+            conn.close()
 
 
 if __name__ == "__main__":

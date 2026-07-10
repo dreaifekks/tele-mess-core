@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from http.client import HTTPConnection
 import tempfile
 import time
 import unittest
@@ -27,8 +28,9 @@ from tele_mess_core.models import (
     SOURCE_TELEGRAM,
     utc_now_iso,
 )
+from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.server import SyncApiServer
-from tele_mess_core.server.api import _account_config
+from tele_mess_core.server.api import MAX_JSON_BODY_BYTES, _account_config
 from tele_mess_core.server.contracts import API_CONTRACT_HASH, API_CONTRACT_VERSION
 
 
@@ -62,7 +64,16 @@ class SyncApiTest(unittest.TestCase):
             ),
             config_path=Path(self.tmp.name) / "config.yml",
         )
-        self.api = SyncApiServer(self.store, "127.0.0.1", 0, token="secret", config=self.config)
+        self.daily_worker = DailyJobWorker(self.store, self.config, poll_interval=0.01)
+        self.daily_worker.start()
+        self.api = SyncApiServer(
+            self.store,
+            "127.0.0.1",
+            0,
+            token="secret",
+            config=self.config,
+            daily_worker=self.daily_worker,
+        )
         self.api.start_background()
         deadline = time.time() + 2
         while self.api._httpd is None and time.time() < deadline:
@@ -72,6 +83,7 @@ class SyncApiTest(unittest.TestCase):
 
     def tearDown(self) -> None:
         self.api.stop()
+        self.daily_worker.stop()
         self.store.close()
         self.tmp.cleanup()
 
@@ -166,6 +178,17 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn("API contract", html)
         self.assertIn("API docs", html)
         self.assertIn("contract_hash", html)
+        self.assertIn("sessionStorage.getItem('teleMessToken')", html)
+        self.assertNotIn("localStorage.getItem('teleMessToken')", html)
+
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request("GET", "/console")
+        response = connection.getresponse()
+        response.read()
+        self.assertEqual(response.getheader("X-Content-Type-Options"), "nosniff")
+        self.assertIn("frame-ancestors 'none'", response.getheader("Content-Security-Policy") or "")
+        connection.close()
+
         self.assertIn("Save policy", html)
         self.assertIn("escapeHtml", html)
         self.assertIn("API token required", html)
@@ -237,6 +260,30 @@ class SyncApiTest(unittest.TestCase):
         self.assertIn(".table-wrap thead th", html)
         self.assertIn("top: 0", html)
         self.assertNotIn("top: 57px", html)
+
+    def test_contract_route_registry_rejects_wrong_method(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.request("POST", "/healthz", headers={"Authorization": "Bearer secret"})
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(response.status, 405)
+        self.assertEqual(payload["error"], "method_not_allowed")
+        connection.close()
+
+    def test_contract_rejects_body_type_drift(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=3)
+        body = json.dumps({"account_id": 123})
+        connection.request(
+            "POST",
+            "/manage/accounts",
+            body=body,
+            headers={"Authorization": "Bearer secret", "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        payload = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(response.status, 400)
+        self.assertIn("body.account_id must be a string", payload["detail"])
+        connection.close()
 
     def test_root_serves_console_without_token(self) -> None:
         html = self.request_text_no_auth("/")
@@ -366,7 +413,7 @@ class SyncApiTest(unittest.TestCase):
             method="POST",
             payload={"date": "2026-07-03", "timezone": "UTC", "tag_groups": ["web3 info"]},
         )["item"]
-        self.assertEqual(job["status"], "running")
+        self.assertIn(job["status"], {"queued", "running", "completed"})
         deadline = time.time() + 3
         job_items = []
         while time.time() < deadline:
@@ -508,6 +555,52 @@ class SyncApiTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             second.start_background(startup_timeout=1)
         second.stop()
+
+    def test_empty_token_requires_explicit_loopback_opt_in(self) -> None:
+        with self.assertRaisesRegex(ValueError, "server.token is required"):
+            SyncApiServer(self.store, "127.0.0.1", 0, token="")
+
+        local = SyncApiServer(
+            self.store,
+            "127.0.0.1",
+            0,
+            token="",
+            allow_unauthenticated_localhost=True,
+        )
+        local.stop()
+
+        with self.assertRaisesRegex(ValueError, "only allowed on a loopback"):
+            SyncApiServer(
+                self.store,
+                "0.0.0.0",
+                0,
+                token="",
+                allow_unauthenticated_localhost=True,
+            )
+
+    def test_write_endpoints_reject_oversized_or_non_json_bodies(self) -> None:
+        connection = HTTPConnection("127.0.0.1", self.port, timeout=3)
+        connection.putrequest("POST", "/manage/accounts")
+        connection.putheader("Authorization", "Bearer secret")
+        connection.putheader("Content-Type", "application/json")
+        connection.putheader("Content-Length", str(MAX_JSON_BODY_BYTES + 1))
+        connection.endheaders()
+        response = connection.getresponse()
+        oversized = json.loads(response.read().decode("utf-8"))
+        self.assertEqual(response.status, 413)
+        self.assertEqual(oversized["error"], "payload_too_large")
+        connection.close()
+
+        req = Request(
+            f"http://127.0.0.1:{self.port}/manage/accounts",
+            data=b"{}",
+            method="POST",
+            headers={"Authorization": "Bearer secret", "Content-Type": "text/plain"},
+        )
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+        self.assertEqual(caught.exception.code, 415)
+        caught.exception.close()
 
     def test_management_endpoints_cover_goal_objects(self) -> None:
         account = self.request_json(
