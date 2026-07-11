@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import yaml
 
@@ -59,6 +60,20 @@ class LoggingConfig:
 
 
 @dataclass(slots=True)
+class DailyAiFallbackConfig:
+    enabled: bool = False
+    provider: str = "openai-compatible"
+    trigger: str = "usage-limit"
+    base_url: str = ""
+    model: str = "deepseek-v4-flash"
+    api_key_file: Path | None = None
+    retry_delay_seconds: int = 1200
+    max_retries: int = 1
+    supports_images: bool = False
+    supports_json_schema: bool = False
+
+
+@dataclass(slots=True)
 class DailyAiConfig:
     provider: str = "codex-cli"
     model: str = "gpt-5.6-sol"
@@ -78,6 +93,7 @@ class DailyAiConfig:
         ]
     )
     timeout_seconds: int = 900
+    fallback: DailyAiFallbackConfig = field(default_factory=DailyAiFallbackConfig)
 
 
 @dataclass(slots=True)
@@ -230,12 +246,12 @@ def _parse_daily(base_dir: Path, raw: Any) -> DailyPackagingConfig:
         output_dir=_resolve_path(base_dir, output_dir) if output_dir else None,
         systemd_user_dir=_resolve_path(base_dir, systemd_user_dir) if systemd_user_dir else None,
         cli_path=str(raw.get("cli_path", "tele-mess-core") or "tele-mess-core"),
-        ai=_parse_daily_ai(raw.get("ai", {})),
+        ai=_parse_daily_ai(base_dir, raw.get("ai", {})),
         delivery=_parse_daily_delivery(raw.get("delivery", {})),
     )
 
 
-def _parse_daily_ai(raw: Any) -> DailyAiConfig:
+def _parse_daily_ai(base_dir: Path, raw: Any) -> DailyAiConfig:
     if raw is None:
         raw = {}
     if not isinstance(raw, dict):
@@ -254,6 +270,56 @@ def _parse_daily_ai(raw: Any) -> DailyAiConfig:
         model=str(raw.get("model", "gpt-5.6-sol") or "gpt-5.6-sol"),
         command=command_list,
         timeout_seconds=max(1, int(raw.get("timeout_seconds", 900))),
+        fallback=_parse_daily_ai_fallback(base_dir, raw.get("fallback", {})),
+    )
+
+
+def _parse_daily_ai_fallback(base_dir: Path, raw: Any) -> DailyAiFallbackConfig:
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ValueError("daily.ai.fallback must be a mapping")
+    enabled = _parse_bool(raw.get("enabled", False))
+    provider = str(raw.get("provider", "openai-compatible") or "openai-compatible").strip()
+    trigger = str(raw.get("trigger", "usage-limit") or "usage-limit").strip()
+    base_url = str(raw.get("base_url") or "").strip().rstrip("/")
+    model = str(raw.get("model", "deepseek-v4-flash") or "deepseek-v4-flash").strip()
+    api_key_file_raw = raw.get("api_key_file")
+    api_key_file = _resolve_path(base_dir, api_key_file_raw) if api_key_file_raw else None
+    retry_delay_seconds = int(raw.get("retry_delay_seconds", 1200))
+    max_retries = int(raw.get("max_retries", 1))
+    supports_images = _parse_bool(raw.get("supports_images", False))
+    supports_json_schema = _parse_bool(raw.get("supports_json_schema", False))
+    if provider != "openai-compatible":
+        raise ValueError("daily.ai.fallback.provider must be openai-compatible")
+    if trigger != "usage-limit":
+        raise ValueError("daily.ai.fallback.trigger must be usage-limit")
+    if retry_delay_seconds < 0:
+        raise ValueError("daily.ai.fallback.retry_delay_seconds must be non-negative")
+    if max_retries < 0 or max_retries > 1:
+        raise ValueError("daily.ai.fallback.max_retries must be 0 or 1")
+    if enabled:
+        parsed_url = urlparse(base_url)
+        loopback_http = parsed_url.scheme == "http" and parsed_url.hostname in {"127.0.0.1", "localhost", "::1"}
+        if parsed_url.scheme != "https" and not loopback_http:
+            raise ValueError("daily.ai.fallback.base_url must use HTTPS or loopback HTTP")
+        if not model:
+            raise ValueError("daily.ai.fallback.model is required when fallback is enabled")
+        if api_key_file is None:
+            raise ValueError("daily.ai.fallback.api_key_file is required when fallback is enabled")
+        if not api_key_file.is_file():
+            raise ValueError("daily.ai.fallback.api_key_file does not exist")
+    return DailyAiFallbackConfig(
+        enabled=enabled,
+        provider=provider,
+        trigger=trigger,
+        base_url=base_url,
+        model=model,
+        api_key_file=api_key_file,
+        retry_delay_seconds=retry_delay_seconds,
+        max_retries=max_retries,
+        supports_images=supports_images,
+        supports_json_schema=supports_json_schema,
     )
 
 

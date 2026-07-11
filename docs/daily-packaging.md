@@ -165,6 +165,40 @@ Recognized direct `codex exec` commands from older configs receive missing
 model and output-schema flags automatically. Custom wrapper commands should
 include the placeholders explicitly.
 
+An optional fallback is activated only after the Codex CLI returns a confirmed
+usage-limit error. Once activated, the rest of that summary run goes directly
+to the fallback instead of repeatedly starting Codex:
+
+```yaml
+daily:
+  ai:
+    fallback:
+      enabled: true
+      provider: "openai-compatible"
+      trigger: "usage-limit"
+      base_url: "https://api.example.invalid/v1"
+      model: "deepseek-v4-flash"
+      api_key_file: "./.secrets/openai-compatible-api-key"
+      retry_delay_seconds: 1200
+      max_retries: 1
+      supports_images: false
+      supports_json_schema: false
+```
+
+`api_key_file` is resolved relative to the main config file and must remain
+untracked with restrictive local permissions. The key and Authorization header
+are never included in job requests, dedupe keys, provider errors, or API
+responses. The fallback uses the OpenAI Responses shape. When server-enforced
+JSON Schema is unavailable, the schema is appended to the prompt and message
+points are still checked by the local validator before persistence.
+
+When `supports_images` is false, `media_image_analysis` creates an explicit
+`fallback_has_no_vision` artifact without making OCR or visual claims.
+Important-origin analysis continues from message text and metadata without
+attaching images. A transient fallback network, rate-limit, or 5xx failure can
+return the durable job to `queued` until `retry_at`; the worker releases its
+lease, the retry survives restart, and cancellation remains available.
+
 Set `daily.ai.provider: disabled` for local dry runs. In that mode the pipeline
 still creates stage files and summary records. Structured extraction emits an
 empty valid point set, while Markdown AI stages use a disabled-provider marker.
@@ -191,6 +225,8 @@ a target from a client, run live discovery with
 username, and forum metadata. The important report keeps its generated date,
 timezone, source-tag, and provider header. The point digest is sent as a
 separate logical delivery whose searchable Telegram tag is always `#point`.
+Telegram sends use Telethon Markdown parsing; standard Markdown headings are
+adapted to bold Telegram headings at send time while hashtags remain searchable.
 
 YAML remains the fallback for existing deployments. Management clients should
 use `GET` and `PATCH /manage/daily-summary-delivery`; the API stores the target

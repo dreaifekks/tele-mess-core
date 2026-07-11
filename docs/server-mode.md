@@ -113,7 +113,21 @@ daily:
     model: "gpt-5.6-sol"
     # command can use {model}, {output_schema}, {output}, {images}, and {task}
     timeout_seconds: 900
+    fallback:
+      enabled: false
+      provider: "openai-compatible"
+      trigger: "usage-limit"
+      base_url: "https://api.example.invalid/v1"
+      model: "deepseek-v4-flash"
+      api_key_file: "./.secrets/openai-compatible-api-key"
+      retry_delay_seconds: 1200
+      max_retries: 1
+      supports_images: false
+      supports_json_schema: false
 ```
+
+Keep the fallback key in an ignored, mode-`600` local file. It is read only by
+the fallback subprocess and is not stored in SQLite or exposed by the API.
 
 For Mac access from another machine, bind `server.host` to a LAN/Tailscale
 address or put a reverse proxy in front of the local server.

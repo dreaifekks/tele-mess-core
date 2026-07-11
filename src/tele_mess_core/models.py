@@ -248,6 +248,8 @@ class DailySummaryJobRecord:
     lease_until: str | None = None
     heartbeat_at: str | None = None
     attempt: int = 0
+    retry_at: str | None = None
+    retry_count: int = 0
     cancel_requested_at: str | None = None
     error: str | None = None
     started_at: str | None = None

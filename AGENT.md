@@ -10,8 +10,9 @@ The core owns Telegram ingestion, SQLite storage, sync cursors, account auth
 state, origin discovery, backup policy, participants, capture cursors, media
 file records, structured operation events, daily package runs, system-managed
 daily package schedules, local Codex-backed important-summary and all-origin
-message-point runs, queryable daily message points, and stored daily summary
-content records.
+message-point runs, an optional OpenAI-compatible usage-limit fallback,
+durable delayed AI retries, queryable daily message points, and stored daily
+summary content records.
 Client-specific UI state and labels belong outside the core.
 
 ## API Contract Workflow

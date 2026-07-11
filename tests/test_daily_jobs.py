@@ -10,6 +10,7 @@ from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import (
     AppConfig,
     DailyAiConfig,
+    DailyAiFallbackConfig,
     DailyDeliveryConfig,
     DailyPackagingConfig,
     LoggingConfig,
@@ -134,6 +135,55 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertNotEqual(first["job_id"], second["job_id"])
         self.assertNotEqual(first["dedupe_key"], second["dedupe_key"])
 
+    def test_job_dedupe_changes_when_fallback_model_changes_without_key_material(self) -> None:
+        key_path = self.root / "fallback-key"
+        key_path.write_text("must-not-enter-dedupe", encoding="utf-8")
+        first_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="disabled",
+                    fallback=DailyAiFallbackConfig(
+                        enabled=True,
+                        base_url="https://fallback.example/v1",
+                        model="deepseek-v4-flash",
+                        api_key_file=key_path,
+                    ),
+                ),
+            ),
+        )
+        second_config = AppConfig(
+            storage=first_config.storage,
+            telegram=first_config.telegram,
+            server=first_config.server,
+            logging=first_config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=first_config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="disabled",
+                    fallback=DailyAiFallbackConfig(
+                        enabled=True,
+                        base_url="https://fallback.example/v1",
+                        model="deepseek-v4-pro",
+                        api_key_file=key_path,
+                    ),
+                ),
+            ),
+        )
+        first = DailyJobWorker(self.store, first_config).enqueue(
+            run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"}
+        )
+        second = DailyJobWorker(self.store, second_config).enqueue(
+            run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"}
+        )
+
+        self.assertNotEqual(first["dedupe_key"], second["dedupe_key"])
+        self.assertNotIn("must-not-enter-dedupe", str(first))
+
     def test_expired_lease_is_reclaimed_after_restart(self) -> None:
         old_worker = DailyJobWorker(self.store, self.config, worker_id="old")
         job = old_worker.enqueue(
@@ -183,6 +233,138 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(recovered["status"], "completed")
         self.assertEqual(recovered["summary_run_id"], summary_run_id)
         self.assertEqual(len(self.store.list_daily_summary_runs(package_run_id=recovered["package_run_id"])), 1)
+
+    def test_retryable_summary_is_durably_requeued_and_reuses_run_ids(self) -> None:
+        retry_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="disabled",
+                    fallback=DailyAiFallbackConfig(retry_delay_seconds=0, max_retries=1),
+                ),
+            ),
+        )
+        summary_run_ids: list[str] = []
+
+        def fake_summary(*args: object, **kwargs: object) -> dict[str, object]:
+            run_id = str(kwargs["run_id"])
+            summary_run_ids.append(run_id)
+            if len(summary_run_ids) == 1:
+                return {
+                    "run_id": run_id,
+                    "status": "failed",
+                    "error": "fallback temporarily unavailable",
+                    "progress": {"retryable": True, "error_kind": "fallback_failed"},
+                }
+            return {
+                "run_id": run_id,
+                "status": "completed",
+                "date": "2026-07-03",
+                "timezone": "UTC",
+                "progress_current": 1,
+                "progress_total": 1,
+            }
+
+        worker = DailyJobWorker(self.store, retry_config, worker_id="retry-worker")
+        job = worker.enqueue(run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        with patch("tele_mess_core.daily_jobs.run_daily_summary", side_effect=fake_summary):
+            waiting = worker.run_once()
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "queued")
+            self.assertEqual(waiting["retry_count"], 1)
+            self.assertIsNotNone(waiting["retry_at"])
+            self.assertIsNone(waiting["worker_id"])
+            self.assertIsNone(waiting["lease_until"])
+            self.assertEqual(waiting["progress"]["phase"], "retry_wait")
+
+            completed = worker.run_once()
+
+        assert completed is not None
+        self.assertEqual(completed["job_id"], job["job_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["retry_count"], 1)
+        self.assertEqual(completed["attempt"], 2)
+        self.assertEqual(summary_run_ids, [completed["summary_run_id"], completed["summary_run_id"]])
+
+    def test_retryable_summary_fails_after_retry_budget_is_exhausted(self) -> None:
+        retry_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="disabled",
+                    fallback=DailyAiFallbackConfig(retry_delay_seconds=0, max_retries=1),
+                ),
+            ),
+        )
+
+        def failed_summary(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "run_id": str(kwargs["run_id"]),
+                "status": "failed",
+                "error": "fallback still unavailable",
+                "progress": {"retryable": True, "error_kind": "fallback_failed"},
+            }
+
+        worker = DailyJobWorker(self.store, retry_config)
+        worker.enqueue(run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        with patch("tele_mess_core.daily_jobs.run_daily_summary", side_effect=failed_summary) as provider:
+            waiting = worker.run_once()
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "queued")
+            failed = worker.run_once()
+
+        assert failed is not None
+        self.assertEqual(failed["status"], "failed")
+        self.assertEqual(failed["retry_count"], 1)
+        self.assertEqual(failed["attempt"], 2)
+        self.assertEqual(provider.call_count, 2)
+
+    def test_canceling_scheduled_retry_prevents_another_provider_call(self) -> None:
+        retry_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="disabled",
+                    fallback=DailyAiFallbackConfig(retry_delay_seconds=1200, max_retries=1),
+                ),
+            ),
+        )
+
+        def failed_summary(*args: object, **kwargs: object) -> dict[str, object]:
+            return {
+                "run_id": str(kwargs["run_id"]),
+                "status": "failed",
+                "error": "fallback temporarily unavailable",
+                "progress": {"retryable": True, "error_kind": "fallback_failed"},
+            }
+
+        worker = DailyJobWorker(self.store, retry_config)
+        job = worker.enqueue(run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        with patch("tele_mess_core.daily_jobs.run_daily_summary", side_effect=failed_summary) as provider:
+            waiting = worker.run_once()
+            assert waiting is not None
+            self.assertEqual(waiting["status"], "queued")
+            requested = worker.cancel(job["job_id"])
+            self.assertEqual(requested["status"], "cancel_requested")
+            self.assertIsNone(worker.run_once())
+
+        canceled = self.store.get_daily_summary_job(job["job_id"])
+        assert canceled is not None
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertIsNone(canceled["retry_at"])
+        self.assertEqual(provider.call_count, 1)
 
     def test_canceling_queued_job_reaches_terminal_state(self) -> None:
         worker = DailyJobWorker(self.store, self.config)

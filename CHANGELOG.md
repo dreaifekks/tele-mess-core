@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- Render daily Telegram summary deliveries with Markdown instead of sending the
+  generated Markdown source as plain text; standard headings are adapted to
+  Telegram-compatible bold headings while hashtags such as `#point` remain searchable.
+- Added a Codex usage-limit circuit breaker that switches the remainder of a
+  summary run to a configurable OpenAI-compatible Responses fallback without
+  storing its API key in tracked configuration.
+- Added durable delayed retry state for transient fallback failures, including
+  one configurable 20-minute retry that survives worker restarts and remains
+  cancelable.
+- Sanitized provider errors before storing them, and downgrade image stages to
+  explicit no-vision artifacts when the fallback model cannot accept images.
 - Split daily AI output into an important-origin full-context report and a
   separate `#point` digest built from structured message points extracted from
   all eligible origins.

@@ -16,6 +16,7 @@ from tele_mess_core.cli import main
 from tele_mess_core.config import (
     AppConfig,
     DailyAiConfig,
+    DailyAiFallbackConfig,
     DailyDeliveryConfig,
     DailyPackagingConfig,
     LoggingConfig,
@@ -23,7 +24,16 @@ from tele_mess_core.config import (
     StorageConfig,
     TelegramConfig,
 )
-from tele_mess_core.daily import _expand_command, build_daily_package, run_daily_summary, update_daily_package_schedule
+from tele_mess_core.daily import (
+    AiProviderResult,
+    AiProviderRuntimeState,
+    _codex_provider_error,
+    _expand_command,
+    _run_summary_provider,
+    build_daily_package,
+    run_daily_summary,
+    update_daily_package_schedule,
+)
 from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.models import BackupPolicyRecord, DailySummaryDeliveryRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
@@ -901,6 +911,99 @@ daily:
             self.assertEqual(current["progress_label"], "canceled")
         finally:
             worker.stop()
+
+    def test_codex_usage_limit_activates_run_local_fallback_circuit(self) -> None:
+        counter_path = self.root / "codex-attempts.txt"
+        provider_path = self.root / "limited_codex.py"
+        provider_path.write_text(
+            "from pathlib import Path\n"
+            "import sys\n"
+            "sys.stdin.read()\n"
+            "path = Path(sys.argv[1])\n"
+            "path.write_text(path.read_text() + 'attempt\\n' if path.exists() else 'attempt\\n')\n"
+            "print(\"ERROR: You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits or try again at 11:33 PM.\", file=sys.stderr)\n"
+            "raise SystemExit(1)\n",
+            encoding="utf-8",
+        )
+        key_path = self.root / "fallback-key"
+        key_path.write_text("local-secret", encoding="utf-8")
+        config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="codex-cli",
+                    command=[sys.executable, str(provider_path), str(counter_path)],
+                    fallback=DailyAiFallbackConfig(
+                        enabled=True,
+                        base_url="https://fallback.example/v1",
+                        api_key_file=key_path,
+                    ),
+                ),
+            ),
+        )
+        state = AiProviderRuntimeState()
+
+        def fake_fallback(
+            _config: AppConfig,
+            _prompt: str,
+            output_path: Path,
+            _images: list[str],
+            **kwargs: object,
+        ) -> AiProviderResult:
+            runtime_state = kwargs["provider_state"]
+            assert isinstance(runtime_state, AiProviderRuntimeState)
+            runtime_state.register("openai-compatible:deepseek-v4-flash")
+            output_path.write_text("fallback output", encoding="utf-8")
+            return AiProviderResult(
+                content="fallback output",
+                provider="openai-compatible:deepseek-v4-flash",
+            )
+
+        with patch(
+            "tele_mess_core.daily._run_openai_fallback_provider",
+            side_effect=fake_fallback,
+        ) as fallback:
+            first = _run_summary_provider(
+                config,
+                "first task",
+                self.root / "first.md",
+                [],
+                provider_state=state,
+            )
+            second = _run_summary_provider(
+                config,
+                "second task",
+                self.root / "second.md",
+                [],
+                provider_state=state,
+            )
+
+        self.assertEqual(first.content, "fallback output")
+        self.assertEqual(second.content, "fallback output")
+        self.assertTrue(state.fallback_active)
+        self.assertEqual(counter_path.read_text(encoding="utf-8").splitlines(), ["attempt"])
+        self.assertEqual(fallback.call_count, 2)
+
+    def test_codex_errors_are_classified_without_persisting_prompt_or_key(self) -> None:
+        usage = _codex_provider_error(
+            "private Telegram body\nERROR: You've hit your usage limit and try again at 11:33 PM.",
+            returncode=1,
+        )
+        self.assertEqual(usage.kind, "codex_usage_limit")
+        self.assertTrue(usage.retryable)
+        self.assertNotIn("Telegram", str(usage))
+
+        generic = _codex_provider_error(
+            "prompt /home/user/private/image.png sk-private\nERROR: arbitrary upstream failure",
+            returncode=7,
+        )
+        self.assertEqual(generic.kind, "codex_failed")
+        self.assertNotIn("/home", str(generic))
+        self.assertNotIn("sk-private", str(generic))
 
     def _structured_ai_config(self, *, delivery: bool = False) -> tuple[AppConfig, Path]:
         provider_path = self.root / "structured_provider.py"

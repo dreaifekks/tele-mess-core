@@ -32,7 +32,7 @@ from tele_mess_core.models import (
 from tele_mess_core.archive.migrations import apply_migrations
 
 
-SCHEMA_VERSION = 16
+SCHEMA_VERSION = 17
 LEGACY_SCHEMA_BASELINE = 12
 
 
@@ -1494,10 +1494,10 @@ class ArchiveStore:
                   job_id, status, date, timezone, scope_json, package_run_id,
                   summary_run_id, provider, progress_total, progress_current,
                   progress_label, progress_json, request_json, dedupe_key, worker_id,
-                  lease_until, heartbeat_at, attempt, cancel_requested_at, error,
-                  started_at, finished_at, updated_at
+                  lease_until, heartbeat_at, attempt, retry_at, retry_count,
+                  cancel_requested_at, error, started_at, finished_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(job_id) DO UPDATE SET
                   status = CASE
                     WHEN daily_summary_jobs.status = 'cancel_requested' AND excluded.status = 'running'
@@ -1520,6 +1520,8 @@ class ArchiveStore:
                   lease_until = COALESCE(excluded.lease_until, daily_summary_jobs.lease_until),
                   heartbeat_at = COALESCE(excluded.heartbeat_at, daily_summary_jobs.heartbeat_at),
                   attempt = MAX(excluded.attempt, daily_summary_jobs.attempt),
+                  retry_at = excluded.retry_at,
+                  retry_count = MAX(excluded.retry_count, daily_summary_jobs.retry_count),
                   cancel_requested_at = COALESCE(excluded.cancel_requested_at, daily_summary_jobs.cancel_requested_at),
                   error = excluded.error,
                   finished_at = excluded.finished_at,
@@ -1544,6 +1546,8 @@ class ArchiveStore:
                     job.lease_until,
                     job.heartbeat_at,
                     int(job.attempt),
+                    job.retry_at,
+                    int(job.retry_count),
                     job.cancel_requested_at,
                     job.error,
                     started_at,
@@ -1564,7 +1568,8 @@ class ArchiveStore:
                 SELECT job_id, status, date, timezone, scope_json, package_run_id,
                        summary_run_id, provider, progress_total, progress_current,
                        progress_label, progress_json, request_json, dedupe_key, worker_id,
-                       lease_until, heartbeat_at, attempt, cancel_requested_at, error,
+                       lease_until, heartbeat_at, attempt, retry_at, retry_count,
+                       cancel_requested_at, error,
                        started_at, finished_at, updated_at
                 FROM daily_summary_jobs
                 WHERE job_id = ?
@@ -1586,7 +1591,8 @@ class ArchiveStore:
             SELECT job_id, status, date, timezone, scope_json, package_run_id,
                    summary_run_id, provider, progress_total, progress_current,
                    progress_label, progress_json, request_json, dedupe_key, worker_id,
-                   lease_until, heartbeat_at, attempt, cancel_requested_at, error,
+                   lease_until, heartbeat_at, attempt, retry_at, retry_count,
+                   cancel_requested_at, error,
                    started_at, finished_at, updated_at
             FROM daily_summary_jobs
         """
@@ -1613,7 +1619,8 @@ class ArchiveStore:
                 SELECT job_id, status, date, timezone, scope_json, package_run_id,
                        summary_run_id, provider, progress_total, progress_current,
                        progress_label, progress_json, request_json, dedupe_key, worker_id,
-                       lease_until, heartbeat_at, attempt, cancel_requested_at, error,
+                       lease_until, heartbeat_at, attempt, retry_at, retry_count,
+                       cancel_requested_at, error,
                        started_at, finished_at, updated_at
                 FROM daily_summary_jobs
                 WHERE dedupe_key = ? AND status IN ('queued', 'running', 'cancel_requested')
@@ -1631,7 +1638,8 @@ class ArchiveStore:
                 SELECT job_id, status, date, timezone, scope_json, package_run_id,
                        summary_run_id, provider, progress_total, progress_current,
                        progress_label, progress_json, request_json, dedupe_key, worker_id,
-                       lease_until, heartbeat_at, attempt, cancel_requested_at, error,
+                       lease_until, heartbeat_at, attempt, retry_at, retry_count,
+                       cancel_requested_at, error,
                        started_at, finished_at, updated_at
                 FROM daily_summary_jobs
                 WHERE dedupe_key = ? AND status = 'completed'
@@ -1657,7 +1665,8 @@ class ArchiveStore:
                     """
                     UPDATE daily_summary_jobs
                     SET status = 'canceled', finished_at = COALESCE(finished_at, ?),
-                        updated_at = ?, worker_id = NULL, lease_until = NULL
+                        updated_at = ?, worker_id = NULL, lease_until = NULL,
+                        heartbeat_at = NULL, retry_at = NULL
                     WHERE status = 'cancel_requested'
                       AND (worker_id IS NULL OR lease_until IS NULL OR lease_until < ?)
                     """,
@@ -1667,12 +1676,12 @@ class ArchiveStore:
                     """
                     SELECT job_id
                     FROM daily_summary_jobs
-                    WHERE status = 'queued'
+                    WHERE (status = 'queued' AND (retry_at IS NULL OR retry_at <= ?))
                        OR (status = 'running' AND (lease_until IS NULL OR lease_until < ?))
                     ORDER BY started_at ASC
                     LIMIT 1
                     """,
-                    (now,),
+                    (now, now),
                 ).fetchone()
                 if row is not None:
                     job_id = str(row["job_id"])
@@ -1680,7 +1689,7 @@ class ArchiveStore:
                         """
                         UPDATE daily_summary_jobs
                         SET status = 'running', worker_id = ?, lease_until = ?, heartbeat_at = ?,
-                            attempt = attempt + 1, updated_at = ?
+                            attempt = attempt + 1, retry_at = NULL, updated_at = ?
                         WHERE job_id = ?
                         """,
                         (worker_id, lease_until, now, now, job_id),
@@ -1725,10 +1734,50 @@ class ArchiveStore:
                 """
                 UPDATE daily_summary_jobs
                 SET status = 'queued', worker_id = NULL, lease_until = NULL,
-                    heartbeat_at = NULL, progress_label = 'queued after worker stop', updated_at = ?
+                    heartbeat_at = NULL, retry_at = NULL,
+                    progress_label = 'queued after worker stop', updated_at = ?
                 WHERE job_id = ? AND worker_id = ? AND status = 'running'
                 """,
                 (now, job_id, worker_id),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def schedule_daily_summary_job_retry(
+        self,
+        job_id: str,
+        worker_id: str,
+        *,
+        retry_at: str,
+        max_retries: int,
+        progress_label: str,
+        progress_json: str,
+        error: str | None,
+        now: str,
+    ) -> bool:
+        if max_retries <= 0:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE daily_summary_jobs
+                SET status = 'queued', retry_at = ?, retry_count = retry_count + 1,
+                    worker_id = NULL, lease_until = NULL, heartbeat_at = NULL,
+                    progress_label = ?, progress_json = ?, error = ?,
+                    finished_at = NULL, updated_at = ?
+                WHERE job_id = ? AND worker_id = ? AND status = 'running'
+                  AND cancel_requested_at IS NULL AND retry_count < ?
+                """,
+                (
+                    retry_at,
+                    progress_label,
+                    progress_json,
+                    error,
+                    now,
+                    job_id,
+                    worker_id,
+                    int(max_retries),
+                ),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -1746,6 +1795,7 @@ class ArchiveStore:
                     UPDATE daily_summary_jobs
                     SET status = 'cancel_requested',
                         cancel_requested_at = COALESCE(cancel_requested_at, ?),
+                        retry_at = NULL,
                         updated_at = ?
                     WHERE job_id = ?
                     """,

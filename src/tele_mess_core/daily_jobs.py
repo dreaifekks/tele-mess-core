@@ -61,9 +61,20 @@ def enqueue_daily_summary_job(
     delivery = resolve_daily_summary_delivery(store, config)
     dedupe_payload = {
         **request,
-        "pipeline_version": 2,
+        "pipeline_version": 3,
         "provider": config.daily.ai.provider,
         "model": config.daily.ai.model,
+        "fallback": {
+            "enabled": config.daily.ai.fallback.enabled,
+            "provider": config.daily.ai.fallback.provider,
+            "trigger": config.daily.ai.fallback.trigger,
+            "base_url": config.daily.ai.fallback.base_url,
+            "model": config.daily.ai.fallback.model,
+            "retry_delay_seconds": config.daily.ai.fallback.retry_delay_seconds,
+            "max_retries": config.daily.ai.fallback.max_retries,
+            "supports_images": config.daily.ai.fallback.supports_images,
+            "supports_json_schema": config.daily.ai.fallback.supports_json_schema,
+        },
         "delivery": {
             "enabled": delivery.enabled,
             "account_id": delivery.account_id,
@@ -254,7 +265,11 @@ class DailyJobWorker:
                     scope_json=json.dumps(scope, ensure_ascii=False, sort_keys=True),
                     package_run_id=package_id or current.get("package_run_id"),
                     summary_run_id=summary_id or current.get("summary_run_id"),
-                    provider=self.config.daily.ai.provider,
+                    provider=str(
+                        progress.get("provider")
+                        or current.get("provider")
+                        or self.config.daily.ai.provider
+                    ),
                     progress_total=int(progress.get("total") or 0),
                     progress_current=int(progress.get("current") or 0),
                     progress_label=str(progress.get("label") or status),
@@ -265,6 +280,8 @@ class DailyJobWorker:
                     lease_until=lease_until,
                     heartbeat_at=now,
                     attempt=int(current.get("attempt") or 0),
+                    retry_at=current.get("retry_at"),
+                    retry_count=int(current.get("retry_count") or 0),
                     cancel_requested_at=current.get("cancel_requested_at"),
                     error=error,
                     started_at=current.get("started_at"),
@@ -344,6 +361,41 @@ class DailyJobWorker:
             if summary.get("status") != "completed":
                 if summary.get("status") == "canceled":
                     raise DailyJobCancelled("canceled")
+                summary_progress = dict(summary.get("progress") or {})
+                fallback = getattr(self.config.daily.ai, "fallback", None)
+                max_retries = max(0, int(getattr(fallback, "max_retries", 0) or 0))
+                current_job = self.store.get_daily_summary_job(job_id) or job
+                retry_count = int(current_job.get("retry_count") or 0)
+                if bool(summary_progress.get("retryable")) and retry_count < max_retries:
+                    retry_delay_seconds = max(
+                        0,
+                        int(getattr(fallback, "retry_delay_seconds", 0) or 0),
+                    )
+                    now_dt = datetime.now(timezone.utc)
+                    retry_at = (now_dt + timedelta(seconds=retry_delay_seconds)).isoformat()
+                    error_kind = str(summary_progress.get("error_kind") or "retryable_ai_failure")
+                    retry_progress = {
+                        **(current_job.get("progress") or {}),
+                        **summary_progress,
+                        "phase": "retry_wait",
+                        "label": f"retry scheduled after {error_kind}",
+                        "retry_at": retry_at,
+                        "retry_count": retry_count + 1,
+                    }
+                    scheduled = self.store.schedule_daily_summary_job_retry(
+                        job_id,
+                        self.worker_id,
+                        retry_at=retry_at,
+                        max_retries=max_retries,
+                        progress_label=str(retry_progress["label"]),
+                        progress_json=json.dumps(retry_progress, ensure_ascii=False, sort_keys=True),
+                        error=str(summary.get("error") or error_kind),
+                        now=now_dt.isoformat(),
+                    )
+                    if scheduled:
+                        return
+                    if self.store.daily_summary_job_cancel_requested(job_id):
+                        raise DailyJobCancelled("canceled")
                 raise RuntimeError(summary.get("error") or "Daily summary did not complete")
             check_cancel()
             self._drain_summary_delivery(str(summary["run_id"]), cancel_check=check_cancel)
@@ -358,6 +410,7 @@ class DailyJobWorker:
                     "label": "completed",
                     "date": summary.get("date"),
                     "timezone": summary.get("timezone"),
+                    "provider": summary.get("provider"),
                 },
                 package_id=str(package["run_id"]),
                 summary_id=str(summary["run_id"]),

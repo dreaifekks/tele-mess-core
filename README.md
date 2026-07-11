@@ -238,7 +238,11 @@ turning an already completed summary into a failed run.
 
 The default AI provider is a configurable local `codex exec` command template
 using `--output-last-message`. Templates can use `{output}`, `{images}`, and
-`{task}`. Set `daily.ai.provider: disabled` only for local testing or dry runs.
+`{task}`. An optional `daily.ai.fallback` can switch the remainder of a run to
+an OpenAI-compatible Responses endpoint only when Codex reports a usage limit.
+The API key is read from an ignored local file; transient fallback failures can
+be durably retried once after a configured delay. Set `daily.ai.provider:
+disabled` only for local testing or dry runs.
 
 ## Design Boundary
 

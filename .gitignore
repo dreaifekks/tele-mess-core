@@ -1,4 +1,5 @@
 .env
+.secrets/
 .venv/
 venv/
 __pycache__/
@@ -18,4 +19,3 @@ logs/
 
 config.yml
 tele_mess_core.yml
-

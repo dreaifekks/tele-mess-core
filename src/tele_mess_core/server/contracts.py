@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-10.4"
+API_CONTRACT_VERSION = "2026-07-11.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -648,6 +648,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "lease_until": {"type": "string", "nullable": True},
             "heartbeat_at": {"type": "string", "nullable": True},
             "attempt": {"type": "integer"},
+            "retry_at": {"type": "string", "nullable": True},
+            "retry_count": {"type": "integer"},
             "cancel_requested_at": {"type": "string", "nullable": True},
             "error": {"type": "string", "nullable": True},
             "started_at": {"type": "string", "nullable": True},

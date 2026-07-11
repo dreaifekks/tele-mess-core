@@ -37,6 +37,9 @@ class ApiContractTest(unittest.TestCase):
         self.assertIn("/manage/api-manifest", openapi["paths"])
         self.assertIn("/manage/daily-message-points", openapi["paths"])
         self.assertIn("DailyMessagePoint", openapi["components"]["schemas"])
+        daily_job_properties = openapi["components"]["schemas"]["DailySummaryJob"]["properties"]
+        self.assertIn("retry_at", daily_job_properties)
+        self.assertIn("retry_count", daily_job_properties)
         self.assertIn("ApiManifest", openapi["components"]["schemas"])
         self.assertEqual(set(ENDPOINTS_BY_ROUTE), {(method.upper(), path) for method, path in expected})
         self.assertEqual(

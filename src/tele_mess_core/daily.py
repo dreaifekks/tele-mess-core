@@ -9,9 +9,10 @@ import re
 import shlex
 import signal
 import subprocess
+import sys
 import time as time_module
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date as date_type
 from datetime import datetime, time, timedelta, timezone
 from pathlib import Path
@@ -39,6 +40,50 @@ PACKAGE_MESSAGE_PAGE_SIZE = 5000
 
 class DailyJobCancelled(RuntimeError):
     pass
+
+
+class AiProviderError(RuntimeError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        kind: str,
+        provider: str,
+        retryable: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.provider = provider
+        self.retryable = retryable
+
+
+@dataclass(slots=True)
+class AiProviderRuntimeState:
+    fallback_active: bool = False
+    fallback_reason: str | None = None
+    providers_used: list[str] = field(default_factory=list)
+
+    def register(self, provider: str) -> None:
+        if provider and provider not in self.providers_used:
+            self.providers_used.append(provider)
+
+    def activate_fallback(self, *, reason: str) -> None:
+        self.register("codex-cli")
+        self.fallback_active = True
+        self.fallback_reason = reason
+
+
+@dataclass(frozen=True, slots=True)
+class AiProviderResult:
+    content: str
+    provider: str
+    generated_by_ai: bool = True
+
+
+def _effective_provider_label(config: AppConfig, state: AiProviderRuntimeState) -> str:
+    if state.fallback_active:
+        return f"{config.daily.ai.provider}->openai-compatible:{config.daily.ai.fallback.model}"
+    return config.daily.ai.provider
 
 
 @dataclass(frozen=True, slots=True)
@@ -589,6 +634,7 @@ def run_daily_summary(
     output_root.mkdir(parents=True, exist_ok=True)
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
     progress_state = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
+    provider_state = AiProviderRuntimeState()
 
     def update_progress(
         current: int,
@@ -599,12 +645,14 @@ def run_daily_summary(
         nonlocal progress_state
         if cancel_check:
             cancel_check()
+        progress_extra = dict(extra or {})
+        progress_extra.setdefault("provider", _effective_provider_label(config, provider_state))
         progress_state = _summary_progress_payload(
             progress_counts,
             current=current,
             label=label,
             phase=phase,
-            extra=extra,
+            extra=progress_extra,
         )
         store.upsert_daily_summary_run(
             DailySummaryRunRecord(
@@ -616,7 +664,7 @@ def run_daily_summary(
                 scope_json=scope_json,
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
-                provider=config.daily.ai.provider,
+                provider=str(progress_state["provider"]),
                 origin_count=int(
                     package_payload.get("stats", {}).get("point_origin_count")
                     or package_payload.get("stats", {}).get("origin_count")
@@ -642,7 +690,7 @@ def run_daily_summary(
             run_id=run_id,
             package_run_id=str(package_run_id),
             package_run=package_run,
-            provider=config.daily.ai.provider,
+            provider=_effective_provider_label(config, provider_state),
             points=points,
         )
         store.persist_daily_message_points(run_id, message_point_records)
@@ -662,6 +710,10 @@ def run_daily_summary(
             progress_callback=update_progress,
             cancel_check=cancel_check,
             process_callback=process_callback,
+            provider_state=provider_state,
+        )
+        effective_provider = str(
+            analysis.get("provider") or _effective_provider_label(config, provider_state)
         )
         image_paths = _collect_image_paths(package_payload)
         important_summary_text = str((analysis.get("important_summary") or {}).get("content") or "")
@@ -670,7 +722,7 @@ def run_daily_summary(
             output_root / "summary.json",
             run_id=run_id,
             package_run_id=str(package_run_id),
-            provider=config.daily.ai.provider,
+            provider=effective_provider,
             image_paths=image_paths,
             summary_path=summary_path,
             analysis=analysis,
@@ -681,7 +733,7 @@ def run_daily_summary(
             package_run_id=str(package_run_id),
             package_run=package_run,
             package_payload=package_payload,
-            provider=config.daily.ai.provider,
+            provider=effective_provider,
             summary_path=summary_path,
             image_paths=image_paths,
             analysis=analysis,
@@ -697,7 +749,7 @@ def run_daily_summary(
                         _summary_delivery_markdown(
                             package_run=package_run,
                             package_payload=package_payload,
-                            provider=config.daily.ai.provider,
+                            provider=effective_provider,
                             summary_text=important_summary_text,
                             summary_kind="important",
                         ),
@@ -709,7 +761,7 @@ def run_daily_summary(
                     _summary_delivery_markdown(
                         package_run=package_run,
                         package_payload=package_payload,
-                        provider=config.daily.ai.provider,
+                        provider=effective_provider,
                         summary_text=point_summary_text,
                         summary_kind="point",
                     ),
@@ -792,7 +844,7 @@ def run_daily_summary(
                 output_root / "summary.json",
                 run_id=run_id,
                 package_run_id=str(package_run_id),
-                provider=config.daily.ai.provider,
+                provider=effective_provider,
                 image_paths=image_paths,
                 summary_path=summary_path,
                 analysis=analysis,
@@ -814,7 +866,7 @@ def run_daily_summary(
                 scope_json=scope_json,
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
-                provider=config.daily.ai.provider,
+                provider=effective_provider,
                 origin_count=int(
                     package_payload.get("stats", {}).get("point_origin_count")
                     or package_payload.get("stats", {}).get("origin_count")
@@ -831,6 +883,7 @@ def run_daily_summary(
                         current=int(progress_counts.get("total") or 0),
                         label="completed",
                         phase="completed",
+                        extra={"provider": effective_provider},
                     ),
                     ensure_ascii=False,
                     sort_keys=True,
@@ -849,7 +902,7 @@ def run_daily_summary(
                 scope_json=scope_json,
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
-                provider=config.daily.ai.provider,
+                provider=_effective_provider_label(config, provider_state),
                 origin_count=int(
                     package_payload.get("stats", {}).get("point_origin_count")
                     or package_payload.get("stats", {}).get("origin_count")
@@ -870,6 +923,13 @@ def run_daily_summary(
             )
         )
     except Exception as exc:
+        error_progress: dict[str, Any] = {}
+        if isinstance(exc, AiProviderError):
+            error_progress = {
+                "error_kind": exc.kind,
+                "retryable": bool(exc.retryable),
+                "provider": exc.provider,
+            }
         return store.upsert_daily_summary_run(
             DailySummaryRunRecord(
                 run_id=run_id,
@@ -880,7 +940,7 @@ def run_daily_summary(
                 scope_json=scope_json,
                 output_dir=str(output_root),
                 summary_path=str(summary_path),
-                provider=config.daily.ai.provider,
+                provider=_effective_provider_label(config, provider_state),
                 origin_count=int(
                     package_payload.get("stats", {}).get("point_origin_count")
                     or package_payload.get("stats", {}).get("origin_count")
@@ -892,7 +952,13 @@ def run_daily_summary(
                 progress_current=int(progress_state.get("current") or 0),
                 progress_label="failed",
                 progress_json=json.dumps(
-                    {**progress_state, "label": "failed", "phase": "failed", "error": str(exc)},
+                    {
+                        **progress_state,
+                        **error_progress,
+                        "label": "failed",
+                        "phase": "failed",
+                        "error": str(exc),
+                    },
                     ensure_ascii=False,
                     sort_keys=True,
                 ),
@@ -1361,6 +1427,7 @@ def _run_ai_analysis_pipeline(
     progress_callback: Callable[[int, str, str, dict[str, Any] | None], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
+    provider_state: AiProviderRuntimeState,
 ) -> dict[str, Any]:
     completed = 0
 
@@ -1385,6 +1452,7 @@ def _run_ai_analysis_pipeline(
         progress_done=mark_completed,
         cancel_check=cancel_check,
         process_callback=process_callback,
+        provider_state=provider_state,
     )
 
     point_artifacts: list[dict[str, Any]] = []
@@ -1419,12 +1487,23 @@ def _run_ai_analysis_pipeline(
                 output_schema=_message_point_output_schema(),
                 cancel_check=cancel_check,
                 process_callback=process_callback,
+                provider_state=provider_state,
             )
             extracted = _validated_message_points(
                 str(artifact.get("content") or ""),
                 origin_payload=origin_payload,
                 messages=chunk,
             )
+            if str(artifact.get("provider") or "").startswith("openai-compatible:"):
+                fallback_payload = _parse_json_object(str(artifact.get("content") or ""))
+                fallback_points = fallback_payload.get("points") if isinstance(fallback_payload, dict) else None
+                if not isinstance(fallback_points, list) or (fallback_points and not extracted):
+                    raise AiProviderError(
+                        "OpenAI-compatible fallback returned invalid message-point JSON",
+                        kind="fallback_invalid_structured_output",
+                        provider=str(artifact.get("provider") or "openai-compatible"),
+                        retryable=True,
+                    )
             artifact["metadata"]["point_count"] = len(extracted)
             point_artifacts.append(artifact)
             message_points.extend(extracted)
@@ -1467,6 +1546,7 @@ def _run_ai_analysis_pipeline(
             },
             cancel_check=cancel_check,
             process_callback=process_callback,
+            provider_state=provider_state,
         )
         important_artifacts.append(artifact)
         mark_completed(
@@ -1497,6 +1577,7 @@ def _run_ai_analysis_pipeline(
             },
             cancel_check=cancel_check,
             process_callback=process_callback,
+            provider_state=provider_state,
         )
         mark_completed("wrote important daily summary", "important_summary")
     else:
@@ -1526,6 +1607,7 @@ def _run_ai_analysis_pipeline(
             },
             cancel_check=cancel_check,
             process_callback=process_callback,
+            provider_state=provider_state,
         )
     else:
         point_summary_artifact = _static_artifact(
@@ -1552,6 +1634,7 @@ def _run_ai_analysis_pipeline(
         "important_summary": important_artifact,
         "point_summary": point_summary_artifact,
         "final": important_artifact,
+        "provider": _effective_provider_label(config, provider_state),
     }
     _write_json(output_root / "analysis.json", _analysis_record_payload(analysis))
     return analysis
@@ -1565,6 +1648,7 @@ def _analyze_package_media(
     progress_done: Callable[[str, str, dict[str, Any] | None], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
+    provider_state: AiProviderRuntimeState,
 ) -> dict[str, dict[str, Any]]:
     output_dir.mkdir(parents=True, exist_ok=True)
     artifacts: dict[str, dict[str, Any]] = {}
@@ -1589,6 +1673,7 @@ def _analyze_package_media(
                 metadata=descriptor,
                 cancel_check=cancel_check,
                 process_callback=process_callback,
+                provider_state=provider_state,
             )
         else:
             content = _media_reference_markdown(descriptor)
@@ -1601,6 +1686,7 @@ def _analyze_package_media(
                 "content": content,
                 "image_paths": [],
                 "generated_by_ai": False,
+                "provider": "static",
                 "metadata": descriptor,
             }
         if progress_done:
@@ -1624,6 +1710,7 @@ def _run_ai_task(
     output_schema: dict[str, Any] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
+    provider_state: AiProviderRuntimeState,
 ) -> dict[str, Any]:
     if cancel_check:
         cancel_check()
@@ -1637,7 +1724,7 @@ def _run_ai_task(
             json.dumps(output_schema, ensure_ascii=False, indent=2),
             encoding="utf-8",
         )
-    content = _run_summary_provider(
+    provider_result = _run_summary_provider(
         config,
         prompt,
         output_path,
@@ -1646,7 +1733,9 @@ def _run_ai_task(
         output_schema_path=output_schema_path,
         cancel_check=cancel_check,
         process_callback=process_callback,
+        provider_state=provider_state,
     )
+    content = provider_result.content
     if output_path.exists():
         content = output_path.read_text(encoding="utf-8")
     else:
@@ -1659,7 +1748,8 @@ def _run_ai_task(
         "output_schema_path": str(output_schema_path) if output_schema_path else None,
         "content": content,
         "image_paths": image_paths,
-        "generated_by_ai": config.daily.ai.provider != "disabled",
+        "generated_by_ai": provider_result.generated_by_ai,
+        "provider": provider_result.provider,
         "metadata": metadata,
     }
 
@@ -1682,6 +1772,7 @@ def _static_artifact(
         "content": content,
         "image_paths": [],
         "generated_by_ai": False,
+        "provider": "static",
         "metadata": metadata,
     }
 
@@ -1799,8 +1890,16 @@ def _validated_message_points(
     for raw in raw_points:
         if not isinstance(raw, dict):
             continue
+        raw_source_ids = raw.get("source_message_ids")
+        raw_tags = raw.get("tags")
+        if not isinstance(raw_source_ids, list) or not 1 <= len(raw_source_ids) <= 20:
+            continue
+        if not isinstance(raw_tags, list) or len(raw_tags) > 12 or any(
+            not isinstance(tag, str) for tag in raw_tags
+        ):
+            continue
         source_ids: list[int] = []
-        for value in raw.get("source_message_ids") or []:
+        for value in raw_source_ids:
             try:
                 message_id = int(value)
             except (TypeError, ValueError):
@@ -1820,7 +1919,7 @@ def _validated_message_points(
         seen.add(dedupe_key)
         source_messages = [message_by_id[message_id] for message_id in source_ids]
         primary = source_messages[0]
-        tags = parse_tags([*origin_tags, *parse_tags(raw.get("tags"))])
+        tags = parse_tags([*origin_tags, *parse_tags(raw_tags)])
         deeplink = next(
             (str(message.get("telegram_deeplink")) for message in source_messages if message.get("telegram_deeplink")),
             None,
@@ -1926,6 +2025,7 @@ def _write_combined_daily_summary(
 
 def _analysis_record_payload(analysis: dict[str, Any]) -> dict[str, Any]:
     return {
+        "provider": analysis.get("provider"),
         "task_count": (
             len(analysis.get("media") or [])
             + len(analysis.get("message_point_extractions") or [])
@@ -1958,6 +2058,7 @@ def _artifact_payload(artifact: dict[str, Any]) -> dict[str, Any]:
         "output_schema_path": artifact.get("output_schema_path"),
         "image_paths": artifact.get("image_paths") or [],
         "generated_by_ai": bool(artifact.get("generated_by_ai")),
+        "provider": artifact.get("provider"),
         "metadata": artifact.get("metadata") or {},
         "content": artifact.get("content") or "",
     }
@@ -2606,7 +2707,8 @@ def _run_summary_provider(
     output_schema_path: Path | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
-) -> str:
+    provider_state: AiProviderRuntimeState,
+) -> AiProviderResult:
     if cancel_check:
         cancel_check()
     if config.daily.ai.provider == "disabled":
@@ -2616,7 +2718,62 @@ def _run_summary_provider(
             else f"# AI Task Disabled\n\nTask: `{task_name}`\n\nAI provider is disabled for this run.\n"
         )
         output_path.write_text(text, encoding="utf-8")
-        return text
+        provider_state.register("disabled")
+        return AiProviderResult(content=text, provider="disabled", generated_by_ai=False)
+    if provider_state.fallback_active:
+        return _run_openai_fallback_provider(
+            config,
+            prompt,
+            output_path,
+            image_paths,
+            task_name=task_name,
+            output_schema_path=output_schema_path,
+            cancel_check=cancel_check,
+            process_callback=process_callback,
+            provider_state=provider_state,
+        )
+    try:
+        return _run_codex_provider(
+            config,
+            prompt,
+            output_path,
+            image_paths,
+            task_name=task_name,
+            output_schema_path=output_schema_path,
+            cancel_check=cancel_check,
+            process_callback=process_callback,
+            provider_state=provider_state,
+        )
+    except AiProviderError as exc:
+        fallback = config.daily.ai.fallback
+        if exc.kind != "codex_usage_limit" or not fallback.enabled:
+            raise
+        provider_state.activate_fallback(reason=exc.kind)
+        return _run_openai_fallback_provider(
+            config,
+            prompt,
+            output_path,
+            image_paths,
+            task_name=task_name,
+            output_schema_path=output_schema_path,
+            cancel_check=cancel_check,
+            process_callback=process_callback,
+            provider_state=provider_state,
+        )
+
+
+def _run_codex_provider(
+    config: AppConfig,
+    prompt: str,
+    output_path: Path,
+    image_paths: list[str],
+    *,
+    task_name: str,
+    output_schema_path: Path | None,
+    cancel_check: Callable[[], None] | None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None,
+    provider_state: AiProviderRuntimeState,
+) -> AiProviderResult:
     command = _expand_command(
         config.daily.ai.command,
         output_path,
@@ -2651,7 +2808,11 @@ def _run_summary_provider(
                 input_text = None
                 if time_module.monotonic() >= deadline:
                     _terminate_process(process)
-                    raise RuntimeError(f"AI provider timed out after {config.daily.ai.timeout_seconds} seconds")
+                    raise AiProviderError(
+                        f"Codex CLI timed out after {config.daily.ai.timeout_seconds} seconds",
+                        kind="codex_timeout",
+                        provider="codex-cli",
+                    )
     except DailyJobCancelled:
         _terminate_process(process)
         raise
@@ -2662,13 +2823,171 @@ def _run_summary_provider(
         cancel_check()
     if process.returncode != 0:
         detail = stderr.strip() or stdout.strip() or f"exit code {process.returncode}"
-        raise RuntimeError(f"AI provider failed: {detail}")
+        raise _codex_provider_error(detail, returncode=int(process.returncode))
     if output_path.exists():
-        return output_path.read_text(encoding="utf-8")
+        content = output_path.read_text(encoding="utf-8")
+        provider_state.register("codex-cli")
+        return AiProviderResult(content=content, provider="codex-cli")
     if stdout.strip():
         output_path.write_text(stdout, encoding="utf-8")
-        return stdout
-    raise RuntimeError("AI provider completed without writing a summary")
+        provider_state.register("codex-cli")
+        return AiProviderResult(content=stdout, provider="codex-cli")
+    raise AiProviderError(
+        "Codex CLI completed without writing output",
+        kind="codex_empty_output",
+        provider="codex-cli",
+    )
+
+
+def _codex_provider_error(detail: str, *, returncode: int) -> AiProviderError:
+    lines = [line.strip() for line in detail.splitlines() if line.strip()]
+    tail = "\n".join(lines[-12:]).lower()
+    if "you've hit your usage limit" in tail and (
+        "try again at" in tail or "codex/settings/usage" in tail
+    ):
+        return AiProviderError(
+            "Codex usage limit reached",
+            kind="codex_usage_limit",
+            provider="codex-cli",
+            retryable=True,
+        )
+    return AiProviderError(
+        f"Codex CLI failed with exit code {returncode}",
+        kind="codex_failed",
+        provider="codex-cli",
+    )
+
+
+def _run_openai_fallback_provider(
+    config: AppConfig,
+    prompt: str,
+    output_path: Path,
+    image_paths: list[str],
+    *,
+    task_name: str,
+    output_schema_path: Path | None,
+    cancel_check: Callable[[], None] | None,
+    process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None,
+    provider_state: AiProviderRuntimeState,
+) -> AiProviderResult:
+    fallback = config.daily.ai.fallback
+    if not fallback.enabled or fallback.api_key_file is None:
+        raise AiProviderError(
+            "Codex usage limit reached and no fallback provider is configured",
+            kind="codex_usage_limit",
+            provider="codex-cli",
+            retryable=True,
+        )
+    command = [
+        sys.executable,
+        "-m",
+        "tele_mess_core.openai_fallback",
+        "--base-url",
+        fallback.base_url,
+        "--model",
+        fallback.model,
+        "--api-key-file",
+        str(fallback.api_key_file),
+        "--timeout",
+        str(config.daily.ai.timeout_seconds),
+    ]
+    if fallback.supports_images:
+        command.append("--supports-images")
+    if fallback.supports_json_schema:
+        command.append("--supports-json-schema")
+    output_schema = None
+    if output_schema_path is not None and output_schema_path.is_file():
+        output_schema = json.loads(output_schema_path.read_text(encoding="utf-8"))
+    request_payload = json.dumps(
+        {
+            "task_name": task_name,
+            "prompt": prompt,
+            "image_paths": image_paths,
+            "redact_roots": [
+                str(config.storage.data_dir),
+                str(_daily_output_dir(config)),
+            ],
+            "output_schema": output_schema,
+        },
+        ensure_ascii=False,
+    )
+    config.storage.data_dir.mkdir(parents=True, exist_ok=True)
+    process = subprocess.Popen(
+        command,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=str(config.storage.data_dir),
+        start_new_session=(os.name != "nt"),
+    )
+    if process_callback:
+        process_callback(process, f"{task_name}:fallback")
+    deadline = time_module.monotonic() + max(1, int(config.daily.ai.timeout_seconds) + 5)
+    input_text: str | None = request_payload
+    try:
+        while True:
+            if cancel_check:
+                cancel_check()
+            timeout = max(0.1, min(0.5, deadline - time_module.monotonic()))
+            try:
+                stdout, _stderr = process.communicate(input=input_text, timeout=timeout)
+                break
+            except subprocess.TimeoutExpired:
+                input_text = None
+                if time_module.monotonic() >= deadline:
+                    _terminate_process(process)
+                    raise AiProviderError(
+                        f"OpenAI-compatible fallback timed out after {config.daily.ai.timeout_seconds} seconds",
+                        kind="fallback_timeout",
+                        provider=f"openai-compatible:{fallback.model}",
+                        retryable=True,
+                    )
+    except DailyJobCancelled:
+        _terminate_process(process)
+        raise
+    finally:
+        if process_callback:
+            process_callback(None, f"{task_name}:fallback")
+    if cancel_check:
+        cancel_check()
+    try:
+        payload = json.loads(stdout)
+    except json.JSONDecodeError as exc:
+        raise AiProviderError(
+            "OpenAI-compatible fallback returned an invalid local response",
+            kind="fallback_protocol",
+            provider=f"openai-compatible:{fallback.model}",
+            retryable=True,
+        ) from exc
+    if not isinstance(payload, dict) or not payload.get("ok"):
+        message = (
+            str(payload.get("error") or "OpenAI-compatible fallback failed")
+            if isinstance(payload, dict)
+            else "OpenAI-compatible fallback failed"
+        )
+        raise AiProviderError(
+            message,
+            kind=str(payload.get("kind") or "fallback_failed") if isinstance(payload, dict) else "fallback_failed",
+            provider=f"openai-compatible:{fallback.model}",
+            retryable=bool(payload.get("retryable")) if isinstance(payload, dict) else True,
+        )
+    content = str(payload.get("content") or "")
+    if not content.strip():
+        raise AiProviderError(
+            "OpenAI-compatible fallback returned empty output",
+            kind="fallback_empty_output",
+            provider=f"openai-compatible:{fallback.model}",
+            retryable=True,
+        )
+    output_path.write_text(content, encoding="utf-8")
+    provider = str(payload.get("provider") or f"openai-compatible:{fallback.model}")
+    provider_state.register(provider)
+    return AiProviderResult(
+        content=content,
+        provider=provider,
+        generated_by_ai=bool(payload.get("generated_by_ai", True)),
+    )
 
 
 def _terminate_process(process: subprocess.Popen[str]) -> None:

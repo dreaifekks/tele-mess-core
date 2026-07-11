@@ -1,9 +1,10 @@
 from __future__ import annotations
 
+import json
+import sqlite3
 import tempfile
 import threading
 import unittest
-import sqlite3
 from pathlib import Path
 from unittest.mock import patch
 
@@ -861,8 +862,146 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(canceled["status"], "cancel_requested")
         self.assertIsNotNone(canceled["cancel_requested_at"])
 
+    def test_daily_summary_job_retry_is_not_claimed_before_retry_at(self) -> None:
+        self.store.upsert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_retry",
+                status="running",
+                worker_id="worker_a",
+                attempt=1,
+                progress_label="failed provider",
+                progress_json='{"stage":"summary"}',
+                started_at="2026-07-03T00:00:00+00:00",
+            )
+        )
+
+        scheduled = self.store.schedule_daily_summary_job_retry(
+            "job_retry",
+            "worker_a",
+            retry_at="2026-07-03T00:20:00+00:00",
+            max_retries=1,
+            progress_label="retry scheduled",
+            progress_json='{"phase":"retry_wait"}',
+            error="fallback failed",
+            now="2026-07-03T00:00:00+00:00",
+        )
+
+        self.assertTrue(scheduled)
+        waiting = self.store.get_daily_summary_job("job_retry")
+        assert waiting is not None
+        self.assertEqual(waiting["status"], "queued")
+        self.assertEqual(waiting["retry_count"], 1)
+        self.assertEqual(waiting["retry_at"], "2026-07-03T00:20:00+00:00")
+        self.assertIsNone(waiting["worker_id"])
+        self.assertIsNone(waiting["lease_until"])
+        self.assertIsNone(
+            self.store.claim_daily_summary_job(
+                "worker_b",
+                now="2026-07-03T00:19:59+00:00",
+                lease_until="2026-07-03T00:30:00+00:00",
+            )
+        )
+
+        claimed = self.store.claim_daily_summary_job(
+            "worker_b",
+            now="2026-07-03T00:20:00+00:00",
+            lease_until="2026-07-03T00:40:00+00:00",
+        )
+
+        assert claimed is not None
+        self.assertEqual(claimed["status"], "running")
+        self.assertEqual(claimed["worker_id"], "worker_b")
+        self.assertEqual(claimed["attempt"], 2)
+        self.assertEqual(claimed["retry_count"], 1)
+        self.assertIsNone(claimed["retry_at"])
+
+    def test_retry_schedule_does_not_overwrite_cancel_request(self) -> None:
+        self.store.upsert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_retry_cancel",
+                status="running",
+                worker_id="worker_a",
+                progress_label="running",
+                progress_json='{"stage":"summary"}',
+            )
+        )
+        requested = self.store.request_daily_summary_job_cancel("job_retry_cancel")
+        assert requested is not None
+        self.assertEqual(requested["status"], "cancel_requested")
+
+        scheduled = self.store.schedule_daily_summary_job_retry(
+            "job_retry_cancel",
+            "worker_a",
+            retry_at="2026-07-03T00:20:00+00:00",
+            max_retries=1,
+            progress_label="retry scheduled",
+            progress_json='{"phase":"retry_wait"}',
+            error="fallback failed",
+            now="2026-07-03T00:00:00+00:00",
+        )
+
+        self.assertFalse(scheduled)
+        current = self.store.get_daily_summary_job("job_retry_cancel")
+        assert current is not None
+        self.assertEqual(current["status"], "cancel_requested")
+        self.assertEqual(current["retry_count"], 0)
+        self.assertIsNone(current["retry_at"])
+
 
 class ArchiveMigrationTest(unittest.TestCase):
+    def test_v16_retry_migration_sanitizes_codex_usage_limit_errors(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES('schema_version', '16');
+            PRAGMA user_version = 16;
+            CREATE TABLE daily_summary_jobs (
+              job_id TEXT PRIMARY KEY,
+              status TEXT NOT NULL,
+              error TEXT,
+              progress_json TEXT,
+              lease_until TEXT,
+              started_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE TABLE daily_summary_runs (
+              run_id TEXT PRIMARY KEY,
+              status TEXT NOT NULL,
+              error TEXT,
+              progress_json TEXT,
+              started_at TEXT NOT NULL
+            );
+            INSERT INTO daily_summary_jobs(job_id, status, error, progress_json, started_at, updated_at)
+            VALUES(
+              'job_limit', 'failed',
+              'private prompt then You''ve hit your usage limit https://chatgpt.com/codex/settings/usage',
+              '{"error":"private prompt"}',
+              '2026-07-10T00:00:00+00:00', '2026-07-10T00:00:00+00:00'
+            );
+            INSERT INTO daily_summary_runs(run_id, status, error, progress_json, started_at)
+            VALUES(
+              'sum_limit', 'failed',
+              'private prompt then You''ve hit your usage limit',
+              '{"error":"private prompt"}',
+              '2026-07-10T00:00:00+00:00'
+            );
+            """
+        )
+
+        apply_migrations(conn, 16, 17)
+
+        for table in ("daily_summary_jobs", "daily_summary_runs"):
+            error, progress_json = conn.execute(
+                f"SELECT error, progress_json FROM {table} LIMIT 1"
+            ).fetchone()
+            self.assertEqual(error, "Codex usage limit reached")
+            progress = json.loads(progress_json)
+            self.assertEqual(progress["error"], "Codex usage limit reached")
+            self.assertEqual(progress["error_kind"], "codex_usage_limit")
+            self.assertEqual(progress["retryable"], 1)
+        conn.close()
+
     def test_v1_database_migrates_to_account_aware_schema(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             db_path = Path(tmp) / "archive.db"
@@ -907,7 +1046,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 16)
+                self.assertEqual(store.state()["schema_version"], 17)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
@@ -961,10 +1100,22 @@ class ArchiveMigrationTest(unittest.TestCase):
                 """
             )
 
-            apply_migrations(conn, 12, 16)
+            apply_migrations(conn, 12, 17)
 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
-            self.assertTrue({"request_json", "dedupe_key", "worker_id", "lease_until", "heartbeat_at", "attempt"} <= columns)
+            self.assertTrue(
+                {
+                    "request_json",
+                    "dedupe_key",
+                    "worker_id",
+                    "lease_until",
+                    "heartbeat_at",
+                    "attempt",
+                    "retry_at",
+                    "retry_count",
+                }
+                <= columns
+            )
             self.assertIsNotNone(
                 conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='delivery_outbox'").fetchone()
             )
@@ -978,10 +1129,10 @@ class ArchiveMigrationTest(unittest.TestCase):
                 conn.execute("SELECT record_type FROM daily_summary_records WHERE summary_id='legacy_summary'").fetchone()[0],
                 "important_origin",
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 16)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 17)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "16",
+                "17",
             )
             self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
 
@@ -1040,7 +1191,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 16)
+                self.assertEqual(store.state()["schema_version"], 17)
                 record = store.get_daily_summary_record(summary_id="legacy_v15")
                 assert record is not None
                 self.assertEqual(record["record_type"], "important_origin")

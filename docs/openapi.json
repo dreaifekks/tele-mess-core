@@ -1049,6 +1049,13 @@
           "request": {
             "type": "object"
           },
+          "retry_at": {
+            "nullable": true,
+            "type": "string"
+          },
+          "retry_count": {
+            "type": "integer"
+          },
           "scope": {
             "type": "object"
           },
@@ -2532,8 +2539,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-10.4",
-    "x-contract-hash": "bf0d29cf60733f79"
+    "version": "2026-07-11.1",
+    "x-contract-hash": "afa02c26723109db"
   },
   "openapi": "3.1.0",
   "paths": {

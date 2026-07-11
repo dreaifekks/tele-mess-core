@@ -212,6 +212,38 @@ def _migration_16(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_17(connection: sqlite3.Connection) -> None:
+    _ensure_column(connection, "daily_summary_jobs", "retry_at", "TEXT")
+    _ensure_column(connection, "daily_summary_jobs", "retry_count", "INTEGER NOT NULL DEFAULT 0")
+    for table in ("daily_summary_jobs", "daily_summary_runs"):
+        columns = {str(row[1]) for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+        if not {"error", "progress_json"}.issubset(columns):
+            continue
+        connection.execute(
+            f"""
+            UPDATE {table}
+            SET error = 'Codex usage limit reached',
+                progress_json = CASE
+                  WHEN progress_json IS NOT NULL AND json_valid(progress_json)
+                  THEN json_set(
+                    progress_json,
+                    '$.error', 'Codex usage limit reached',
+                    '$.error_kind', 'codex_usage_limit',
+                    '$.retryable', 1
+                  )
+                  ELSE progress_json
+                END
+            WHERE error LIKE '%chatgpt.com/codex/settings/usage%'
+               OR error LIKE '%You''ve hit your usage limit%'
+            """
+        )
+    connection.execute("DROP INDEX IF EXISTS idx_daily_summary_jobs_claim")
+    connection.execute(
+        "CREATE INDEX idx_daily_summary_jobs_claim "
+        "ON daily_summary_jobs(status, retry_at, lease_until, started_at)"
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -224,4 +256,5 @@ MIGRATIONS: dict[int, Migration] = {
     14: _migration_14,
     15: _migration_15,
     16: _migration_16,
+    17: _migration_17,
 }

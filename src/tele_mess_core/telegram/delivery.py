@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Any
 
 from tele_mess_core.archive import ArchiveStore
@@ -11,6 +12,7 @@ from tele_mess_core.telegram.runtime import TelegramOperationError, classify_tel
 
 
 MAX_TELEGRAM_MESSAGE_CHARS = 3800
+TELEGRAM_SUMMARY_PARSE_MODE = "md"
 
 
 class TelegramSummaryDeliveryService:
@@ -43,7 +45,8 @@ class TelegramSummaryDeliveryService:
 
             self._set_auth_state("authorized")
             entity = await client.get_entity(delivery.origin_id)
-            chunks = split_telegram_message(content) if split_content else [str(content)]
+            markdown_content = telegram_markdown_for_send(content)
+            chunks = split_telegram_message(markdown_content) if split_content else [markdown_content]
             message_ids: list[int] = []
             for index, chunk in enumerate(chunks, start=1):
                 body = chunk
@@ -53,7 +56,7 @@ class TelegramSummaryDeliveryService:
                     entity,
                     body,
                     reply_to=delivery.topic_id or None,
-                    parse_mode=None,
+                    parse_mode=TELEGRAM_SUMMARY_PARSE_MODE,
                 )
                 message_id = getattr(sent, "id", None)
                 if message_id is not None:
@@ -157,6 +160,24 @@ def split_telegram_message(content: str, limit: int = MAX_TELEGRAM_MESSAGE_CHARS
     if remaining:
         chunks.append(remaining)
     return chunks
+
+
+def telegram_markdown_for_send(content: str) -> str:
+    """Adapt common Markdown headings to the subset rendered by Telethon."""
+    lines: list[str] = []
+    in_fenced_code = False
+    for line in str(content or "").splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("```"):
+            in_fenced_code = not in_fenced_code
+            lines.append(line)
+            continue
+        if not in_fenced_code:
+            heading = re.match(r"^\s{0,3}#{1,6}[ \t]+(.+?)\s*$", line)
+            if heading:
+                line = f"**{heading.group(1)}**"
+        lines.append(line)
+    return "\n".join(lines).strip()
 
 
 def _best_split_index(text: str, limit: int) -> int:

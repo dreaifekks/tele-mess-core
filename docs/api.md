@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-10.4`
-- Contract hash: `bf0d29cf60733f79`
+- Contract version: `2026-07-11.1`
+- Contract hash: `afa02c26723109db`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1290,6 +1290,8 @@ Response: `ParticipantRefreshResultResponse`
 | `lease_until` | `string` | no |
 | `heartbeat_at` | `string` | no |
 | `attempt` | `integer` | no |
+| `retry_at` | `string` | no |
+| `retry_count` | `integer` | no |
 | `cancel_requested_at` | `string` | no |
 | `error` | `string` | no |
 | `started_at` | `string` | no |

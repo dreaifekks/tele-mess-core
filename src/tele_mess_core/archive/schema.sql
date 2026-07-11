@@ -261,6 +261,8 @@ CREATE TABLE IF NOT EXISTS daily_summary_jobs (
   lease_until TEXT,
   heartbeat_at TEXT,
   attempt INTEGER NOT NULL DEFAULT 0,
+  retry_at TEXT,
+  retry_count INTEGER NOT NULL DEFAULT 0,
   cancel_requested_at TEXT,
   error TEXT,
   started_at TEXT NOT NULL,
