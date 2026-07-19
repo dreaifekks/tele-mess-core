@@ -244,6 +244,48 @@ def _migration_17(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_18(connection: sqlite3.Connection) -> None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'capture_cursors'"
+    ).fetchone()
+    if table is None:
+        return
+    _ensure_column(
+        connection,
+        "capture_cursors",
+        "history_scanned_through_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        connection,
+        "capture_cursors",
+        "observed_max_message_id",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+    _ensure_column(connection, "capture_cursors", "backfill_head_message_id", "INTEGER")
+    _ensure_column(connection, "capture_cursors", "backfill_status", "TEXT")
+    _ensure_column(connection, "capture_cursors", "backfill_error", "TEXT")
+    _ensure_column(connection, "capture_cursors", "backfill_count", "INTEGER")
+    connection.execute(
+        """
+        UPDATE capture_cursors
+        SET history_scanned_through_id = 0,
+            observed_max_message_id = MAX(
+              COALESCE(observed_max_message_id, 0),
+              COALESCE(last_message_id, 0)
+            ),
+            last_message_id = MAX(
+              COALESCE(last_message_id, 0),
+              COALESCE(observed_max_message_id, 0)
+            ),
+            backfill_status = CASE
+              WHEN COALESCE(last_message_id, 0) > 0 THEN 'migration_rescan'
+              ELSE backfill_status
+            END
+        """
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -257,4 +299,5 @@ MIGRATIONS: dict[int, Migration] = {
     15: _migration_15,
     16: _migration_16,
     17: _migration_17,
+    18: _migration_18,
 }

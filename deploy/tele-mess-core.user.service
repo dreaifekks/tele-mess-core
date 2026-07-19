@@ -5,9 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-WorkingDirectory=/home/dreaife/dev/tele-mess-core
+WorkingDirectory=%h/.local/share/tele-mess-core
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core --config /home/dreaife/dev/tele-mess-core/config.yml run-server
+ExecStart=/usr/bin/env tele-mess-core --workspace %h/.local/share/tele-mess-core --config %h/.config/tele-mess-core/config.yml run-server
 Restart=always
 RestartSec=10
 StandardOutput=journal

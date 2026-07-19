@@ -32,7 +32,7 @@ from tele_mess_core.models import (
 from tele_mess_core.archive.migrations import apply_migrations
 
 
-SCHEMA_VERSION = 17
+SCHEMA_VERSION = 18
 LEGACY_SCHEMA_BASELINE = 12
 
 
@@ -627,7 +627,9 @@ class ArchiveStore:
             row = self._conn.execute(
                 """
                 SELECT source, account_id, origin_id, topic_id, last_message_id,
-                       last_message_at, last_backfill_at, updated_at, raw_json
+                       history_scanned_through_id, observed_max_message_id,
+                       last_message_at, last_backfill_at, backfill_head_message_id,
+                       backfill_status, backfill_error, backfill_count, updated_at, raw_json
                 FROM capture_cursors
                 WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
                 """,
@@ -637,29 +639,80 @@ class ArchiveStore:
 
     def upsert_capture_cursor(self, cursor: CaptureCursorRecord) -> None:
         now = cursor.updated_at or utc_now_iso()
+        observed_max_message_id = max(
+            cursor.last_message_id,
+            cursor.observed_max_message_id or 0,
+        )
+        history_scanned_through_id = cursor.history_scanned_through_id or 0
         with self._lock:
             self._conn.execute(
                 """
                 INSERT INTO capture_cursors(
                   source, account_id, origin_id, topic_id, last_message_id,
-                  last_message_at, last_backfill_at, updated_at, raw_json
+                  history_scanned_through_id, observed_max_message_id,
+                  last_message_at, last_backfill_at, backfill_head_message_id,
+                  backfill_status, backfill_error, backfill_count, updated_at, raw_json
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
-                  last_message_id = MAX(capture_cursors.last_message_id, excluded.last_message_id),
-                  last_message_at = COALESCE(excluded.last_message_at, capture_cursors.last_message_at),
-                  last_backfill_at = excluded.last_backfill_at,
+                  last_message_id = MAX(
+                    capture_cursors.last_message_id,
+                    capture_cursors.observed_max_message_id,
+                    excluded.last_message_id,
+                    excluded.observed_max_message_id
+                  ),
+                  history_scanned_through_id = MAX(
+                    capture_cursors.history_scanned_through_id,
+                    excluded.history_scanned_through_id
+                  ),
+                  observed_max_message_id = MAX(
+                    capture_cursors.last_message_id,
+                    capture_cursors.observed_max_message_id,
+                    excluded.last_message_id,
+                    excluded.observed_max_message_id
+                  ),
+                  last_message_at = CASE
+                    WHEN excluded.last_message_at IS NULL THEN capture_cursors.last_message_at
+                    WHEN capture_cursors.last_message_at IS NULL
+                      OR excluded.last_message_at > capture_cursors.last_message_at
+                    THEN excluded.last_message_at
+                    ELSE capture_cursors.last_message_at
+                  END,
+                  last_backfill_at = CASE
+                    WHEN excluded.last_backfill_at IS NULL THEN capture_cursors.last_backfill_at
+                    WHEN capture_cursors.last_backfill_at IS NULL
+                      OR excluded.last_backfill_at > capture_cursors.last_backfill_at
+                    THEN excluded.last_backfill_at
+                    ELSE capture_cursors.last_backfill_at
+                  END,
+                  backfill_head_message_id = CASE
+                    WHEN excluded.backfill_head_message_id IS NULL
+                    THEN capture_cursors.backfill_head_message_id
+                    WHEN capture_cursors.backfill_head_message_id IS NULL
+                      OR excluded.backfill_head_message_id > capture_cursors.backfill_head_message_id
+                    THEN excluded.backfill_head_message_id
+                    ELSE capture_cursors.backfill_head_message_id
+                  END,
+                  backfill_status = COALESCE(excluded.backfill_status, capture_cursors.backfill_status),
+                  backfill_error = COALESCE(excluded.backfill_error, capture_cursors.backfill_error),
+                  backfill_count = COALESCE(excluded.backfill_count, capture_cursors.backfill_count),
                   updated_at = excluded.updated_at,
-                  raw_json = excluded.raw_json
+                  raw_json = COALESCE(excluded.raw_json, capture_cursors.raw_json)
                 """,
                 (
                     cursor.source,
                     cursor.account_id,
                     cursor.origin_id,
                     cursor.topic_id,
-                    cursor.last_message_id,
+                    observed_max_message_id,
+                    history_scanned_through_id,
+                    observed_max_message_id,
                     cursor.last_message_at,
                     cursor.last_backfill_at,
+                    cursor.backfill_head_message_id,
+                    cursor.backfill_status,
+                    cursor.backfill_error,
+                    cursor.backfill_count,
                     now,
                     cursor.raw_json,
                 ),
@@ -690,7 +743,10 @@ class ArchiveStore:
     def list_capture_cursors(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
             SELECT c.source, c.account_id, c.origin_id, c.topic_id, c.last_message_id,
-                   c.last_message_at, c.last_backfill_at, c.updated_at, c.raw_json,
+                   c.history_scanned_through_id, c.observed_max_message_id,
+                   c.last_message_at, c.last_backfill_at, c.backfill_head_message_id,
+                   c.backfill_status, c.backfill_error, c.backfill_count,
+                   c.updated_at, c.raw_json,
                    o.title AS origin_title
             FROM capture_cursors c
             LEFT JOIN origins o
@@ -798,19 +854,68 @@ class ArchiveStore:
                   sender_name = excluded.sender_name,
                   sender_username = excluded.sender_username,
                   sent_at = excluded.sent_at,
-                  edited_at = excluded.edited_at,
-                  ingested_at = excluded.ingested_at,
-                  deleted_at = excluded.deleted_at,
-                  text = excluded.text,
-                  has_media = excluded.has_media,
-                  media_kind = excluded.media_kind,
-                  grouped_id = excluded.grouped_id,
-                  reply_to_message_id = excluded.reply_to_message_id,
-                  forward_from_id = excluded.forward_from_id,
-                  forward_from_name = excluded.forward_from_name,
-                  permalink = excluded.permalink,
-                  reactions_json = excluded.reactions_json,
-                  raw_json = excluded.raw_json,
+                  edited_at = CASE
+                    WHEN excluded.edited_at IS NULL THEN messages.edited_at
+                    WHEN messages.edited_at IS NULL OR excluded.edited_at >= messages.edited_at
+                    THEN excluded.edited_at
+                    ELSE messages.edited_at
+                  END,
+                  ingested_at = CASE
+                    WHEN excluded.ingested_at >= messages.ingested_at THEN excluded.ingested_at
+                    ELSE messages.ingested_at
+                  END,
+                  deleted_at = CASE
+                    WHEN excluded.deleted_at IS NULL THEN messages.deleted_at
+                    WHEN messages.deleted_at IS NULL OR excluded.deleted_at >= messages.deleted_at
+                    THEN excluded.deleted_at
+                    ELSE messages.deleted_at
+                  END,
+                  text = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.text ELSE messages.text
+                  END,
+                  has_media = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.has_media ELSE messages.has_media
+                  END,
+                  media_kind = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.media_kind ELSE messages.media_kind
+                  END,
+                  grouped_id = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.grouped_id ELSE messages.grouped_id
+                  END,
+                  reply_to_message_id = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.reply_to_message_id ELSE messages.reply_to_message_id
+                  END,
+                  forward_from_id = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.forward_from_id ELSE messages.forward_from_id
+                  END,
+                  forward_from_name = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.forward_from_name ELSE messages.forward_from_name
+                  END,
+                  permalink = COALESCE(excluded.permalink, messages.permalink),
+                  reactions_json = CASE
+                    WHEN ? = 'backfill'
+                    THEN COALESCE(messages.reactions_json, excluded.reactions_json)
+                    ELSE COALESCE(excluded.reactions_json, messages.reactions_json)
+                  END,
+                  raw_json = CASE
+                    WHEN messages.edited_at IS NULL
+                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                    THEN excluded.raw_json ELSE messages.raw_json
+                  END,
                   version = messages.version + 1
                 """,
                 (
@@ -836,6 +941,7 @@ class ArchiveStore:
                     message.permalink,
                     message.reactions_json,
                     message.raw_json,
+                    event_type,
                 ),
             )
             event_seq = self._insert_event(

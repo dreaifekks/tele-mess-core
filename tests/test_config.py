@@ -8,6 +8,58 @@ from tele_mess_core.config import load_config
 
 
 class ConfigTest(unittest.TestCase):
+    def test_workspace_override_anchors_defaults_and_ai_work_dir(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_dir = root / "config-source"
+            workspace = root / "Mac Workspace"
+            config_dir.mkdir()
+            config_path = config_dir / "config.yml"
+            config_path.write_text(
+                """
+storage:
+  data_dir: ./state
+  database: ./state/archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+  session_dir: ./state/sessions
+daily:
+  ai:
+    work_dir: ./ai-work
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path, workspace_dir=workspace)
+
+        self.assertEqual(config.workspace_dir, workspace.resolve())
+        self.assertEqual(config.storage.data_dir, workspace / "state")
+        self.assertEqual(config.storage.database, workspace / "state" / "archive.db")
+        self.assertEqual(config.telegram.accounts[0].session_dir, workspace / "state" / "sessions")
+        self.assertEqual(config.daily.ai.work_dir, workspace / "ai-work")
+
+    def test_custom_data_dir_does_not_change_legacy_database_or_session_defaults(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = root / "config.yml"
+            config_path.write_text(
+                """
+storage:
+  data_dir: ./custom-data
+telegram:
+  api_id: 1
+  api_hash: hash
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.storage.data_dir, root / "custom-data")
+        self.assertEqual(config.storage.database, root / "data" / "archive.db")
+        self.assertEqual(config.telegram.accounts[0].session_dir, root / "data" / "sessions")
+
     def test_telegram_chats_are_ignored(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             config_path = Path(tmp) / "config.yml"

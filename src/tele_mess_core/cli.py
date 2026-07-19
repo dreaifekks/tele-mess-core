@@ -6,6 +6,7 @@ import json
 import logging
 import signal
 from pathlib import Path
+import sys
 from typing import TYPE_CHECKING
 
 from tele_mess_core.archive import ArchiveStore
@@ -17,6 +18,7 @@ from tele_mess_core.models import (
     utc_now_iso,
 )
 from tele_mess_core.server import SyncApiServer
+from tele_mess_core.runtime_paths import RuntimePathSelection, resolve_runtime_paths
 
 if TYPE_CHECKING:
     from tele_mess_core.config import AppConfig
@@ -24,16 +26,49 @@ if TYPE_CHECKING:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Telegram message archive core")
-    parser.add_argument("--config", default="config.yml", help="Path to config YAML")
+    parser.add_argument("--config", help="Path to config YAML")
+    parser.add_argument(
+        "--workspace",
+        "--work-dir",
+        dest="workspace",
+        help="Stable instance root used for config discovery and relative config paths",
+    )
     sub = parser.add_subparsers(dest="command", required=True)
 
-    def add_config_arg(subparser: argparse.ArgumentParser) -> None:
-        subparser.add_argument("--config", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+    def add_config_arg(subparser: argparse.ArgumentParser, *, visible: bool = False) -> None:
+        subparser.add_argument(
+            "--config",
+            default=argparse.SUPPRESS,
+            help="Path to config YAML" if visible else argparse.SUPPRESS,
+        )
+        subparser.add_argument(
+            "--workspace",
+            "--work-dir",
+            dest="workspace",
+            default=argparse.SUPPRESS,
+            help=(
+                "Stable instance root used for config discovery and relative config paths"
+                if visible
+                else argparse.SUPPRESS
+            ),
+        )
 
     add_config_arg(sub.add_parser("init-db", help="Initialize the SQLite archive"))
     add_config_arg(sub.add_parser("serve-api", help="Run HTTP API and durable daily worker without Telegram ingestion"))
     add_config_arg(sub.add_parser("run-telegram", help="Run only Telegram ingestion"))
     add_config_arg(sub.add_parser("run-server", help="Run Telegram ingestion and sync API"))
+    local_parser = sub.add_parser(
+        "run-local",
+        help="Run Telegram ingestion and durable jobs locally without HTTP by default",
+    )
+    add_config_arg(local_parser, visible=True)
+    local_parser.add_argument(
+        "--web",
+        action="store_true",
+        help="Also start the configured HTTP API and built-in web console",
+    )
+    paths_parser = sub.add_parser("paths", help="Print resolved local workspace paths without opening the database")
+    add_config_arg(paths_parser, visible=True)
     smoke_parser = sub.add_parser("smoke-telegram", help="Check Telegram account auth and optional live discovery")
     add_config_arg(smoke_parser)
     smoke_parser.add_argument("--account-id", help="Configured Telegram account ID to check")
@@ -119,7 +154,24 @@ def main(argv: list[str] | None = None) -> int:
     from tele_mess_core.config import load_config
     from tele_mess_core.logging_setup import setup_logging
 
-    config = load_config(args.config)
+    path_selection = resolve_runtime_paths(
+        getattr(args, "config", None),
+        getattr(args, "workspace", None),
+        local_mode=args.command in {"run-local", "paths"},
+    )
+    if not path_selection.config_path.is_file():
+        print(
+            f"Config not found: {path_selection.config_path}\n"
+            "Pass --config, set TELE_MESS_CORE_CONFIG, or place config.yml in the workspace.",
+            file=sys.stderr,
+        )
+        if args.command == "paths":
+            print(json.dumps(_paths_payload(path_selection), ensure_ascii=False, indent=2))
+        return 2
+    config = load_config(path_selection.config_path, workspace_dir=path_selection.workspace_dir)
+    if args.command == "paths":
+        print(json.dumps(_paths_payload(path_selection, config), ensure_ascii=False, indent=2))
+        return 0
     logger = setup_logging(config.logging)
 
     store = ArchiveStore(config.storage.database)
@@ -136,6 +188,13 @@ def main(argv: list[str] | None = None) -> int:
             return _run_async(_run_telegram(config, store))
         if args.command == "run-server":
             return _run_async(_run_server(config, store))
+        if args.command == "run-local":
+            logger.info(
+                "Starting local mode with workspace=%s web=%s",
+                path_selection.workspace_dir,
+                "enabled" if args.web else "disabled",
+            )
+            return _run_async(_run_local(config, store, web=bool(args.web)))
         if args.command == "smoke-telegram":
             return _run_async(_smoke_telegram(config, store, args.account_id, args.discover_origins, args.topic_limit))
         if args.command == "daily-package":
@@ -197,6 +256,39 @@ def _generate_api_docs(output_dir: Path, check: bool = False) -> int:
         path.write_text(content, encoding="utf-8")
         print(f"wrote {path}")
     return 0
+
+
+def _paths_payload(
+    selection: RuntimePathSelection,
+    config: AppConfig | None = None,
+) -> dict[str, object]:
+    payload: dict[str, object] = {
+        "workspace_dir": str(selection.workspace_dir),
+        "workspace_source": selection.workspace_source,
+        "config_path": str(selection.config_path),
+        "config_source": selection.config_source,
+        "config_exists": selection.config_path.is_file(),
+        "local_web_default": False,
+    }
+    if config is None:
+        return payload
+    daily_output_dir = config.daily.output_dir or (config.storage.data_dir / "daily-packages")
+    ai_work_dir = config.daily.ai.work_dir or config.storage.data_dir
+    payload.update(
+        {
+            "data_dir": str(config.storage.data_dir),
+            "database": str(config.storage.database),
+            "media_dir": str(config.storage.database.parent / "media"),
+            "session_dirs": {
+                account.account_id: str(account.session_dir)
+                for account in config.telegram.accounts
+            },
+            "log_file": str(config.logging.file) if config.logging.file else None,
+            "daily_output_dir": str(daily_output_dir),
+            "ai_work_dir": str(ai_work_dir),
+        }
+    )
+    return payload
 
 
 def _serve_api(config: AppConfig, store: ArchiveStore) -> int:
@@ -310,6 +402,14 @@ async def _smoke_telegram(
 
 
 async def _run_server(config: AppConfig, store: ArchiveStore) -> None:
+    await _run_core(config, store, web=True)
+
+
+async def _run_local(config: AppConfig, store: ArchiveStore, *, web: bool = False) -> None:
+    await _run_core(config, store, web=web)
+
+
+async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool) -> None:
     from tele_mess_core.daily_jobs import DailyJobWorker
     from tele_mess_core.telegram.manager import TelegramRuntimeManager
 
@@ -323,39 +423,48 @@ async def _run_server(config: AppConfig, store: ArchiveStore) -> None:
     try:
         await runtime.start()
         daily_worker = DailyJobWorker(store, config, telegram_runtime=runtime)
-        api = SyncApiServer(
-            store,
-            config.server.host,
-            config.server.port,
-            config.server.token,
-            config,
-            allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
-            telegram_runtime=runtime,
-            daily_worker=daily_worker,
-        )
         daily_worker.start()
-        api.start_background()
         stop_task = asyncio.create_task(stop_event.wait(), name="server-stop-signal")
-        api_task = asyncio.create_task(api.wait_stopped(), name="sync-api-stopped")
-        done, pending = await asyncio.wait({stop_task, api_task}, return_when=asyncio.FIRST_COMPLETED)
-        for task in pending:
-            task.cancel()
-        await asyncio.gather(*pending, return_exceptions=True)
-        if api_task in done and not stop_event.is_set():
-            raise RuntimeError("Sync API stopped unexpectedly")
-    finally:
-        if api is not None:
-            api.stop()
-        if daily_worker is not None:
-            daily_worker.stop()
-        await runtime.stop()
-        for task in (stop_task, api_task):
-            if task is not None and not task.done():
+        if web:
+            api = SyncApiServer(
+                store,
+                config.server.host,
+                config.server.port,
+                config.server.token,
+                config,
+                allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
+                telegram_runtime=runtime,
+                daily_worker=daily_worker,
+            )
+            api.start_background()
+            api_task = asyncio.create_task(api.wait_stopped(), name="sync-api-stopped")
+            done, pending = await asyncio.wait({stop_task, api_task}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
                 task.cancel()
-        await asyncio.gather(
-            *(task for task in (stop_task, api_task) if task is not None),
-            return_exceptions=True,
-        )
+            await asyncio.gather(*pending, return_exceptions=True)
+            if api_task in done and not stop_event.is_set():
+                raise RuntimeError("Sync API stopped unexpectedly")
+        else:
+            await stop_task
+    finally:
+        try:
+            if api is not None:
+                api.stop()
+        finally:
+            try:
+                if daily_worker is not None:
+                    await asyncio.to_thread(daily_worker.stop)
+            finally:
+                try:
+                    await runtime.stop()
+                finally:
+                    for task in (stop_task, api_task):
+                        if task is not None and not task.done():
+                            task.cancel()
+                    await asyncio.gather(
+                        *(task for task in (stop_task, api_task) if task is not None),
+                        return_exceptions=True,
+                    )
 
 
 def _install_stop_handlers(stop_event: asyncio.Event) -> None:

@@ -439,6 +439,25 @@
           "account_id": {
             "type": "string"
           },
+          "backfill_count": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "backfill_error": {
+            "nullable": true,
+            "type": "string"
+          },
+          "backfill_head_message_id": {
+            "nullable": true,
+            "type": "integer"
+          },
+          "backfill_status": {
+            "nullable": true,
+            "type": "string"
+          },
+          "history_scanned_through_id": {
+            "type": "integer"
+          },
           "last_backfill_at": {
             "nullable": true,
             "type": "string"
@@ -448,6 +467,9 @@
             "type": "string"
           },
           "last_message_id": {
+            "type": "integer"
+          },
+          "observed_max_message_id": {
             "type": "integer"
           },
           "origin_id": {
@@ -2539,8 +2561,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-11.1",
-    "x-contract-hash": "afa02c26723109db"
+    "version": "2026-07-19.1",
+    "x-contract-hash": "4ef7a958cada8ce2"
   },
   "openapi": "3.1.0",
   "paths": {

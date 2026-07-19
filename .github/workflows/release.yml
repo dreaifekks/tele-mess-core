@@ -1,0 +1,124 @@
+name: Release to PyPI
+
+on:
+  push:
+    tags:
+      - "v*"
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Test and build distributions
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+
+    steps:
+      - name: Check out the tagged source
+        uses: actions/checkout@v6
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: pyproject.toml
+
+      - name: Verify tag and version metadata
+        id: version
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: |
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import tomllib
+
+          project_version = tomllib.loads(Path("pyproject.toml").read_text(encoding="utf-8"))["project"]["version"]
+          expected_tag = f"v{project_version}"
+          release_tag = os.environ["RELEASE_TAG"]
+          if release_tag != expected_tag:
+              raise SystemExit(f"release tag {release_tag!r} does not match {expected_tag!r}")
+
+          init_text = Path("src/tele_mess_core/__init__.py").read_text(encoding="utf-8")
+          init_match = re.search(r'^__version__\s*=\s*["\']([^"\']+)["\']', init_text, re.MULTILINE)
+          if init_match is None or init_match.group(1) != project_version:
+              raise SystemExit("src/tele_mess_core/__init__.py version does not match pyproject.toml")
+
+          api_text = Path("src/tele_mess_core/server/api.py").read_text(encoding="utf-8")
+          api_match = re.search(r'server_version\s*=\s*["\']tele-mess-core/([^"\']+)["\']', api_text)
+          if api_match is None or api_match.group(1) != project_version:
+              raise SystemExit("HTTP server version does not match pyproject.toml")
+
+          changelog = Path("CHANGELOG.md").read_text(encoding="utf-8")
+          if f"## {project_version} -" not in changelog:
+              raise SystemExit(f"CHANGELOG.md has no dated {project_version} release section")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              print(f"version={project_version}", file=output)
+          print(f"release metadata is consistent for {release_tag}")
+          PY
+
+      - name: Install project and release tools
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install . build twine
+
+      - name: Run the full test suite
+        run: python -m unittest discover -s tests -v
+
+      - name: Check generated API documentation
+        run: tele-mess-core generate-api-docs --check
+
+      - name: Compile Python sources
+        run: python -m compileall -q src tests
+
+      - name: Build source and wheel distributions
+        run: python -m build
+
+      - name: Validate distribution metadata
+        run: python -m twine check dist/*
+
+      - name: Smoke-test the built wheel
+        run: |
+          python -m venv /tmp/tele-mess-core-wheel-smoke
+          /tmp/tele-mess-core-wheel-smoke/bin/python -m pip install dist/*.whl
+          /tmp/tele-mess-core-wheel-smoke/bin/tele-mess-core run-local --help
+
+      - name: Upload distributions
+        uses: actions/upload-artifact@v7
+        with:
+          name: python-distributions-${{ steps.version.outputs.version }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 14
+
+  publish:
+    name: Publish to PyPI
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: pypi
+      url: https://pypi.org/project/tele-mess-core/${{ needs.build.outputs.version }}/
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - name: Download distributions
+        uses: actions/download-artifact@v8
+        with:
+          name: python-distributions-${{ needs.build.outputs.version }}
+          path: dist/
+
+      - name: Publish distributions with Trusted Publishing
+        uses: pypa/gh-action-pypi-publish@release/v1

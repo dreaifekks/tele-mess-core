@@ -93,6 +93,7 @@ class DailyAiConfig:
         ]
     )
     timeout_seconds: int = 900
+    work_dir: Path | None = None
     fallback: DailyAiFallbackConfig = field(default_factory=DailyAiFallbackConfig)
 
 
@@ -121,30 +122,36 @@ class AppConfig:
     logging: LoggingConfig
     daily: DailyPackagingConfig = field(default_factory=DailyPackagingConfig)
     config_path: Path | None = None
+    workspace_dir: Path | None = None
 
 
-def load_config(path: str | Path) -> AppConfig:
-    config_path = Path(path)
+def load_config(path: str | Path, *, workspace_dir: str | Path | None = None) -> AppConfig:
+    config_path = Path(path).expanduser()
+    if not config_path.is_absolute():
+        config_path = config_path.resolve()
     with config_path.open("r", encoding="utf-8") as f:
         raw = yaml.safe_load(f) or {}
 
-    base_dir = config_path.parent
+    base_dir = _resolve_workspace_dir(config_path, workspace_dir)
     storage_raw = raw.get("storage", {})
     telegram_raw = raw.get("telegram", {})
     server_raw = raw.get("server", {})
     logging_raw = raw.get("logging", {})
     daily_raw = raw.get("daily", {})
 
-    telegram = TelegramConfig(
-        accounts=_parse_accounts(base_dir, telegram_raw),
-        backfill=_parse_backfill(telegram_raw.get("backfill", {})),
-        media_download=_parse_media_download(telegram_raw.get("media_download", {})),
-    )
-
     storage = StorageConfig(
         data_dir=_resolve_path(base_dir, storage_raw.get("data_dir", "./data")),
         database=_resolve_path(base_dir, storage_raw.get("database", "./data/archive.db")),
         raw_json_retention_days=max(1, int(storage_raw.get("raw_json_retention_days", 7))),
+    )
+    telegram = TelegramConfig(
+        accounts=_parse_accounts(
+            base_dir,
+            telegram_raw,
+            default_session_dir=_resolve_path(base_dir, "./data/sessions"),
+        ),
+        backfill=_parse_backfill(telegram_raw.get("backfill", {})),
+        media_download=_parse_media_download(telegram_raw.get("media_download", {})),
     )
     server = ServerConfig(
         host=str(server_raw.get("host", "127.0.0.1")),
@@ -167,33 +174,56 @@ def load_config(path: str | Path) -> AppConfig:
         logging=logging_config,
         daily=daily,
         config_path=config_path.resolve(),
+        workspace_dir=base_dir,
     )
 
 
-def _parse_accounts(base_dir: Path, telegram_raw: dict[str, Any]) -> list[TelegramAccountConfig]:
+def _parse_accounts(
+    base_dir: Path,
+    telegram_raw: dict[str, Any],
+    *,
+    default_session_dir: Path,
+) -> list[TelegramAccountConfig]:
     raw_accounts = telegram_raw.get("accounts")
     if raw_accounts:
-        return [_parse_account(base_dir, item, index) for index, item in enumerate(raw_accounts)]
+        return [
+            _parse_account(base_dir, item, index, default_session_dir=default_session_dir)
+            for index, item in enumerate(raw_accounts)
+        ]
     return [
         TelegramAccountConfig(
             account_id=str(telegram_raw.get("account_id", "default")),
             api_id=int(_required(telegram_raw, "api_id", "telegram.api_id")),
             api_hash=str(_required(telegram_raw, "api_hash", "telegram.api_hash")),
             session_name=str(telegram_raw.get("session_name", "tele_mess_core")),
-            session_dir=_resolve_path(base_dir, telegram_raw.get("session_dir", "./data/sessions")),
+            session_dir=(
+                _resolve_path(base_dir, telegram_raw["session_dir"])
+                if telegram_raw.get("session_dir")
+                else default_session_dir
+            ),
             timezone=str(telegram_raw.get("timezone", "Asia/Tokyo")),
         )
     ]
 
 
-def _parse_account(base_dir: Path, item: dict[str, Any], index: int) -> TelegramAccountConfig:
+def _parse_account(
+    base_dir: Path,
+    item: dict[str, Any],
+    index: int,
+    *,
+    default_session_dir: Path,
+) -> TelegramAccountConfig:
     account_id = str(item.get("account_id") or item.get("id") or f"account_{index + 1}")
     return TelegramAccountConfig(
         account_id=account_id,
         api_id=int(_required(item, "api_id", f"telegram.accounts[{index}].api_id")),
         api_hash=str(_required(item, "api_hash", f"telegram.accounts[{index}].api_hash")),
         session_name=str(item.get("session_name") or account_id),
-        session_dir=_resolve_path(base_dir, item.get("session_dir", "./data/sessions")),
+        session_dir=(
+            _resolve_path(base_dir, item["session_dir"])
+            if item.get("session_dir")
+            else default_session_dir
+        ),
         timezone=str(item.get("timezone", "Asia/Tokyo")),
     )
 
@@ -210,6 +240,27 @@ def _resolve_path(base_dir: Path, value: str | Path) -> Path:
     if path.is_absolute():
         return path
     return (base_dir / path).resolve()
+
+
+def _resolve_workspace_dir(config_path: Path, workspace_dir: str | Path | None) -> Path:
+    if workspace_dir is None:
+        return config_path.parent.resolve()
+    path = Path(workspace_dir).expanduser()
+    if path.is_absolute():
+        return path.resolve()
+    return (Path.cwd() / path).resolve()
+
+
+def app_workspace_dir(config: AppConfig) -> Path:
+    if config.workspace_dir is not None:
+        return config.workspace_dir
+    if config.config_path is not None:
+        return config.config_path.parent.resolve()
+    return Path.cwd().resolve()
+
+
+def resolve_workspace_path(config: AppConfig, value: str | Path) -> Path:
+    return _resolve_path(app_workspace_dir(config), value)
 
 
 def _parse_backfill(raw: Any) -> BackfillConfig:
@@ -270,6 +321,7 @@ def _parse_daily_ai(base_dir: Path, raw: Any) -> DailyAiConfig:
         model=str(raw.get("model", "gpt-5.6-sol") or "gpt-5.6-sol"),
         command=command_list,
         timeout_seconds=max(1, int(raw.get("timeout_seconds", 900))),
+        work_dir=_resolve_path(base_dir, raw["work_dir"]) if raw.get("work_dir") else None,
         fallback=_parse_daily_ai_fallback(base_dir, raw.get("fallback", {})),
     )
 

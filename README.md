@@ -11,9 +11,10 @@ selection, capture policy, topics, and participant metadata through the core API
 It intentionally does not forward messages to backup Telegram groups. Daily
 package generation and local Codex-backed daily summaries run as local jobs
 against the archive. See
-[docs/product-direction.md](docs/product-direction.md) for the management
-interface direction and [docs/daily-packaging.md](docs/daily-packaging.md) for
-daily package and AI analysis details.
+[product direction](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/product-direction.md)
+for the management interface direction and
+[daily packaging](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md)
+for daily package and AI analysis details.
 
 ## Current Scope
 
@@ -30,7 +31,9 @@ daily package and AI analysis details.
 - Live origin discovery and participant refresh endpoints for authenticated
   Telegram sessions.
 - Runtime operation events for Telegram auth/discovery/media-download failures.
-- Server daemon mode for devNuc-style always-on deployment.
+- Server daemon mode for an always-on Linux deployment.
+- macOS-oriented local CLI mode with durable jobs and no HTTP listener by
+  default.
 - Daily package generation by origin, tag group, timezone, and local date.
 - Local Codex-backed daily analysis with important-origin full-context reports,
   all-origin structured message points, and point-based daily digests.
@@ -41,7 +44,47 @@ daily package and AI analysis details.
 - Optional raw Telegram JSON retention cleanup for keeping the SQLite archive
   compact while preserving structured message rows.
 
-## Quick Start
+## Run from PyPI with uvx
+
+[`uvx`](https://docs.astral.sh/uv/guides/tools/) installs the published package
+and its Python dependencies into an isolated cache, then runs the
+`tele-mess-core` command. It does not clone the repository into the current
+directory, and runtime state remains in the selected workspace rather than the
+tool environment.
+
+Once a release is available on PyPI and the Mac workspace contains a valid
+`config.yml`, the local core is one command:
+
+```bash
+uvx tele-mess-core run-local
+```
+
+Use the same stable workspace across invocations, or select one explicitly:
+
+```bash
+uvx tele-mess-core run-local \
+  --workspace "$HOME/Library/Application Support/tele-mess-core-personal"
+```
+
+For a reproducible launcher, pin the distribution while keeping the executable
+name explicit:
+
+```bash
+uvx --from "tele-mess-core==X.Y.Z" tele-mess-core run-local
+```
+
+Maintainers can find the tag and Trusted Publishing process in the
+[release guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/releasing.md).
+
+A fresh machine still needs Telegram API credentials and a local configuration
+before `run-local` can ingest messages. In the macOS product, `mess-end` owns
+that first-run UI and drives the core management/auth API for code/2FA login,
+origin discovery, and capture-policy management; these are intentionally not
+duplicated as interactive core CLI setup. A standalone operator may enable
+`run-local --web` temporarily as a fallback. The normal local runtime keeps HTTP
+disabled.
+
+## Source Checkout
 
 ```bash
 python3 -m venv .venv
@@ -53,10 +96,45 @@ tele-mess-core smoke-telegram --config config.yml
 tele-mess-core run-server --config config.yml
 ```
 
-The first Telethon run may ask for Telegram login if no session file exists.
-See [docs/server-mode.md](docs/server-mode.md) for the devNuc-style deployment
-shape and client sync contract. See [docs/daily-packaging.md](docs/daily-packaging.md)
+If no authorized Telegram session exists, use the built-in console while
+`run-server` is active to request a login code and submit code/2FA credentials.
+See the
+[server-mode guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/server-mode.md)
+for the always-on deployment shape and client sync contract. See the
+[daily-packaging guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md)
 for the daily packaging, scheduling, and staged AI analysis workflow.
+
+## macOS Local Mode
+
+`run-local` starts Telegram ingestion plus the durable daily worker without
+starting the HTTP API or web console. On macOS its default workspace is
+`~/Library/Application Support/tele-mess-core`, so it does not depend on the
+Terminal or launcher current directory.
+
+```bash
+mkdir -p "$HOME/Library/Application Support/tele-mess-core"
+cp config.example.yml "$HOME/Library/Application Support/tele-mess-core/config.yml"
+tele-mess-core paths
+tele-mess-core run-local
+```
+
+Use `--workspace PATH` (alias `--work-dir`),
+`TELE_MESS_CORE_WORKSPACE`, or `TELE_MESS_CORE_HOME` to select another stable
+instance root. `TELE_MESS_CORE_CONFIG` or an explicit `--config` selects a
+specific config. `tele-mess-core paths` prints the resolved non-secret paths
+without opening the database.
+
+HTTP remains opt-in in local mode:
+
+```bash
+tele-mess-core run-local --web
+```
+
+This enables the existing API and `/console`; it never opens a browser
+automatically. See the
+[local-mode guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/local-mode.md)
+for precedence, path semantics, first-login limitations, and configuration
+examples.
 
 Use `telegram.accounts[]` for multi-account auth/runtime configuration. Message
 capture sources are managed in SQLite through origin discovery plus backup
@@ -250,6 +328,22 @@ The server is responsible for durable collection, sync, capture-management
 state, daily packaging, and local daily analysis jobs. Client-side features such
 as labels and app-specific UI state should live in the Mac app.
 
+`mess-end` is the host-facing manager, while `tele-mess-core` remains an
+independently runnable engine:
+
+| Owner | Responsibilities |
+| --- | --- |
+| `tele-mess-core` | Telegram sessions, SQLite schema and migrations, ingestion, capture policy, daily jobs, delivery, and optional HTTP/API service. |
+| `mess-end` | Version selection and installation, workspace selection, first-run UI, process start/stop/status, updates, and macOS LaunchAgent integration. |
+
+`mess-end` should use the public CLI and management API rather than importing
+internal Python modules or modifying the archive database directly. It should
+also enforce one core process per workspace: `run-local` and `run-server` must
+not own the same Telegram sessions and SQLite archive simultaneously. For a
+persistent managed installation, `mess-end` should point LaunchAgent at a
+stable, pinned executable rather than an incidental `uvx` cache path.
+
 ## License
 
-Apache-2.0. See [LICENSE](LICENSE).
+Apache-2.0. See the
+[license](https://github.com/dreaifekks/tele-mess-core/blob/master/LICENSE).

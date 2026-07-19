@@ -15,6 +15,22 @@ durable delayed AI retries, queryable daily message points, and stored daily
 summary content records.
 Client-specific UI state and labels belong outside the core.
 
+## Runtime Modes
+
+- `run-server` owns Telegram ingestion, durable daily jobs, and the HTTP API
+  including `/console`; keep this behavior compatible with existing systemd
+  deployments.
+- `run-local` owns Telegram ingestion and durable daily jobs but does not create
+  an HTTP listener unless `--web` is supplied.
+- `run-telegram` is the ingestion-only debugging path, and `serve-api` is the
+  HTTP-plus-worker debugging path.
+- Local workspace discovery and environment precedence live in
+  `runtime_paths.py`. Do not use process-wide `chdir()`; resolve managed paths
+  against `AppConfig.workspace_dir`.
+- On macOS the local default workspace is
+  `~/Library/Application Support/tele-mess-core`. Use `tele-mess-core paths` to
+  inspect effective non-secret paths without initializing SQLite.
+
 ## API Contract Workflow
 
 `src/tele_mess_core/server/contracts.py` is the source of truth for HTTP

@@ -21,6 +21,7 @@ from tele_mess_core.config import (
     TelegramConfig,
 )
 from tele_mess_core.models import (
+    CaptureCursorRecord,
     ChatRecord,
     DailyMessagePointRecord,
     DailySummaryRunRecord,
@@ -849,8 +850,25 @@ class SyncApiTest(unittest.TestCase):
         participants = self.request_json("/manage/participants?account_id=main&origin_id=-1001")["items"]
         self.assertEqual(participants[0]["display_name"], "Alice")
 
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                observed_max_message_id=12,
+                history_scanned_through_id=10,
+                backfill_head_message_id=12,
+                backfill_status="running",
+                backfill_count=10,
+            )
+        )
         cursors = self.request_json("/manage/capture-cursors?account_id=main")["items"]
-        self.assertEqual(cursors, [])
+        self.assertEqual(len(cursors), 1)
+        self.assertEqual(cursors[0]["observed_max_message_id"], 12)
+        self.assertEqual(cursors[0]["history_scanned_through_id"], 10)
+        self.assertEqual(cursors[0]["backfill_head_message_id"], 12)
+        self.assertEqual(cursors[0]["backfill_status"], "running")
+        self.assertEqual(cursors[0]["backfill_count"], 10)
 
         capabilities = self.request_json("/manage/capabilities")
         self.assertIn("origin_registry", capabilities["management"])
@@ -956,7 +974,12 @@ class SyncApiTest(unittest.TestCase):
         self.request_json(
             "/manage/accounts",
             method="POST",
-            payload={"account_id": "second", "display_name": "Second", "session_name": "second-main"},
+            payload={
+                "account_id": "second",
+                "display_name": "Second",
+                "session_name": "second-main",
+                "session_dir": "managed-sessions",
+            },
         )
 
         account = _account_config(config, self.store, "second")
@@ -965,7 +988,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(account.api_id, 12345)
         self.assertEqual(account.api_hash, "hash")
         self.assertEqual(account.session_name, "second-main")
-        self.assertEqual(account.session_dir, session_dir)
+        self.assertEqual(account.session_dir, Path(self.tmp.name) / "managed-sessions")
 
 
 if __name__ == "__main__":

@@ -136,6 +136,8 @@ The default AI provider is a local Codex command template:
 daily:
   ai:
     provider: "codex-cli"
+    # Optional cwd for the external AI process. Defaults to storage.data_dir.
+    work_dir: "./data/ai-work"
     model: "gpt-5.6-sol"
     command:
       - "codex"
@@ -165,6 +167,10 @@ Recognized direct `codex exec` commands from older configs receive missing
 model and output-schema flags automatically. Custom wrapper commands should
 include the placeholders explicitly.
 
+`daily.ai.work_dir` is resolved like other configured paths and controls only
+the Codex/fallback subprocess current directory. It does not change the config,
+database, session, or output path roots.
+
 An optional fallback is activated only after the Codex CLI returns a confirmed
 usage-limit error. Once activated, the rest of that summary run goes directly
 to the fallback instead of repeatedly starting Codex:
@@ -185,10 +191,11 @@ daily:
       supports_json_schema: false
 ```
 
-`api_key_file` is resolved relative to the main config file and must remain
-untracked with restrictive local permissions. The key and Authorization header
-are never included in job requests, dedupe keys, provider errors, or API
-responses. The fallback uses the OpenAI Responses shape. When server-enforced
+`api_key_file` is resolved from the selected workspace, or from the main config
+directory when no workspace override is used, and must remain untracked with
+restrictive local permissions. The key and Authorization header are never
+included in job requests, dedupe keys, provider errors, or API responses. The
+fallback uses the OpenAI Responses shape. When server-enforced
 JSON Schema is unavailable, the schema is appended to the prompt and message
 points are still checked by the local validator before persistence.
 

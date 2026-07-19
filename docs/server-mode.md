@@ -1,6 +1,6 @@
 # Server Mode
 
-Server mode runs `tele-mess-core` on an always-on host such as devNuc.
+Server mode runs `tele-mess-core` on an always-on Linux host.
 
 The server owns Telegram collection, durable storage, and capture-management
 state. A Mac client connects over LAN or Tailscale and uses the HTTP API for
@@ -72,8 +72,8 @@ Copy `config.example.yml` to `config.yml` and edit:
 
 ```yaml
 storage:
-  data_dir: "/home/dreaife/.local/share/tele-mess-core"
-  database: "/home/dreaife/.local/share/tele-mess-core/archive.db"
+  data_dir: "~/.local/share/tele-mess-core"
+  database: "~/.local/share/tele-mess-core/archive.db"
 
 telegram:
   backfill:
@@ -88,12 +88,12 @@ telegram:
       api_id: 123456
       api_hash: "your_api_hash_here"
       session_name: "main"
-      session_dir: "/home/dreaife/.local/share/tele-mess-core/sessions"
+      session_dir: "~/.local/share/tele-mess-core/sessions"
     - account_id: "alt"
       api_id: 654321
       api_hash: "another_api_hash_here"
       session_name: "alt"
-      session_dir: "/home/dreaife/.local/share/tele-mess-core/sessions"
+      session_dir: "~/.local/share/tele-mess-core/sessions"
 
 server:
   host: "127.0.0.1"
@@ -102,12 +102,12 @@ server:
   allow_unauthenticated_localhost: false
 
 logging:
-  file: "/home/dreaife/.local/state/tele-mess-core/tele-mess-core.log"
+  file: "~/.local/state/tele-mess-core/tele-mess-core.log"
 
 daily:
-  output_dir: "/home/dreaife/.local/share/tele-mess-core/daily-packages"
-  systemd_user_dir: "/home/dreaife/.config/systemd/user"
-  cli_path: "/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core"
+  output_dir: "~/.local/share/tele-mess-core/daily-packages"
+  systemd_user_dir: "~/.config/systemd/user"
+  cli_path: "tele-mess-core"
   ai:
     provider: "codex-cli"
     model: "gpt-5.6-sol"

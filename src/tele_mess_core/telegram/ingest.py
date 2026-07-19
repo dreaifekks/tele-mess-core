@@ -47,23 +47,40 @@ class TelegramArchiveService:
         self.logger = logging.getLogger(__name__)
         self.client = None
         self._handlers_registered = False
+        self._backfill_lock = asyncio.Lock()
+        self._retry_targets: set[CaptureTarget] = set()
+        self._retry_task: asyncio.Task[None] | None = None
+        self._backfill_retry_wait_seconds = 5.0
+        self._closed = False
 
     async def run(self) -> None:
         from telethon import TelegramClient
 
         self.config.session_dir.mkdir(parents=True, exist_ok=True)
         session_file = self.config.session_dir / self.config.session_name
-        client = TelegramClient(str(session_file), self.config.api_id, self.config.api_hash)
+        client = TelegramClient(
+            str(session_file),
+            self.config.api_id,
+            self.config.api_hash,
+            catch_up=True,
+            sequential_updates=True,
+        )
         self.client = client
+        self.register_handlers(client)
         try:
             await client.start()
-            await self.attach(client)
+            await self.activate(client)
             await client.run_until_disconnected()
         finally:
+            await self.stop()
             if client.is_connected():
                 await client.disconnect()
 
     async def attach(self, client: Any) -> None:
+        self.register_handlers(client)
+        await self.activate(client)
+
+    def register_handlers(self, client: Any) -> None:
         from telethon import TelegramClient, events, utils
         from telethon.tl.types import MessageService, UpdateMessageReactions
 
@@ -73,28 +90,6 @@ class TelegramArchiveService:
         self.client = client
         if self._handlers_registered:
             return
-        if not await client.is_user_authorized():
-            raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
-        now = utc_now_iso()
-        self.store.upsert_account(
-            AccountRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                display_name=self.account_id,
-                kind="telegram",
-                updated_at=now,
-            )
-        )
-        self.store.upsert_account_auth(
-            AccountAuthRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                auth_state="authorized",
-                session_name=self.config.session_name,
-                session_dir=str(self.config.session_dir),
-                updated_at=now,
-            )
-        )
 
         @client.on(events.NewMessage())
         async def on_new(event: Any) -> None:
@@ -144,6 +139,34 @@ class TelegramArchiveService:
             )
 
         self._handlers_registered = True
+
+    async def activate(self, client: Any) -> None:
+        self.register_handlers(client)
+        if not await client.is_user_authorized():
+            raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
+        now = utc_now_iso()
+        self.store.upsert_account(
+            AccountRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                display_name=self.account_id,
+                kind="telegram",
+                updated_at=now,
+            )
+        )
+        self.store.upsert_account_auth(
+            AccountAuthRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                auth_state="authorized",
+                session_name=self.config.session_name,
+                session_dir=str(self.config.session_dir),
+                updated_at=now,
+            )
+        )
+        catch_up = getattr(client, "catch_up", None)
+        if callable(catch_up):
+            await catch_up()
         await self.refresh_capture_targets()
 
     async def refresh_capture_targets(self) -> None:
@@ -153,7 +176,47 @@ class TelegramArchiveService:
             self.account_id,
             len(capture_targets),
         )
-        await self._backfill_capture_targets(capture_targets)
+        failed_targets = await self._backfill_capture_targets(capture_targets)
+        self._schedule_backfill_retry(failed_targets)
+
+    async def stop(self) -> None:
+        self._closed = True
+        self._retry_targets.clear()
+        task = self._retry_task
+        self._retry_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    def _schedule_backfill_retry(self, targets: list[CaptureTarget]) -> None:
+        if self._closed or not targets:
+            return
+        self._retry_targets.update(targets)
+        if self._retry_task is not None and not self._retry_task.done():
+            return
+        self._retry_task = asyncio.create_task(
+            self._retry_failed_backfills(),
+            name=f"telegram-backfill-retry-{self.account_id}",
+        )
+
+    async def _retry_failed_backfills(self) -> None:
+        delay = max(5.0, self._backfill_retry_wait_seconds)
+        try:
+            while self._retry_targets and not self._closed:
+                await asyncio.sleep(delay)
+                self._backfill_retry_wait_seconds = 5.0
+                targets = list(self._retry_targets)
+                self._retry_targets.clear()
+                failed_targets = await self._backfill_capture_targets(targets)
+                self._retry_targets.update(failed_targets)
+                delay = max(min(delay * 2, 300.0), self._backfill_retry_wait_seconds)
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._retry_task is asyncio.current_task():
+                self._retry_task = None
+            if self._retry_targets and not self._closed:
+                self._schedule_backfill_retry(list(self._retry_targets))
 
     def _capture_targets(self) -> list[CaptureTarget]:
         targets: list[CaptureTarget] = []
@@ -244,7 +307,17 @@ class TelegramArchiveService:
         )
         self.store.upsert_message(record, event_type=event_type)
         if policy.get("download_media", False) and _message_media_downloadable(message):
-            await self._download_message_media(message, record)
+            existing_media = (
+                self.store.list_media_files(
+                    account_id=self.account_id,
+                    chat_id=record.chat_id,
+                    message_id=record.message_id,
+                )
+                if event_type == "backfill"
+                else []
+            )
+            if not existing_media:
+                await self._download_message_media(message, record)
         self._update_capture_cursor(chat_id, topic_id, int(message.id), record.sent_at)
         return True
 
@@ -316,13 +389,18 @@ class TelegramArchiveService:
             )
 
 
-    async def _backfill_capture_targets(self, targets: list[CaptureTarget]) -> None:
+    async def _backfill_capture_targets(self, targets: list[CaptureTarget]) -> list[CaptureTarget]:
+        async with self._backfill_lock:
+            return await self._backfill_capture_targets_locked(targets)
+
+    async def _backfill_capture_targets_locked(self, targets: list[CaptureTarget]) -> list[CaptureTarget]:
         if not self.backfill.enabled or not targets:
-            return
+            return []
         from telethon.tl.types import MessageService
 
         targets = _dedupe_capture_targets(targets)
         root_chat_ids = {target.chat_id for target in targets if target.topic_id == 0}
+        failed_targets: list[CaptureTarget] = []
         for target in targets:
             if target.topic_id and target.chat_id in root_chat_ids:
                 continue
@@ -335,6 +413,11 @@ class TelegramArchiveService:
                     target.topic_id,
                 )
                 continue
+            history_scanned_through_id = 0
+            backfill_head_message_id: int | None = None
+            count = 0
+            last_message_at: str | None = None
+            cursor_status = ""
             try:
                 cursor = self.store.get_capture_cursor(
                     SOURCE_TELEGRAM,
@@ -342,46 +425,118 @@ class TelegramArchiveService:
                     target.chat_id,
                     target.topic_id,
                 )
-                min_id = int(cursor["last_message_id"]) if cursor else 0
-                limit = self.backfill.catch_up_limit if min_id else self.backfill.initial_limit
-                limit_arg = None if limit <= 0 else limit
-                count = 0
-                last_message_id = min_id
+                history_scanned_through_id = (
+                    int(cursor.get("history_scanned_through_id") or 0) if cursor else 0
+                )
                 last_message_at = cursor.get("last_message_at") if cursor else None
+                cursor_status = str(cursor.get("backfill_status") or "") if cursor else ""
+                backfill_head_message_id = await self._remote_history_head(target)
+                migration_rescan_pending = cursor_status.startswith("migration_rescan")
+                is_initial_backfill = not migration_rescan_pending and (
+                    history_scanned_through_id == 0
+                    and not (cursor and cursor.get("last_backfill_at"))
+                )
+                mode = (
+                    "migration_rescan"
+                    if migration_rescan_pending
+                    else "initial" if is_initial_backfill else "catch_up"
+                )
                 self.logger.info(
-                    "Backfilling account=%s chat=%s topic=%s min_id=%s limit=%s",
+                    "Backfilling account=%s chat=%s topic=%s scanned_through=%s head=%s mode=%s",
                     self.account_id,
                     target.chat_id,
                     target.topic_id,
-                    min_id,
-                    limit_arg if limit_arg is not None else "unlimited",
+                    history_scanned_through_id,
+                    backfill_head_message_id,
+                    mode,
                 )
-                kwargs: dict[str, Any] = {"min_id": min_id, "reverse": True, "limit": limit_arg}
-                if target.topic_id:
-                    kwargs["reply_to"] = target.topic_id
-                async for message in self.client.iter_messages(target.chat_id, **kwargs):
-                    if isinstance(message, MessageService):
-                        continue
-                    stored = await self._store_message(message, event_type="backfill")
-                    if stored:
-                        last_message_id = max(last_message_id, int(message.id))
-                        last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
-                        count += 1
-                self.store.upsert_capture_cursor(
-                    CaptureCursorRecord(
-                        source=SOURCE_TELEGRAM,
-                        account_id=self.account_id,
-                        origin_id=target.chat_id,
-                        topic_id=target.topic_id,
-                        last_message_id=last_message_id,
-                        last_message_at=last_message_at,
-                        last_backfill_at=utc_now_iso(),
-                        updated_at=utc_now_iso(),
-                        raw_json=json.dumps(
-                            {"count": count, "min_id": min_id, "limit": limit_arg},
-                            ensure_ascii=False,
-                        ),
+                self._save_backfill_cursor(
+                    target,
+                    history_scanned_through_id=history_scanned_through_id,
+                    backfill_head_message_id=backfill_head_message_id,
+                    status="migration_rescan_running" if migration_rescan_pending else "running",
+                    error="",
+                    count=0,
+                    last_message_at=last_message_at,
+                    raw_payload={
+                        "mode": mode,
+                        "head_message_id": backfill_head_message_id,
+                    },
+                )
+
+                if is_initial_backfill and self.backfill.initial_limit > 0:
+                    messages = await self._initial_history_messages(target, backfill_head_message_id)
+                    page_high, page_count, page_last_message_at = await self._store_backfill_page(
+                        messages,
+                        MessageService,
                     )
+                    count += page_count
+                    if page_high:
+                        last_message_at = page_last_message_at or last_message_at
+                    # The initial_limit is an intentional retention boundary. Once
+                    # that newest window succeeds, future runs continue after this
+                    # fixed head instead of walking older history unexpectedly.
+                    history_scanned_through_id = backfill_head_message_id
+                elif backfill_head_message_id <= history_scanned_through_id:
+                    pass
+                else:
+                    page_size = self.backfill.catch_up_limit
+                    limit_arg = page_size if page_size > 0 else 1000
+                    while history_scanned_through_id < backfill_head_message_id:
+                        messages = await self._history_page(
+                            target,
+                            min_id=history_scanned_through_id,
+                            max_id=backfill_head_message_id + 1,
+                            limit=limit_arg,
+                        )
+                        if not messages:
+                            history_scanned_through_id = backfill_head_message_id
+                            break
+                        page_high, page_count, page_last_message_at = await self._store_backfill_page(
+                            messages,
+                            MessageService,
+                        )
+                        if page_high <= history_scanned_through_id:
+                            raise RuntimeError("Telegram history page did not advance its cursor")
+                        history_scanned_through_id = min(page_high, backfill_head_message_id)
+                        count += page_count
+                        last_message_at = page_last_message_at or last_message_at
+                        self._save_backfill_cursor(
+                            target,
+                            history_scanned_through_id=history_scanned_through_id,
+                            backfill_head_message_id=backfill_head_message_id,
+                            status=(
+                                "migration_rescan_running"
+                                if migration_rescan_pending
+                                else "running"
+                            ),
+                            error="",
+                            count=count,
+                            last_message_at=last_message_at,
+                            raw_payload={
+                                "mode": mode,
+                                "head_message_id": backfill_head_message_id,
+                                "page_size": limit_arg,
+                            },
+                        )
+                        if len(messages) < limit_arg:
+                            history_scanned_through_id = backfill_head_message_id
+                            break
+
+                self._save_backfill_cursor(
+                    target,
+                    history_scanned_through_id=history_scanned_through_id,
+                    backfill_head_message_id=backfill_head_message_id,
+                    status="completed",
+                    error="",
+                    count=count,
+                    last_message_at=last_message_at,
+                    completed=True,
+                    raw_payload={
+                        "count": count,
+                        "head_message_id": backfill_head_message_id,
+                        "history_scanned_through_id": history_scanned_through_id,
+                    },
                 )
                 self.logger.info(
                     "Backfilled %s messages for account=%s chat=%s topic=%s",
@@ -403,6 +558,20 @@ class TelegramArchiveService:
                     target.topic_id,
                     error.message,
                 )
+                self._save_backfill_cursor(
+                    target,
+                    history_scanned_through_id=history_scanned_through_id,
+                    backfill_head_message_id=backfill_head_message_id,
+                    status=(
+                        "migration_rescan_failed"
+                        if cursor_status.startswith("migration_rescan")
+                        else "failed"
+                    ),
+                    error=error.message,
+                    count=count,
+                    last_message_at=last_message_at,
+                    raw_payload=error.to_public_dict(),
+                )
                 self._record_operation(
                     "backfill",
                     "failed",
@@ -410,6 +579,127 @@ class TelegramArchiveService:
                     subject_id=_origin_subject_id(target),
                     error=error.to_public_dict(),
                 )
+                if error.code not in {"access_denied", "needs_login"}:
+                    failed_targets.append(target)
+                    if error.retry_after is not None:
+                        self._backfill_retry_wait_seconds = max(
+                            self._backfill_retry_wait_seconds,
+                            float(error.retry_after),
+                        )
+        return failed_targets
+
+    async def _remote_history_head(self, target: CaptureTarget) -> int:
+        kwargs: dict[str, Any] = {"limit": 1}
+        if target.topic_id:
+            kwargs["reply_to"] = target.topic_id
+        get_messages = getattr(self.client, "get_messages", None)
+        if callable(get_messages):
+            result = await get_messages(target.chat_id, **kwargs)
+            messages = _coerce_messages(result)
+        else:
+            messages = []
+            async for message in self.client.iter_messages(target.chat_id, **kwargs):
+                messages.append(message)
+        return max((int(message.id) for message in messages), default=0)
+
+    async def _initial_history_messages(
+        self,
+        target: CaptureTarget,
+        head_message_id: int,
+    ) -> list[Any]:
+        limit = self.backfill.initial_limit
+        limit_arg = None if limit <= 0 else limit
+        kwargs: dict[str, Any] = {
+            "max_id": head_message_id + 1,
+            "limit": limit_arg,
+        }
+        if target.topic_id:
+            kwargs["reply_to"] = target.topic_id
+        get_messages = getattr(self.client, "get_messages", None)
+        if callable(get_messages):
+            result = await get_messages(target.chat_id, **kwargs)
+            messages = _coerce_messages(result)
+        else:
+            messages = []
+            async for message in self.client.iter_messages(target.chat_id, **kwargs):
+                messages.append(message)
+        return sorted(
+            (message for message in messages if int(message.id) <= head_message_id),
+            key=lambda message: int(message.id),
+        )
+
+    async def _history_page(
+        self,
+        target: CaptureTarget,
+        *,
+        min_id: int,
+        max_id: int,
+        limit: int | None,
+    ) -> list[Any]:
+        kwargs: dict[str, Any] = {
+            "min_id": min_id,
+            "max_id": max_id,
+            "reverse": True,
+            "limit": limit,
+        }
+        if target.topic_id:
+            kwargs["reply_to"] = target.topic_id
+        messages: list[Any] = []
+        async for message in self.client.iter_messages(target.chat_id, **kwargs):
+            if min_id < int(message.id) < max_id:
+                messages.append(message)
+        return messages
+
+    async def _store_backfill_page(
+        self,
+        messages: list[Any],
+        message_service_type: type[Any],
+    ) -> tuple[int, int, str | None]:
+        page_high = 0
+        stored_count = 0
+        last_message_at: str | None = None
+        for message in messages:
+            page_high = max(page_high, int(message.id))
+            if isinstance(message, message_service_type):
+                continue
+            stored = await self._store_message(message, event_type="backfill")
+            if stored:
+                stored_count += 1
+                last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
+        return page_high, stored_count, last_message_at
+
+    def _save_backfill_cursor(
+        self,
+        target: CaptureTarget,
+        *,
+        history_scanned_through_id: int,
+        backfill_head_message_id: int | None,
+        status: str,
+        error: str,
+        count: int,
+        last_message_at: str | None,
+        raw_payload: dict[str, Any],
+        completed: bool = False,
+    ) -> None:
+        now = utc_now_iso()
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                origin_id=target.chat_id,
+                topic_id=target.topic_id,
+                last_message_id=0,
+                history_scanned_through_id=history_scanned_through_id,
+                last_message_at=last_message_at,
+                last_backfill_at=now if completed else None,
+                backfill_head_message_id=backfill_head_message_id,
+                backfill_status=status,
+                backfill_error=error,
+                backfill_count=count,
+                updated_at=now,
+                raw_json=json.dumps(raw_payload, ensure_ascii=False),
+            )
+        )
 
     def _policy_for(self, chat_id: int, topic_id: int | None = None) -> dict[str, Any]:
         if topic_id:
@@ -568,6 +858,17 @@ def _dedupe_capture_targets(targets: list[CaptureTarget]) -> list[CaptureTarget]
 
 def _origin_subject_id(target: CaptureTarget) -> str:
     return f"{target.chat_id}/{target.topic_id}" if target.topic_id else str(target.chat_id)
+
+
+def _coerce_messages(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if hasattr(value, "id"):
+        return [value]
+    try:
+        return list(value)
+    except TypeError:
+        return [value]
 
 
 def _message_media_downloadable(message: Any) -> bool:

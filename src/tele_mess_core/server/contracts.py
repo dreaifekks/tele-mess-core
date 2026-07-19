@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-11.1"
+API_CONTRACT_VERSION = "2026-07-19.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -389,8 +389,14 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "origin_id": {"type": "integer"},
             "topic_id": {"type": "integer"},
             "last_message_id": {"type": "integer"},
+            "history_scanned_through_id": {"type": "integer"},
+            "observed_max_message_id": {"type": "integer"},
             "last_message_at": {"type": "string", "nullable": True},
             "last_backfill_at": {"type": "string", "nullable": True},
+            "backfill_head_message_id": {"type": "integer", "nullable": True},
+            "backfill_status": {"type": "string", "nullable": True},
+            "backfill_error": {"type": "string", "nullable": True},
+            "backfill_count": {"type": "integer", "nullable": True},
             "updated_at": {"type": "string", "nullable": True},
             "origin_title": {"type": "string", "nullable": True},
             "raw_json": {"type": "object", "nullable": True},

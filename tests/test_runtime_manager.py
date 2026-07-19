@@ -18,7 +18,7 @@ from tele_mess_core.config import (
     TelegramConfig,
 )
 from tele_mess_core.models import AccountAuthRecord, SOURCE_TELEGRAM
-from tele_mess_core.telegram.manager import TelegramRuntimeManager
+from tele_mess_core.telegram.manager import TelegramRuntimeManager, _default_client_factory
 
 
 class FakeClient:
@@ -46,6 +46,32 @@ class FakeClient:
         return SimpleNamespace(phone_code_hash=f"hash-{phone}")
 
 
+class HandlerAwareClient(FakeClient):
+    def __init__(self, *, fail_catch_up_count: int = 0) -> None:
+        super().__init__(authorized=True)
+        self.handlers: list[object] = []
+        self.handlers_registered_before_connect = False
+        self.catch_up_count = 0
+        self.fail_catch_up_count = fail_catch_up_count
+
+    def on(self, event: object):
+        def register(handler: object) -> object:
+            self.handlers.append(handler)
+            return handler
+
+        return register
+
+    async def connect(self) -> None:
+        self.handlers_registered_before_connect = len(self.handlers) == 4
+        await super().connect()
+
+    async def catch_up(self) -> None:
+        self.catch_up_count += 1
+        if self.fail_catch_up_count > 0:
+            self.fail_catch_up_count -= 1
+            raise RuntimeError("temporary catch-up failure")
+
+
 class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -64,6 +90,7 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
             telegram=TelegramConfig(accounts=[self.account]),
             server=ServerConfig(token="secret"),
             logging=LoggingConfig(file=None),
+            workspace_dir=self.root,
         )
 
     async def asyncTearDown(self) -> None:
@@ -181,6 +208,81 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
                 self.assertTrue(manager.statuses()[0]["ingest_running"])
             finally:
                 await manager.stop()
+
+    async def test_update_handlers_are_registered_before_connect_and_catch_up(self) -> None:
+        client = HandlerAwareClient()
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda config: client,
+        )
+
+        await manager.start()
+        try:
+            await asyncio.wait_for(manager.execute("main", "auth_status"), timeout=1)
+
+            async def wait_until_active() -> None:
+                while not manager.statuses()[0]["ingest_running"]:
+                    await asyncio.sleep(0)
+
+            await asyncio.wait_for(wait_until_active(), timeout=1)
+
+            self.assertTrue(client.handlers_registered_before_connect)
+            self.assertEqual(len(client.handlers), 4)
+            self.assertEqual(client.catch_up_count, 1)
+            self.assertTrue(manager.statuses()[0]["ingest_running"])
+        finally:
+            await manager.stop()
+
+    async def test_failed_activation_reuses_preconnected_handlers_on_retry(self) -> None:
+        client = HandlerAwareClient(fail_catch_up_count=1)
+        with patch("tele_mess_core.telegram.manager.INGEST_RETRY_INITIAL_SECONDS", 0.001):
+            manager = TelegramRuntimeManager(
+                self.config,
+                self.store,
+                client_factory=lambda config: client,
+            )
+
+            await manager.start()
+            try:
+                async def wait_until_recovered() -> None:
+                    while client.catch_up_count < 2 or not manager.statuses()[0]["ingest_running"]:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_until_recovered(), timeout=1)
+
+                self.assertEqual(client.catch_up_count, 2)
+                self.assertEqual(len(client.handlers), 4)
+                self.assertTrue(manager.statuses()[0]["ingest_running"])
+            finally:
+                await manager.stop()
+
+    def test_default_client_enables_telethon_update_recovery(self) -> None:
+        sentinel = object()
+        with patch("telethon.TelegramClient", return_value=sentinel) as constructor:
+            client = _default_client_factory(self.account)
+
+        self.assertIs(client, sentinel)
+        constructor.assert_called_once_with(
+            str(self.account.session_dir / self.account.session_name),
+            self.account.api_id,
+            self.account.api_hash,
+            catch_up=True,
+            sequential_updates=True,
+        )
+
+    async def test_stored_relative_session_dir_is_anchored_to_workspace(self) -> None:
+        manager_account = {
+            "account_id": "saved",
+            "session_name": "saved-main",
+            "session_dir": "managed-sessions",
+        }
+        manager = TelegramRuntimeManager(self.config, self.store, client_factory=lambda item: FakeClient())
+
+        resolved = manager._stored_account_config(manager_account)
+
+        self.assertEqual(resolved.account_id, "saved")
+        self.assertEqual(resolved.session_dir, self.root / "managed-sessions")
 
 
 class ConfiguredAccountSyncTest(unittest.TestCase):

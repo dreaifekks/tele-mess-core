@@ -9,7 +9,7 @@ import threading
 from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig, TelegramAccountConfig
+from tele_mess_core.config import AppConfig, TelegramAccountConfig, resolve_workspace_path
 from tele_mess_core.models import AccountAuthRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
 from tele_mess_core.telegram.auth import TelegramAuthService
 from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
@@ -18,6 +18,7 @@ from tele_mess_core.telegram.ingest import TelegramArchiveService
 
 
 ClientFactory = Callable[[TelegramAccountConfig], Any]
+INGEST_RETRY_INITIAL_SECONDS = 1.0
 
 
 class TelegramAccountRuntime:
@@ -42,7 +43,10 @@ class TelegramAccountRuntime:
         self._stopping = asyncio.Event()
         self._supervisor_task: asyncio.Task[None] | None = None
         self._ingest_task: asyncio.Task[None] | None = None
+        self._ingest_retry_task: asyncio.Task[None] | None = None
         self._ingest_service: TelegramArchiveService | None = None
+        self._ingest_active = False
+        self._ingest_retry_delay = INGEST_RETRY_INITIAL_SECONDS
 
     async def start(self) -> None:
         if self._supervisor_task and not self._supervisor_task.done():
@@ -123,7 +127,7 @@ class TelegramAccountRuntime:
             if operation == "refresh_capture":
                 if not await client.is_user_authorized():
                     return {"account_id": self.config.account_id, "status": "needs_login"}
-                was_attached = self._ingest_service is not None
+                was_attached = self._ingest_active
                 self._schedule_ingestion(client)
                 task = self._ingest_task
                 if task is not None:
@@ -139,7 +143,7 @@ class TelegramAccountRuntime:
             "account_id": self.config.account_id,
             "connected": self._ready.is_set() and self.client is not None,
             "supervisor_running": bool(supervisor and not supervisor.done()),
-            "ingest_running": self._ingest_service is not None,
+            "ingest_running": self._ingest_active,
         }
 
     async def _supervise_connection(self) -> None:
@@ -150,6 +154,8 @@ class TelegramAccountRuntime:
                 client = self.client_factory(self.config)
                 if inspect.isawaitable(client):
                     client = await client
+                if callable(getattr(client, "on", None)):
+                    self._prepare_ingestion(client)
                 await client.connect()
                 self.client = client
                 self._ready.set()
@@ -187,18 +193,34 @@ class TelegramAccountRuntime:
                 if self.client is client:
                     self.client = None
 
-    def _schedule_ingestion(self, client: Any) -> None:
+    def _prepare_ingestion(self, client: Any) -> TelegramArchiveService:
         if self._ingest_service is not None:
-            return
+            return self._ingest_service
         service = TelegramArchiveService(
             self.config,
             self.store,
             self.app_config.telegram.backfill,
             self.app_config.telegram.media_download,
         )
+        register_handlers = getattr(service, "register_handlers", None)
+        if callable(register_handlers):
+            register_handlers(client)
         self._ingest_service = service
+        return service
+
+    def _schedule_ingestion(self, client: Any) -> None:
+        if self._ingest_task is not None:
+            return
+        retry_task = self._ingest_retry_task
+        if retry_task is not None and not retry_task.done():
+            retry_task.cancel()
+        self._ingest_retry_task = None
+        service = self._prepare_ingestion(client)
+        activate = getattr(service, "activate", None)
+        operation = activate(client) if callable(activate) else service.attach(client)
+        self._ingest_active = False
         self._ingest_task = asyncio.create_task(
-            service.attach(client),
+            operation,
             name=f"telegram-ingest-attach-{self.config.account_id}",
         )
         self._ingest_task.add_done_callback(self._ingest_done)
@@ -207,19 +229,55 @@ class TelegramAccountRuntime:
         if task.cancelled() or self._stopping.is_set():
             return
         exc = task.exception()
-        if exc is not None:
-            if self._ingest_task is task:
-                self._ingest_task = None
-            self._ingest_service = None
-            self._record_runtime_failure(exc, operation="ingest_attach")
+        if exc is None:
+            self._ingest_active = True
+            self._ingest_retry_delay = INGEST_RETRY_INITIAL_SECONDS
+            return
+        if self._ingest_task is task:
+            self._ingest_task = None
+        self._ingest_active = False
+        # Keep the service because its handlers were registered before connect.
+        # Retry activation on the same connected client without duplicating
+        # handlers, even when no management client is open to trigger it.
+        self._record_runtime_failure(exc, operation="ingest_attach")
+        client = self.client
+        if client is not None:
+            delay = self._ingest_retry_delay
+            self._ingest_retry_delay = min(max(delay * 2, INGEST_RETRY_INITIAL_SECONDS), 60.0)
+            self._ingest_retry_task = asyncio.create_task(
+                self._retry_ingestion_activation(client, delay),
+                name=f"telegram-ingest-retry-{self.config.account_id}",
+            )
+
+    async def _retry_ingestion_activation(self, client: Any, delay: float) -> None:
+        try:
+            await asyncio.sleep(delay)
+            if self._stopping.is_set() or self.client is not client:
+                return
+            self._ingest_retry_task = None
+            self._schedule_ingestion(client)
+        except asyncio.CancelledError:
+            raise
 
     async def _stop_ingestion(self) -> None:
         task = self._ingest_task
+        retry_task = self._ingest_retry_task
+        service = self._ingest_service
         self._ingest_task = None
+        self._ingest_retry_task = None
         self._ingest_service = None
+        self._ingest_active = False
         if task is not None and not task.done():
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        if retry_task is not None and not retry_task.done():
+            retry_task.cancel()
+            await asyncio.gather(retry_task, return_exceptions=True)
+        stop = getattr(service, "stop", None)
+        if callable(stop):
+            result = stop()
+            if inspect.isawaitable(result):
+                await result
 
     def _record_auth_state(self, state: str, last_error: str | None = None) -> None:
         self.store.upsert_account_auth(
@@ -370,7 +428,11 @@ class TelegramRuntimeManager:
         template = self.config.telegram.accounts[0]
         account_id = str(item["account_id"])
         session_dir_raw = item.get("session_dir")
-        session_dir = Path(str(session_dir_raw)).expanduser() if session_dir_raw else template.session_dir
+        session_dir = (
+            resolve_workspace_path(self.config, str(session_dir_raw))
+            if session_dir_raw
+            else template.session_dir
+        )
         return TelegramAccountConfig(
             account_id=account_id,
             api_id=template.api_id,
@@ -398,4 +460,10 @@ def _default_client_factory(config: TelegramAccountConfig) -> Any:
 
     config.session_dir.mkdir(parents=True, exist_ok=True)
     session_file = config.session_dir / config.session_name
-    return TelegramClient(str(session_file), config.api_id, config.api_hash)
+    return TelegramClient(
+        str(session_file),
+        config.api_id,
+        config.api_hash,
+        catch_up=True,
+        sequential_updates=True,
+    )

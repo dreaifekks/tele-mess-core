@@ -123,11 +123,18 @@ class CaptureCursorRecord:
     account_id: str
     origin_id: int
     topic_id: int = 0
+    # Backward-compatible alias for observed_max_message_id.
     last_message_id: int = 0
     last_message_at: str | None = None
     last_backfill_at: str | None = None
     updated_at: str | None = None
     raw_json: str | None = None
+    history_scanned_through_id: int | None = None
+    observed_max_message_id: int | None = None
+    backfill_head_message_id: int | None = None
+    backfill_status: str | None = None
+    backfill_error: str | None = None
+    backfill_count: int | None = None
 
 
 @dataclass(slots=True)

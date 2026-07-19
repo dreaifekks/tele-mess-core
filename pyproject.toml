@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tele-mess-core"
-version = "0.2.5"
+version = "0.3.0"
 description = "Telegram message archive core with SQLite storage and sync API"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -13,6 +13,12 @@ dependencies = [
   "Telethon>=1.38,<2",
   "PyYAML>=6,<7",
 ]
+
+[project.urls]
+Homepage = "https://github.com/dreaifekks/tele-mess-core"
+Repository = "https://github.com/dreaifekks/tele-mess-core"
+Issues = "https://github.com/dreaifekks/tele-mess-core/issues"
+Changelog = "https://github.com/dreaifekks/tele-mess-core/blob/master/CHANGELOG.md"
 
 [project.scripts]
 tele-mess-core = "tele_mess_core.cli:main"

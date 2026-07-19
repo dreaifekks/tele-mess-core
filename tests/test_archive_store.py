@@ -77,6 +77,113 @@ class ArchiveStoreTest(unittest.TestCase):
         accounts = self.store.list_accounts()
         self.assertEqual(accounts[0]["account_id"], "main")
 
+    def test_stale_backfill_does_not_resurrect_deleted_message(self) -> None:
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=20,
+                sent_at="2026-07-19T00:00:00+00:00",
+                ingested_at="2026-07-19T00:00:01+00:00",
+                text="before delete",
+            ),
+            event_type="new",
+        )
+        self.store.mark_deleted(
+            SOURCE_TELEGRAM,
+            -1001,
+            [20],
+            event_at="2026-07-19T00:00:03+00:00",
+        )
+
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=20,
+                sent_at="2026-07-19T00:00:00+00:00",
+                ingested_at="2026-07-19T00:00:04+00:00",
+                text="stale history copy",
+            ),
+            event_type="backfill",
+        )
+
+        message = self.store.list_latest_messages(limit=1)["items"][0]
+        self.assertEqual(message["deleted_at"], "2026-07-19T00:00:03+00:00")
+
+    def test_stale_backfill_does_not_overwrite_newer_edit_or_reactions(self) -> None:
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=21,
+                sent_at="2026-07-19T00:00:00+00:00",
+                edited_at="2026-07-19T00:00:03+00:00",
+                ingested_at="2026-07-19T00:00:03+00:00",
+                text="new edited text",
+                reactions_json='{"results":["ok"]}',
+                raw_json='{"edit":"new"}',
+            ),
+            event_type="edit",
+        )
+
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=21,
+                sent_at="2026-07-19T00:00:00+00:00",
+                edited_at=None,
+                ingested_at="2026-07-19T00:00:01+00:00",
+                text="old history text",
+                reactions_json=None,
+                raw_json='{"edit":"old"}',
+            ),
+            event_type="backfill",
+        )
+
+        message = self.store.list_latest_messages(limit=1)["items"][0]
+        self.assertEqual(message["text"], "new edited text")
+        self.assertEqual(message["edited_at"], "2026-07-19T00:00:03+00:00")
+        self.assertEqual(message["ingested_at"], "2026-07-19T00:00:03+00:00")
+        self.assertEqual(message["reactions_json"], {"results": ["ok"]})
+        self.assertEqual(message["raw_json"], {"edit": "new"})
+
+    def test_stale_backfill_does_not_overwrite_raw_reaction_update(self) -> None:
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=22,
+                sent_at="2026-07-19T00:00:00+00:00",
+                ingested_at="2026-07-19T00:00:01+00:00",
+                reactions_json='{"count":1}',
+            ),
+            event_type="new",
+        )
+        self.store.update_reactions(
+            SOURCE_TELEGRAM,
+            -1001,
+            22,
+            {"count": 2},
+            event_at="2026-07-19T00:00:03+00:00",
+        )
+
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=22,
+                sent_at="2026-07-19T00:00:00+00:00",
+                ingested_at="2026-07-19T00:00:04+00:00",
+                reactions_json='{"count":1}',
+            ),
+            event_type="backfill",
+        )
+
+        message = self.store.list_latest_messages(limit=1)["items"][0]
+        self.assertEqual(message["reactions_json"], {"count": 2})
+
     def test_each_thread_uses_its_own_sqlite_connection(self) -> None:
         main_connection_id = id(self.store._conn)
         connection_ids: list[int] = []
@@ -474,9 +581,79 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNotNone(cursor)
         assert cursor is not None
         self.assertEqual(cursor["last_message_id"], 10)
+        self.assertEqual(cursor["observed_max_message_id"], 10)
+        self.assertEqual(cursor["history_scanned_through_id"], 0)
+        self.assertEqual(cursor["last_message_at"], "2026-01-01T00:00:01+00:00")
         listed_cursor = self.store.list_capture_cursors(account_id="main")[0]
         self.assertEqual(listed_cursor["origin_id"], -1001)
         self.assertEqual(listed_cursor["origin_title"], "Cursor Chat")
+
+    def test_capture_cursor_watermarks_and_backfill_metadata_merge_monotonically(self) -> None:
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                last_message_id=10,
+                history_scanned_through_id=7,
+                last_message_at="2026-01-02T00:00:00+00:00",
+                last_backfill_at="2026-01-03T00:00:00+00:00",
+                backfill_head_message_id=15,
+                backfill_status="running",
+                backfill_error="temporary failure",
+                backfill_count=3,
+                raw_json='{"phase":"initial"}',
+            )
+        )
+
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                observed_max_message_id=12,
+                last_message_at="2026-01-01T00:00:00+00:00",
+            )
+        )
+        cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, "main", -1001)
+        assert cursor is not None
+        self.assertEqual(cursor["last_message_id"], 12)
+        self.assertEqual(cursor["observed_max_message_id"], 12)
+        self.assertEqual(cursor["history_scanned_through_id"], 7)
+        self.assertEqual(cursor["last_message_at"], "2026-01-02T00:00:00+00:00")
+        self.assertEqual(cursor["last_backfill_at"], "2026-01-03T00:00:00+00:00")
+        self.assertEqual(cursor["backfill_head_message_id"], 15)
+        self.assertEqual(cursor["backfill_status"], "running")
+        self.assertEqual(cursor["backfill_error"], "temporary failure")
+        self.assertEqual(cursor["backfill_count"], 3)
+        self.assertEqual(cursor["raw_json"], {"phase": "initial"})
+
+        self.store.upsert_capture_cursor(
+            CaptureCursorRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1001,
+                history_scanned_through_id=9,
+                observed_max_message_id=8,
+                last_message_at="2026-01-04T00:00:00+00:00",
+                last_backfill_at="2026-01-02T00:00:00+00:00",
+                backfill_head_message_id=14,
+                backfill_status="completed",
+                backfill_error="",
+                backfill_count=5,
+            )
+        )
+        listed = self.store.list_capture_cursors(account_id="main")[0]
+        self.assertEqual(listed["last_message_id"], 12)
+        self.assertEqual(listed["observed_max_message_id"], 12)
+        self.assertEqual(listed["history_scanned_through_id"], 9)
+        self.assertEqual(listed["last_message_at"], "2026-01-04T00:00:00+00:00")
+        self.assertEqual(listed["last_backfill_at"], "2026-01-03T00:00:00+00:00")
+        self.assertEqual(listed["backfill_head_message_id"], 15)
+        self.assertEqual(listed["backfill_status"], "completed")
+        self.assertEqual(listed["backfill_error"], "")
+        self.assertEqual(listed["backfill_count"], 5)
+        self.assertEqual(listed["raw_json"], {"phase": "initial"})
 
     def test_media_files_include_chat_title(self) -> None:
         now = utc_now_iso()
@@ -949,6 +1126,67 @@ class ArchiveStoreTest(unittest.TestCase):
 
 
 class ArchiveMigrationTest(unittest.TestCase):
+    def test_v18_capture_cursor_migration_splits_legacy_watermark_and_marks_rescan(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES('schema_version', '17');
+            PRAGMA user_version = 17;
+            CREATE TABLE capture_cursors (
+              source TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              origin_id INTEGER NOT NULL,
+              topic_id INTEGER NOT NULL DEFAULT 0,
+              last_message_id INTEGER NOT NULL DEFAULT 0,
+              last_message_at TEXT,
+              last_backfill_at TEXT,
+              updated_at TEXT NOT NULL,
+              raw_json TEXT,
+              PRIMARY KEY (source, account_id, origin_id, topic_id)
+            );
+            INSERT INTO capture_cursors(
+              source, account_id, origin_id, topic_id, last_message_id,
+              last_message_at, last_backfill_at, updated_at, raw_json
+            ) VALUES(
+              'telegram', 'main', -1001, 0, 42,
+              '2026-01-02T00:00:00+00:00', '2026-01-03T00:00:00+00:00',
+              '2026-01-03T00:00:00+00:00', '{"count":5}'
+            );
+            """
+        )
+
+        apply_migrations(conn, 17, 18)
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(capture_cursors)")}
+        self.assertTrue(
+            {
+                "history_scanned_through_id",
+                "observed_max_message_id",
+                "backfill_head_message_id",
+                "backfill_status",
+                "backfill_error",
+                "backfill_count",
+            }
+            <= columns
+        )
+        row = conn.execute(
+            """
+            SELECT last_message_id, history_scanned_through_id, observed_max_message_id,
+                   last_message_at, last_backfill_at, raw_json, backfill_status
+            FROM capture_cursors
+            """
+        ).fetchone()
+        assert row is not None
+        self.assertEqual(row[:3], (42, 0, 42))
+        self.assertEqual(row[3], "2026-01-02T00:00:00+00:00")
+        self.assertEqual(row[4], "2026-01-03T00:00:00+00:00")
+        self.assertEqual(row[5], '{"count":5}')
+        self.assertEqual(row[6], "migration_rescan")
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 18)
+        self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "18")
+        conn.close()
+
     def test_v16_retry_migration_sanitizes_codex_usage_limit_errors(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript(
@@ -1046,7 +1284,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 17)
+                self.assertEqual(store.state()["schema_version"], 18)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
@@ -1100,7 +1338,7 @@ class ArchiveMigrationTest(unittest.TestCase):
                 """
             )
 
-            apply_migrations(conn, 12, 17)
+            apply_migrations(conn, 12, 18)
 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
             self.assertTrue(
@@ -1129,10 +1367,10 @@ class ArchiveMigrationTest(unittest.TestCase):
                 conn.execute("SELECT record_type FROM daily_summary_records WHERE summary_id='legacy_summary'").fetchone()[0],
                 "important_origin",
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 17)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 18)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "17",
+                "18",
             )
             self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
 
@@ -1191,7 +1429,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 17)
+                self.assertEqual(store.state()["schema_version"], 18)
                 record = store.get_daily_summary_record(summary_id="legacy_v15")
                 assert record is not None
                 self.assertEqual(record["record_type"], "important_origin")

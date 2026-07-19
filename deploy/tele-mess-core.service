@@ -5,10 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=dreaife
-WorkingDirectory=/home/dreaife/dev/tele-mess-core
+User=tele-mess-core
+WorkingDirectory=/var/lib/tele-mess-core
 Environment=PYTHONUNBUFFERED=1
-ExecStart=/home/dreaife/dev/tele-mess-core/.venv/bin/tele-mess-core run-server --config /home/dreaife/dev/tele-mess-core/config.yml
+ExecStart=/usr/local/bin/tele-mess-core --workspace /var/lib/tele-mess-core --config /etc/tele-mess-core/config.yml run-server
 Restart=always
 RestartSec=10
 StandardOutput=journal
@@ -16,4 +16,3 @@ StandardError=journal
 
 [Install]
 WantedBy=multi-user.target
-

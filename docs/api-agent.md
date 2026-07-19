@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-07-11.1`
-- Contract hash: `afa02c26723109db`
+- Contract version: `2026-07-19.1`
+- Contract hash: `4ef7a958cada8ce2`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`

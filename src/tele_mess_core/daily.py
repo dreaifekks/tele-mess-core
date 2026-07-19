@@ -20,7 +20,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig, DailyDeliveryConfig
+from tele_mess_core.config import AppConfig, DailyDeliveryConfig, app_workspace_dir
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
@@ -2782,14 +2782,15 @@ def _run_codex_provider(
         model=config.daily.ai.model,
         output_schema_path=output_schema_path,
     )
-    config.storage.data_dir.mkdir(parents=True, exist_ok=True)
+    ai_work_dir = _daily_ai_work_dir(config)
+    ai_work_dir.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=str(config.storage.data_dir),
+        cwd=str(ai_work_dir),
         start_new_session=(os.name != "nt"),
     )
     if process_callback:
@@ -2906,19 +2907,21 @@ def _run_openai_fallback_provider(
             "redact_roots": [
                 str(config.storage.data_dir),
                 str(_daily_output_dir(config)),
+                str(_daily_ai_work_dir(config)),
             ],
             "output_schema": output_schema,
         },
         ensure_ascii=False,
     )
-    config.storage.data_dir.mkdir(parents=True, exist_ok=True)
+    ai_work_dir = _daily_ai_work_dir(config)
+    ai_work_dir.mkdir(parents=True, exist_ok=True)
     process = subprocess.Popen(
         command,
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
-        cwd=str(config.storage.data_dir),
+        cwd=str(ai_work_dir),
         start_new_session=(os.name != "nt"),
     )
     if process_callback:
@@ -3183,6 +3186,8 @@ def _systemd_service(config: AppConfig) -> str:
         [
             "/usr/bin/env",
             shlex.quote(config.daily.cli_path),
+            "--workspace",
+            shlex.quote(str(app_workspace_dir(config))),
             "--config",
             shlex.quote(config_path),
             "daily-run",
@@ -3198,7 +3203,7 @@ def _systemd_service(config: AppConfig) -> str:
             "",
             "[Service]",
             "Type=oneshot",
-            f"WorkingDirectory={shlex.quote(str(Path(config_path).parent))}",
+            f"WorkingDirectory={shlex.quote(str(app_workspace_dir(config)))}",
             "Environment=PYTHONUNBUFFERED=1",
             "TimeoutStartSec=0",
             f"ExecStart={exec_start}",
@@ -3231,6 +3236,10 @@ def _daily_output_dir(config: AppConfig) -> Path:
     path = config.daily.output_dir or (config.storage.data_dir / "daily-packages")
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _daily_ai_work_dir(config: AppConfig) -> Path:
+    return config.daily.ai.work_dir or config.storage.data_dir
 
 
 def _resolve_package_date(raw_date: Any, tz: ZoneInfo) -> date_type:

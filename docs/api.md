@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-11.1`
-- Contract hash: `afa02c26723109db`
+- Contract version: `2026-07-19.1`
+- Contract hash: `4ef7a958cada8ce2`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1086,8 +1086,14 @@ Response: `ParticipantRefreshResultResponse`
 | `origin_id` | `integer` | yes |
 | `topic_id` | `integer` | yes |
 | `last_message_id` | `integer` | no |
+| `history_scanned_through_id` | `integer` | no |
+| `observed_max_message_id` | `integer` | no |
 | `last_message_at` | `string` | no |
 | `last_backfill_at` | `string` | no |
+| `backfill_head_message_id` | `integer` | no |
+| `backfill_status` | `string` | no |
+| `backfill_error` | `string` | no |
+| `backfill_count` | `integer` | no |
 | `updated_at` | `string` | no |
 | `origin_title` | `string` | no |
 | `raw_json` | `object` | no |

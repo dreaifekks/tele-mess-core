@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import io
+import shlex
 import sys
 import tempfile
 import time
@@ -671,6 +672,8 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(records[0]["tags_csv"], "point")
 
     def test_schedule_update_writes_systemd_user_timer_files(self) -> None:
+        workspace = self.root / "Mac Workspace"
+        self.config.workspace_dir = workspace
         schedule = update_daily_package_schedule(
             self.store,
             self.config,
@@ -690,6 +693,10 @@ class DailyPackagingTest(unittest.TestCase):
         service_text = service.read_text(encoding="utf-8")
         self.assertIn("daily-run", service_text)
         self.assertIn("TimeoutStartSec=0", service_text)
+        exec_start = next(line.removeprefix("ExecStart=") for line in service_text.splitlines() if line.startswith("ExecStart="))
+        command = shlex.split(exec_start)
+        self.assertEqual(command[command.index("--workspace") + 1], str(workspace))
+        self.assertEqual(command[command.index("--config") + 1], str(self.config.config_path))
 
     def test_topics_group_with_parent_tags_unless_explicitly_different_or_important(self) -> None:
         self._origin(-2001, "Parent Group", "web3,info")

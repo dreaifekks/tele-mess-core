@@ -7,6 +7,7 @@ import subprocess
 from typing import TYPE_CHECKING, Any
 
 from tele_mess_core.archive import ArchiveStore
+from tele_mess_core.config import app_workspace_dir
 from tele_mess_core.models import utc_now_iso
 
 if TYPE_CHECKING:
@@ -130,6 +131,8 @@ def _raw_json_cleanup_service(config: "AppConfig", *, retention_days: int | None
     command = [
         "/usr/bin/env",
         cli_path or config.daily.cli_path,
+        "--workspace",
+        str(app_workspace_dir(config)),
         "--config",
         config_path,
         "cleanup-raw-json",
@@ -146,7 +149,7 @@ def _raw_json_cleanup_service(config: "AppConfig", *, retention_days: int | None
             "",
             "[Service]",
             "Type=oneshot",
-            f"WorkingDirectory={shlex.quote(str(Path(config_path).parent))}",
+            f"WorkingDirectory={shlex.quote(str(app_workspace_dir(config)))}",
             "Environment=PYTHONUNBUFFERED=1",
             f"ExecStart={exec_start}",
             "",

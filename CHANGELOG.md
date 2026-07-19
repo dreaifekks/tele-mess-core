@@ -2,6 +2,23 @@
 
 ## Unreleased
 
+## 0.3.0 - 2026-07-19
+
+- Added a macOS-oriented `run-local` mode that runs Telegram ingestion and the
+  durable daily worker without starting HTTP unless `--web` is supplied.
+- Added stable workspace/config discovery plus a non-mutating `paths` command;
+  macOS local mode defaults to `~/Library/Application Support/tele-mess-core`.
+- Added restart-safe Telegram recovery with Telethon update catch-up, separate
+  live/history cursors, fixed-head paginated backfill, and durable retry state so
+  a newly received message cannot skip content sent while the Mac was offline.
+- Existing capture cursors perform one conservative, paginated full-history
+  reconciliation during the v18 schema upgrade so gaps created by the legacy
+  shared cursor are repaired instead of being treated as complete.
+- Added a tag-driven PyPI Trusted Publishing workflow and documented one-command
+  `uvx tele-mess-core run-local` startup for the macOS client integration.
+- Fixed Telegram error construction on the declared minimum Python 3.11 runtime.
+- Normalized workspace-relative managed session paths and added a configurable
+  `daily.ai.work_dir` for external AI subprocesses.
 - Render daily Telegram summary deliveries with Markdown instead of sending the
   generated Markdown source as plain text; standard headings are adapted to
   Telegram-compatible bold headings while hashtags such as `#point` remain searchable.

@@ -15,7 +15,9 @@ class TelegramOperationError(Exception):
     error_type: str | None = None
 
     def __post_init__(self) -> None:
-        super().__init__(self.message)
+        # dataclass(slots=True) replaces the class object on Python 3.11, which
+        # makes zero-argument super() here reference the pre-replacement class.
+        Exception.__init__(self, self.message)
 
     def to_public_dict(self) -> dict[str, Any]:
         payload: dict[str, Any] = {

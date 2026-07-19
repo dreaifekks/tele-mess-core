@@ -2,7 +2,7 @@
 
 ## Source Bot Shape
 
-- Existing source is on devNuc at `/home/dreaife/dev/infra/group-backup-bot`.
+- Existing source is on the always-on host at `~/dev/infra/group-backup-bot`.
 - Main entrypoint: `telebot/group_backup_bot.py`.
 - Core files:
   - `telebot/group_backup/core.py`
@@ -21,5 +21,4 @@
 
 - Do not copy `.env`, `data/`, `logs/`, `venv/`, `.session`, or real `group_backup_config.yml`.
 - Avoid server-specific defaults like `/data`, `/logs`, `/opt/data`, and `.hermes-docker`.
-- DevNuc deployment can pass explicit config/data/log locations through systemd.
-
+- The always-on deployment can pass explicit config/data/log locations through systemd.

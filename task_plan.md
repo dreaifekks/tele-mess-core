@@ -16,7 +16,7 @@ The primary product surface is the client/core management interface:
 - Cursor-based sync for client-side mirrors and UI state.
 
 The core must also:
-- Keep the original devNuc `group-backup-bot` repo untouched.
+- Keep the original server-side `group-backup-bot` repo untouched.
 - Drop backup-group forwarding from the product center.
 - Keep backup-group forwarding out of scope, while supporting local daily
   package generation and local Codex-backed daily summary jobs.
@@ -34,7 +34,7 @@ The core must also:
 | Sync HTTP API and CLI | complete | Stdlib HTTP server to avoid unnecessary runtime dependencies. |
 | Management API foundation | complete | Account auth state, origin registry, backup policies, participant metadata, capture cursors, live discovery, and participant refresh are exposed over token-protected HTTP endpoints. |
 | Operational hardening | complete | Expected Telegram auth/discovery errors, bounded topic/participant scans, media-download retry/failure tracking, operation-event API, and Telegram smoke CLI are implemented. |
-| Docs/config/deploy template | complete | DevNuc server-mode config and systemd template added. |
+| Docs/config/deploy template | complete | Server-mode config and systemd template added. |
 | Local verification | complete | Unit tests, compileall, CLI help, and Telegram smoke checks are used to verify the core; `/console` smoke test returns 200 while API endpoints keep token protection. |
 
 ## Decisions
@@ -81,17 +81,17 @@ The core must also:
 | Skill path read failed | Tried `.codex/skills/...` path | Re-read from `.agents/skills/...`. |
 | `unittest discover` found 0 tests | Ran discovery without explicit test dir | Used `python3 -m unittest discover -s tests -v`. |
 | Localhost bind denied in sandbox | HTTP API test tried to bind `127.0.0.1:0` | Re-ran tests with approved elevated localhost binding. |
-| DevNuc `tele-mess-core init-db --config config.yml` failed | CLI only accepted global `--config` before subcommands | Added hidden per-subcommand `--config` support so both command orders work. |
+| Server `tele-mess-core init-db --config config.yml` failed | CLI only accepted global `--config` before subcommands | Added hidden per-subcommand `--config` support so both command orders work. |
 
-## DevNuc Deployment Status
+## Server Deployment Status
 
 | Item | Status | Notes |
 | --- | --- | --- |
-| New directory | complete | `/home/dreaife/dev/tele-mess-core` |
+| New directory | complete | `~/dev/tele-mess-core` |
 | Venv/install | complete | `.venv` with editable install and runtime deps |
 | Config | complete | `config.yml` generated from old Telegram API/group config; token not printed |
-| Database | complete | `/home/dreaife/.local/share/tele-mess-core/archive.db` initialized |
-| Unit tests | complete | 22 tests OK on devNuc |
+| Database | complete | `~/.local/share/tele-mess-core/archive.db` initialized |
+| Unit tests | complete | 22 tests OK on the server host |
 | API smoke test | complete | `/console` returns 200 without a token header, `/sync/state` returns 401 without token and 200 with token. |
 | Telegram ingestion | ready | Code supports remote Telegram login and existing-session ingestion; actual start still requires runtime credentials/login code from the operator. |
 

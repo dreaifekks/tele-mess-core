@@ -1,4 +1,6 @@
 storage:
+  # Relative paths use --workspace when supplied; otherwise they use the
+  # directory containing this config file.
   data_dir: "./data"
   database: "./data/archive.db"
   raw_json_retention_days: 7
@@ -6,7 +8,9 @@ storage:
 telegram:
   backfill:
     enabled: true
+    # New accounts retain the newest N messages per capture target (<= 0 means all).
     initial_limit: 1000
+    # Restart catch-up page size, not a total cap; <= 0 uses a safe 1000-message page.
     catch_up_limit: 1000
   media_download:
     retries: 2
@@ -40,6 +44,8 @@ daily:
   cli_path: "tele-mess-core"
   ai:
     provider: "codex-cli"
+    # Optional cwd for Codex/fallback subprocesses. Defaults to storage.data_dir.
+    work_dir: "./data/ai-work"
     # Frontier default used by every AI stage unless this value is overridden.
     model: "gpt-5.6-sol"
     command:

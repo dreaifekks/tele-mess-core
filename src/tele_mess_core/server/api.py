@@ -140,7 +140,7 @@ class SyncApiServer:
         daily_worker = self.daily_worker
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.2.5"
+            server_version = "tele-mess-core/0.3.0"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
@@ -418,7 +418,7 @@ class SyncApiServer:
                     item = _delete_management_account(store, payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth" and method in {"POST", "PATCH"}:
-                    item = _update_account_auth(store, payload)
+                    item = _update_account_auth(config, store, payload)
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth/status" and method == "POST":
                     item = _auth_status(config, store, payload, telegram_runtime)
@@ -867,6 +867,7 @@ def _create_management_account(
             raw_json=raw,
         )
     )
+    session_dir = _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
     store.upsert_account_auth(
         AccountAuthRecord(
             source=source,
@@ -874,7 +875,7 @@ def _create_management_account(
             auth_state=str(payload.get("auth_state") or "pending_auth"),
             phone=_optional_payload_str(payload, "phone"),
             session_name=_optional_payload_str(payload, "session_name") or account_id,
-            session_dir=_optional_payload_str(payload, "session_dir"),
+            session_dir=session_dir,
             updated_at=now,
             raw_json=raw,
         )
@@ -885,7 +886,11 @@ def _create_management_account(
     return item
 
 
-def _update_account_auth(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
+def _update_account_auth(
+    config: "AppConfig | None",
+    store: ArchiveStore,
+    payload: dict[str, Any],
+) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
     now = utc_now_iso()
@@ -896,7 +901,7 @@ def _update_account_auth(store: ArchiveStore, payload: dict[str, Any]) -> dict[s
             auth_state=str(payload.get("auth_state") or payload.get("status") or "pending_auth"),
             phone=_optional_payload_str(payload, "phone"),
             session_name=_optional_payload_str(payload, "session_name"),
-            session_dir=_optional_payload_str(payload, "session_dir"),
+            session_dir=_normalized_session_dir(config, _optional_payload_str(payload, "session_dir")),
             last_error=_optional_payload_str(payload, "last_error"),
             updated_at=now,
             raw_json=_public_raw_json(payload, hidden={"api_hash", "password", "code"}),
@@ -1368,11 +1373,11 @@ def _account_config(
     if stored is None:
         raise ValueError(f"Unknown account_id: {account_id}")
 
-    from tele_mess_core.config import TelegramAccountConfig
+    from tele_mess_core.config import TelegramAccountConfig, resolve_workspace_path
 
     template = config.telegram.accounts[0]
     session_dir_raw = stored.get("session_dir")
-    session_dir = Path(session_dir_raw).expanduser() if session_dir_raw else template.session_dir
+    session_dir = resolve_workspace_path(config, str(session_dir_raw)) if session_dir_raw else template.session_dir
     return TelegramAccountConfig(
         account_id=account_id,
         api_id=template.api_id,
@@ -1381,6 +1386,19 @@ def _account_config(
         session_dir=session_dir,
         timezone=template.timezone,
     )
+
+
+def _normalized_session_dir(config: "AppConfig | None", raw: str | None) -> str | None:
+    if not raw:
+        return None
+    from tele_mess_core.config import resolve_workspace_path
+
+    path = Path(raw).expanduser()
+    if path.is_absolute():
+        return str(path.resolve())
+    if config is None:
+        raise ValueError("session_dir must be absolute when server config is unavailable")
+    return str(resolve_workspace_path(config, path))
 
 
 def _find_account(store: ArchiveStore, source: str, account_id: str) -> dict[str, Any]:
