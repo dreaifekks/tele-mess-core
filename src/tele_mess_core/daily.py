@@ -3192,6 +3192,7 @@ def _systemd_service(config: AppConfig) -> str:
             shlex.quote(config_path),
             "daily-run",
             "--scheduled",
+            "--enqueue-only",
         ]
     )
     return "\n".join(

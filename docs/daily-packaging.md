@@ -339,7 +339,14 @@ tele-mess-core daily-schedule --config config.yml install --activate-systemd
 tele-mess-core daily-schedule --config config.yml remove
 ```
 
-The systemd timer runs `daily-run --scheduled`, so it writes one
+The systemd timer runs `daily-run --scheduled --enqueue-only`. It persists the
+durable job and exits; the long-running core worker then writes one
 `daily_package_runs` row, one `daily_summary_runs` row, independently queryable
-message-point rows, and the important/point daily summary records when the run
-completes.
+message-point rows, and the important/point daily summary records. Keeping
+execution in the core service also makes Telegram delivery reuse the existing
+account runtime instead of opening the same Telethon SQLite session from a
+second process.
+
+The durable worker treats transient SQLite busy/locked errors as recoverable:
+it resets its thread-local connection, backs off, and keeps processing jobs and
+delivery outbox rows.

@@ -108,6 +108,11 @@ def main(argv: list[str] | None = None) -> int:
     daily_run_parser.add_argument("--tags", help="Comma-separated tags that all selected origins must have")
     daily_run_parser.add_argument("--tag-group", action="append", default=[], help="Tag group such as 'web3 info'. Repeatable.")
     daily_run_parser.add_argument("--scheduled", action="store_true", help="Use saved daily package schedule scope/timezone")
+    daily_run_parser.add_argument(
+        "--enqueue-only",
+        action="store_true",
+        help="Persist the durable job and exit so a running core service executes it",
+    )
     daily_run_parser.add_argument("--force", action="store_true", help="Run even when an identical completed job exists")
 
     daily_schedule_parser = sub.add_parser("daily-schedule", help="Install or remove the system daily package timer")
@@ -530,6 +535,19 @@ def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace)
         scope=scope,
         force=bool(args.force),
     )
+    if args.enqueue_only:
+        item = {
+            "status": job.get("status"),
+            "job_id": job.get("job_id"),
+            "package_run_id": job.get("package_run_id"),
+            "summary_run_id": job.get("summary_run_id"),
+            "date": job.get("date"),
+            "timezone": job.get("timezone"),
+            "mode": "enqueue-only",
+            "error": job.get("error"),
+        }
+        print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+        return 1 if item.get("status") in {"failed", "canceled"} else 0
     terminal = worker.wait_for_terminal(str(job["job_id"]), timeout=max(300, config.daily.ai.timeout_seconds * 20))
     package = store.get_daily_package_run(str(terminal.get("package_run_id") or ""))
     summary = store.get_daily_summary_run(str(terminal.get("summary_run_id") or ""))

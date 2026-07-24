@@ -292,6 +292,43 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNotNone(by_id[2]["raw_json"])
         self.assertEqual(self.store.search_messages("old")[0]["message_id"], 1)
 
+    def test_clear_old_message_raw_json_commits_in_batches(self) -> None:
+        for message_id in range(10, 15):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    chat_id=-1001,
+                    message_id=message_id,
+                    sent_at="2026-01-01T00:00:00+00:00",
+                    ingested_at="2026-01-01T00:00:00+00:00",
+                    text=f"old payload {message_id}",
+                    raw_json=f'{{"message_id":{message_id}}}',
+                ),
+                event_type="new",
+            )
+
+        statements: list[str] = []
+        self.store._conn.set_trace_callback(statements.append)
+        try:
+            removed = self.store.clear_message_raw_json_before(
+                "2026-01-07T00:00:00+00:00",
+                batch_size=2,
+            )
+        finally:
+            self.store._conn.set_trace_callback(None)
+
+        self.assertEqual(removed["message_count"], 5)
+        self.assertEqual(
+            sum(statement.strip().upper() == "COMMIT" for statement in statements),
+            3,
+        )
+        self.assertEqual(
+            self.store.message_raw_json_stats(cutoff_sent_at="2026-01-07T00:00:00+00:00")[
+                "message_count"
+            ],
+            0,
+        )
+
     def test_reaction_creates_minimal_message_if_missing(self) -> None:
         self.store.update_reactions(
             SOURCE_TELEGRAM,

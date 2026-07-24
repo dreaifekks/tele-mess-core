@@ -155,7 +155,9 @@ tele-mess-core raw-json-cleanup-schedule --config config.yml install --activate-
 The cleanup timer defaults to `OnCalendar=weekly` and reads
 `storage.raw_json_retention_days`, which defaults to `7`. Add `--vacuum` only
 when you want the SQLite file to shrink immediately; without it, SQLite reuses
-the freed pages for later messages.
+the freed pages for later messages. Cleanup commits eligible rows in bounded
+batches so ingestion and durable job workers are not blocked behind one large
+SQLite write transaction.
 
 ## Sync API
 

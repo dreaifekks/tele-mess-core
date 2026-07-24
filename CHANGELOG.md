@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+## 0.3.1 - 2026-07-24
+
+- Changed the systemd daily timer to enqueue durable jobs for the running core
+  worker instead of opening a second Telegram client against the same Telethon
+  SQLite session.
+- Made the durable daily worker recover with backoff after SQLite lock or loop
+  errors instead of silently losing its background thread.
+- Batched raw JSON retention cleanup commits to avoid one long archive write
+  transaction blocking ingestion and daily job claims.
+
 ## 0.3.0 - 2026-07-19
 
 - Added a macOS-oriented `run-local` mode that runs Telegram ingestion and the

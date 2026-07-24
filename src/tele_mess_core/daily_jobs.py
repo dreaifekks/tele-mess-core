@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import logging
 import sqlite3
 import subprocess
 import threading
@@ -27,6 +28,7 @@ from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
 
 TERMINAL_JOB_STATUSES = {"completed", "failed", "canceled"}
+LOGGER = logging.getLogger(__name__)
 
 
 class DailyJobWorkerStopping(RuntimeError):
@@ -217,13 +219,36 @@ class DailyJobWorker:
             time.sleep(0.05)
 
     def _run_loop(self) -> None:
+        retry_delay = max(0.25, self.poll_interval)
         try:
             while not self._stop_event.is_set():
-                item = self.run_once()
-                delivered = self._deliver_pending_once() if item is None else False
-                if item is None and not delivered:
-                    self._wake_event.wait(self.poll_interval)
+                try:
+                    item = self.run_once()
+                    delivered = self._deliver_pending_once() if item is None else False
+                    retry_delay = max(0.25, self.poll_interval)
+                    if item is None and not delivered:
+                        self._wake_event.wait(self.poll_interval)
+                        self._wake_event.clear()
+                except Exception as exc:
+                    if isinstance(exc, sqlite3.OperationalError) and _is_sqlite_lock_error(exc):
+                        LOGGER.warning(
+                            "Daily job worker hit a transient SQLite lock; retrying in %.2fs: %s",
+                            retry_delay,
+                            exc,
+                        )
+                    else:
+                        LOGGER.exception(
+                            "Daily job worker loop failed; resetting its database connection "
+                            "and retrying in %.2fs",
+                            retry_delay,
+                        )
+                    try:
+                        self.store.close_thread_connection()
+                    except Exception:
+                        LOGGER.exception("Failed to reset the daily job worker database connection")
+                    self._wake_event.wait(retry_delay)
                     self._wake_event.clear()
+                    retry_delay = min(30.0, max(0.5, retry_delay * 2))
         finally:
             self.store.close_thread_connection()
 
@@ -514,3 +539,14 @@ class DailyJobWorker:
                 now=utc_now_iso(),
             )
             return False
+
+
+def _is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:
+    error_code = getattr(exc, "sqlite_errorcode", None)
+    if isinstance(error_code, int) and (error_code & 0xFF) in {
+        sqlite3.SQLITE_BUSY,
+        sqlite3.SQLITE_LOCKED,
+    }:
+        return True
+    message = str(exc).lower()
+    return "database is locked" in message or "database is busy" in message

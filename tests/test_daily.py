@@ -697,6 +697,7 @@ class DailyPackagingTest(unittest.TestCase):
         command = shlex.split(exec_start)
         self.assertEqual(command[command.index("--workspace") + 1], str(workspace))
         self.assertEqual(command[command.index("--config") + 1], str(self.config.config_path))
+        self.assertIn("--enqueue-only", command)
 
     def test_topics_group_with_parent_tags_unless_explicitly_different_or_important(self) -> None:
         self._origin(-2001, "Parent Group", "web3,info")
@@ -846,6 +847,29 @@ daily:
         self.assertEqual(run["status"], "completed")
         self.assertEqual(run["package"]["status"], "completed")
         self.assertEqual(run["summary"]["status"], "completed")
+
+        stdout = io.StringIO()
+        with redirect_stdout(stdout):
+            code = main(
+                [
+                    "--config",
+                    str(config_path),
+                    "daily-run",
+                    "--date",
+                    "2026-07-04",
+                    "--timezone",
+                    "UTC",
+                    "--account-id",
+                    "main",
+                    "--enqueue-only",
+                ]
+            )
+        self.assertEqual(code, 0)
+        queued = json.loads(stdout.getvalue())
+        self.assertEqual(queued["status"], "queued")
+        self.assertEqual(queued["mode"], "enqueue-only")
+        self.assertIsNone(queued["package_run_id"])
+        self.assertIsNone(queued["summary_run_id"])
 
     def test_daily_summary_job_can_cancel_running_provider_process(self) -> None:
         self._origin(-1001, "Cancelable Daily", "web3,info")

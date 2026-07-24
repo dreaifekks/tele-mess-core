@@ -2701,21 +2701,49 @@ class ArchiveStore:
             "raw_json_bytes": int(row["raw_json_bytes"] if row else 0),
         }
 
-    def clear_message_raw_json_before(self, cutoff_sent_at: str) -> dict[str, int]:
+    def clear_message_raw_json_before(
+        self,
+        cutoff_sent_at: str,
+        *,
+        batch_size: int = 10_000,
+    ) -> dict[str, int]:
+        if batch_size < 1:
+            raise ValueError("batch_size must be at least 1")
         before = self.message_raw_json_stats(cutoff_sent_at=cutoff_sent_at)
-        with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE messages
-                SET raw_json = NULL
-                WHERE raw_json IS NOT NULL
-                  AND sent_at < ?
-                """,
-                (cutoff_sent_at,),
-            )
-            self._conn.commit()
+        removed_count = 0
+        last_rowid = 0
+        while True:
+            with self._lock:
+                rows = self._conn.execute(
+                    """
+                    SELECT rowid
+                    FROM messages
+                    WHERE rowid > ?
+                      AND raw_json IS NOT NULL
+                      AND sent_at < ?
+                    ORDER BY rowid
+                    LIMIT ?
+                    """,
+                    (last_rowid, cutoff_sent_at, batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+                first_rowid = int(rows[0]["rowid"])
+                last_rowid = int(rows[-1]["rowid"])
+                cur = self._conn.execute(
+                    """
+                    UPDATE messages
+                    SET raw_json = NULL
+                    WHERE rowid BETWEEN ? AND ?
+                      AND raw_json IS NOT NULL
+                      AND sent_at < ?
+                    """,
+                    (first_rowid, last_rowid, cutoff_sent_at),
+                )
+                self._conn.commit()
+                removed_count += max(cur.rowcount, 0)
         return {
-            "message_count": int(max(cur.rowcount, 0)),
+            "message_count": int(removed_count),
             "raw_json_bytes": before["raw_json_bytes"],
         }
 

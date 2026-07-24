@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 
 
 RAW_JSON_CLEANUP_SYSTEMD_BASENAME = "tele-mess-core-raw-json-cleanup"
+RAW_JSON_CLEANUP_BATCH_SIZE = 10_000
 
 
 def raw_json_cutoff_for_retention(retention_days: int) -> str:
@@ -30,7 +31,10 @@ def cleanup_message_raw_json(
     cutoff_sent_at: str | None = None,
     dry_run: bool = False,
     vacuum: bool = False,
+    batch_size: int = RAW_JSON_CLEANUP_BATCH_SIZE,
 ) -> dict[str, Any]:
+    if batch_size < 1:
+        raise ValueError("batch_size must be at least 1")
     cutoff = cutoff_sent_at or raw_json_cutoff_for_retention(retention_days)
     before_total = store.message_raw_json_stats()
     eligible = store.message_raw_json_stats(cutoff_sent_at=cutoff)
@@ -38,7 +42,7 @@ def cleanup_message_raw_json(
     checkpoint = {"busy": 0, "log": 0, "checkpointed": 0}
     vacuumed = False
     if not dry_run:
-        removed = store.clear_message_raw_json_before(cutoff)
+        removed = store.clear_message_raw_json_before(cutoff, batch_size=batch_size)
         if vacuum:
             store.vacuum()
             vacuumed = True
@@ -48,6 +52,7 @@ def cleanup_message_raw_json(
     return {
         "retention_days": retention_days,
         "cutoff_sent_at": cutoff,
+        "batch_size": batch_size,
         "dry_run": dry_run,
         "vacuum": vacuumed,
         "before": before_total,

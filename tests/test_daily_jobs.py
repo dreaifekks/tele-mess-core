@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import sqlite3
 import tempfile
+import threading
 import unittest
 from datetime import date
 from pathlib import Path
@@ -97,6 +99,29 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertTrue(completed["package_run_id"].startswith("pkg_"))
         self.assertTrue(completed["summary_run_id"].startswith("sum_"))
         self.assertEqual(completed["attempt"], 1)
+
+    def test_worker_recovers_after_transient_sqlite_lock(self) -> None:
+        worker = DailyJobWorker(self.store, self.config, poll_interval=0.01)
+        original_claim = self.store.claim_daily_summary_job
+        recovered = threading.Event()
+        attempts = 0
+
+        def flaky_claim(*args: object, **kwargs: object) -> dict[str, object] | None:
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise sqlite3.OperationalError("database is locked")
+            recovered.set()
+            return original_claim(*args, **kwargs)
+
+        with patch.object(self.store, "claim_daily_summary_job", side_effect=flaky_claim):
+            worker.start()
+            try:
+                self.assertTrue(recovered.wait(2), "worker did not retry after the transient lock")
+            finally:
+                worker.stop()
+
+        self.assertGreaterEqual(attempts, 2)
 
     def test_implicit_date_is_resolved_before_deduplication(self) -> None:
         worker = DailyJobWorker(self.store, self.config)
