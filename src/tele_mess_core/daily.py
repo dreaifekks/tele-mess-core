@@ -768,12 +768,12 @@ def run_daily_summary(
                 )
             )
             if defer_delivery:
-                from tele_mess_core.telegram.delivery import split_telegram_message
+                from tele_mess_core.telegram.delivery import split_telegram_markdown
 
                 pending_chunks = [
                     (kind, chunk)
                     for kind, content in delivery_contents
-                    for chunk in split_telegram_message(content)
+                    for chunk in split_telegram_markdown(content)
                 ]
                 for index, (kind, chunk) in enumerate(pending_chunks, start=1):
                     body = f"[{index}/{len(pending_chunks)}]\n\n{chunk}" if len(pending_chunks) > 1 else chunk

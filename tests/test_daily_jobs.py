@@ -8,6 +8,8 @@ from datetime import date
 from pathlib import Path
 from unittest.mock import patch
 
+from telethon.extensions import markdown as telethon_markdown
+
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import (
     AppConfig,
@@ -22,6 +24,7 @@ from tele_mess_core.config import (
 )
 from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.models import BackupPolicyRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.telegram.delivery import split_telegram_markdown
 
 
 class DailyJobWorkerTest(unittest.TestCase):
@@ -489,21 +492,32 @@ class DailyJobWorkerTest(unittest.TestCase):
             scope={"account_id": "main"},
         )
 
-        completed = worker.run_once()
+        with patch(
+            "tele_mess_core.telegram.delivery.split_telegram_markdown",
+            side_effect=lambda content: split_telegram_markdown(content, limit=100),
+        ):
+            completed = worker.run_once()
 
         self.assertEqual(completed["job_id"], job["job_id"])
         self.assertEqual(completed["status"], "completed")
         outbox = self.store.list_delivery_outbox(summary_run_id=completed["summary_run_id"])
-        self.assertEqual(len(outbox), 2)
+        self.assertGreater(len(outbox), 2)
         self.assertTrue(all(item["status"] == "sent" for item in outbox))
-        self.assertEqual([item["message_id"] for item in outbox], [321, 322])
-        self.assertEqual([item["chunk_index"] for item in outbox], [1, 2])
-        self.assertEqual(len(runtime.calls), 2)
+        self.assertEqual(
+            [item["message_id"] for item in outbox],
+            list(range(321, 321 + len(outbox))),
+        )
+        self.assertEqual(
+            [item["chunk_index"] for item in outbox],
+            list(range(1, len(outbox) + 1)),
+        )
+        self.assertEqual(len(runtime.calls), len(outbox))
         self.assertTrue(all(item[0:2] == ("main", "deliver_chunk") for item in runtime.calls))
-        self.assertIn("# Important Daily Summary", runtime.calls[0][2])
-        self.assertNotIn("- Tags: #point", runtime.calls[0][2])
-        self.assertIn("# Daily Message Point Summary", runtime.calls[1][2])
-        self.assertIn("- Tags: #point", runtime.calls[1][2])
+        self.assertTrue(any("**Important Daily Summary**" in item[2] for item in runtime.calls))
+        self.assertTrue(any("**Daily Message Point Summary**" in item[2] for item in runtime.calls))
+        parsed_calls = [telethon_markdown.parse(item[2]) for item in runtime.calls]
+        self.assertTrue(any(entities for _, entities in parsed_calls))
+        self.assertTrue(all("**" not in parsed and "```" not in parsed for parsed, _ in parsed_calls))
 
     def test_cancel_during_delivery_discards_remaining_outbox_chunks(self) -> None:
         self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 0, True)

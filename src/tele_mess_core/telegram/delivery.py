@@ -1,9 +1,12 @@
 from __future__ import annotations
 
+import copy
 import json
 import logging
 import re
 from typing import Any
+
+from telethon.extensions import markdown as telethon_markdown
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import DailyDeliveryConfig, TelegramAccountConfig
@@ -45,8 +48,11 @@ class TelegramSummaryDeliveryService:
 
             self._set_auth_state("authorized")
             entity = await client.get_entity(delivery.origin_id)
-            markdown_content = telegram_markdown_for_send(content)
-            chunks = split_telegram_message(markdown_content) if split_content else [markdown_content]
+            chunks = (
+                split_telegram_markdown(content)
+                if split_content
+                else [telegram_markdown_for_send(content)]
+            )
             message_ids: list[int] = []
             for index, chunk in enumerate(chunks, start=1):
                 body = chunk
@@ -162,6 +168,24 @@ def split_telegram_message(content: str, limit: int = MAX_TELEGRAM_MESSAGE_CHARS
     return chunks
 
 
+def split_telegram_markdown(content: str, limit: int = MAX_TELEGRAM_MESSAGE_CHARS) -> list[str]:
+    """Split Markdown into independently parseable Telegram messages."""
+    markdown_content = telegram_markdown_for_send(content)
+    plain_text, entities = telethon_markdown.parse(markdown_content)
+    ranges = _split_telegram_text_ranges(plain_text, limit)
+    if not ranges:
+        return ["Daily summary is empty."]
+
+    utf16_offsets = _utf16_prefix_offsets(plain_text)
+    chunks: list[str] = []
+    for start, end in ranges:
+        start_offset = utf16_offsets[start]
+        end_offset = utf16_offsets[end]
+        chunk_entities = _slice_telegram_entities(entities, start_offset, end_offset)
+        chunks.append(telethon_markdown.unparse(plain_text[start:end], chunk_entities))
+    return chunks
+
+
 def telegram_markdown_for_send(content: str) -> str:
     """Adapt common Markdown headings to the subset rendered by Telethon."""
     lines: list[str] = []
@@ -178,6 +202,87 @@ def telegram_markdown_for_send(content: str) -> str:
                 line = f"**{heading.group(1)}**"
         lines.append(line)
     return "\n".join(lines).strip()
+
+
+def _split_telegram_text_ranges(content: str, limit: int) -> list[tuple[int, int]]:
+    if limit < 100:
+        raise ValueError("limit must be at least 100")
+    if not content:
+        return []
+
+    start = len(content) - len(content.lstrip())
+    end = len(content.rstrip())
+    if start >= end:
+        return []
+
+    ranges: list[tuple[int, int]] = []
+    while _utf16_length(content[start:end]) > limit:
+        split_at = _best_utf16_split_index(content[start:end], limit)
+        raw_end = start + split_at
+        chunk_end = raw_end
+        while chunk_end > start and content[chunk_end - 1].isspace():
+            chunk_end -= 1
+        if chunk_end == start:
+            chunk_end = raw_end
+        ranges.append((start, chunk_end))
+
+        start = raw_end
+        while start < end and content[start].isspace():
+            start += 1
+
+    if start < end:
+        ranges.append((start, end))
+    return ranges
+
+
+def _best_utf16_split_index(text: str, limit: int) -> int:
+    units = 0
+    hard_limit = 0
+    for index, char in enumerate(text):
+        next_units = units + (2 if ord(char) > 0xFFFF else 1)
+        if next_units > limit:
+            break
+        units = next_units
+        hard_limit = index + 1
+    if hard_limit <= 0:
+        return 1
+
+    for separator in ("\n\n", "\n", ". ", " "):
+        index = text.rfind(separator, 0, hard_limit)
+        if index >= max(1, hard_limit // 2):
+            return index + len(separator)
+    return hard_limit
+
+
+def _utf16_prefix_offsets(text: str) -> list[int]:
+    offsets = [0]
+    for char in text:
+        offsets.append(offsets[-1] + (2 if ord(char) > 0xFFFF else 1))
+    return offsets
+
+
+def _utf16_length(text: str) -> int:
+    return sum(2 if ord(char) > 0xFFFF else 1 for char in text)
+
+
+def _slice_telegram_entities(
+    entities: list[Any],
+    start_offset: int,
+    end_offset: int,
+) -> list[Any]:
+    chunk_entities: list[Any] = []
+    for entity in entities:
+        entity_start = int(entity.offset)
+        entity_end = entity_start + int(entity.length)
+        overlap_start = max(entity_start, start_offset)
+        overlap_end = min(entity_end, end_offset)
+        if overlap_start >= overlap_end:
+            continue
+        chunk_entity = copy.copy(entity)
+        chunk_entity.offset = overlap_start - start_offset
+        chunk_entity.length = overlap_end - overlap_start
+        chunk_entities.append(chunk_entity)
+    return chunk_entities
 
 
 def _best_split_index(text: str, limit: int) -> int:

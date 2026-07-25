@@ -2,6 +2,9 @@
 
 ## Unreleased
 
+- Keep Telegram Markdown entities intact across summary message boundaries so
+  later delivery chunks retain bold text, links, and fenced code formatting.
+
 ## 0.3.1 - 2026-07-24
 
 - Changed the systemd daily timer to enqueue durable jobs for the running core

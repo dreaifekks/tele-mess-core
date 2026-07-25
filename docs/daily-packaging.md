@@ -234,6 +234,8 @@ timezone, source-tag, and provider header. The point digest is sent as a
 separate logical delivery whose searchable Telegram tag is always `#point`.
 Telegram sends use Telethon Markdown parsing; standard Markdown headings are
 adapted to bold Telegram headings at send time while hashtags remain searchable.
+Long summaries are parsed before splitting so every queued message contains
+self-contained Markdown, including formatting that crosses a chunk boundary.
 
 YAML remains the fallback for existing deployments. Management clients should
 use `GET` and `PATCH /manage/daily-summary-delivery`; the API stores the target

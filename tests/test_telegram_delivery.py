@@ -4,9 +4,13 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock
 
+from telethon.extensions import markdown as telethon_markdown
+from telethon.tl.types import MessageEntityBold, MessageEntityPre, MessageEntityTextUrl
+
 from tele_mess_core.config import DailyDeliveryConfig, TelegramAccountConfig
 from tele_mess_core.telegram.delivery import (
     TelegramSummaryDeliveryService,
+    split_telegram_markdown,
     split_telegram_message,
     telegram_markdown_for_send,
 )
@@ -34,6 +38,40 @@ class TelegramDeliveryTest(unittest.TestCase):
         self.assertTrue(rendered.startswith("**Daily Summary**"))
         self.assertIn("\n#point\n", rendered)
         self.assertIn("```md\n# code heading\n```", rendered)
+
+    def test_split_telegram_markdown_reopens_entities_across_chunks(self) -> None:
+        cases = [
+            ("bold", "**" + ("bold content " * 30) + "**", MessageEntityBold),
+            (
+                "link",
+                "[" + ("linked content " * 30) + "](https://example.com)",
+                MessageEntityTextUrl,
+            ),
+            (
+                "fenced code",
+                "```python\n" + ("# code heading\nprint('chunk')\n" * 15) + "```",
+                MessageEntityPre,
+            ),
+        ]
+
+        for name, content, entity_type in cases:
+            with self.subTest(name=name):
+                chunks = split_telegram_markdown(content, limit=100)
+
+                self.assertGreater(len(chunks), 1)
+                for chunk in chunks:
+                    parsed, entities = telethon_markdown.parse(chunk)
+                    self.assertNotIn("**", parsed)
+                    self.assertNotIn("```", parsed)
+                    self.assertTrue(any(isinstance(entity, entity_type) for entity in entities))
+
+    def test_split_telegram_markdown_counts_astral_characters_as_utf16(self) -> None:
+        chunks = split_telegram_markdown("😀" * 120, limit=100)
+
+        self.assertEqual(len(chunks), 3)
+        for chunk in chunks:
+            parsed, _ = telethon_markdown.parse(chunk)
+            self.assertLessEqual(len(parsed.encode("utf-16-le")) // 2, 100)
 
 
 class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
@@ -78,6 +116,50 @@ class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.calls[0]["parse_mode"], "md")
         self.assertTrue(str(client.calls[0]["body"]).startswith("**Important Summary**"))
         self.assertIn("#point", str(client.calls[0]["body"]))
+
+    async def test_send_summary_keeps_markdown_on_every_chunk(self) -> None:
+        class SentMessage:
+            id = 42
+
+        class FakeClient:
+            def __init__(self) -> None:
+                self.calls: list[dict[str, object]] = []
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            async def get_entity(self, origin_id: int) -> str:
+                return f"entity:{origin_id}"
+
+            async def send_message(self, entity: object, body: str, **kwargs: object) -> SentMessage:
+                self.calls.append({"entity": entity, "body": body, **kwargs})
+                return SentMessage()
+
+        store = Mock()
+        account = TelegramAccountConfig(
+            account_id="main",
+            api_id=1,
+            api_hash="test",
+            session_name="main",
+            session_dir=Path("/tmp/tele-mess-core-test-sessions"),
+        )
+        client = FakeClient()
+        service = TelegramSummaryDeliveryService(account, store)
+        content = "**" + ("formatted content " * 300) + "**"
+
+        result = await service.send_summary(
+            DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-1001),
+            content,
+            client=client,
+        )
+
+        self.assertGreater(result["message_count"], 1)
+        self.assertEqual(len(client.calls), result["message_count"])
+        self.assertTrue(all(call["parse_mode"] == "md" for call in client.calls))
+        for call in client.calls:
+            parsed, entities = telethon_markdown.parse(str(call["body"]))
+            self.assertNotIn("**", parsed)
+            self.assertTrue(any(isinstance(entity, MessageEntityBold) for entity in entities))
 
 
 if __name__ == "__main__":
