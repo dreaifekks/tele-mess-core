@@ -1,9 +1,19 @@
 # Changelog
 
+PyPI publishing and the current tag/version validation workflow began with
+`0.3.0`. Earlier entries document source milestones; not every pre-`0.3.0`
+milestone has a matching remote tag, and `v0.1.2` predates the current metadata
+validation rules.
+
 ## Unreleased
 
 - Keep Telegram Markdown entities intact across summary message boundaries so
   later delivery chunks retain bold text, links, and fenced code formatting.
+- Reworked the public project overview and package metadata, added a public
+  roadmap and open-source governance files, and added continuous verification
+  for pull requests and `master` across Python 3.11 through 3.14.
+- Expanded ignored local-data patterns to reduce the risk of committing
+  workspaces, archives, media, logs, sessions, or environment files.
 
 ## 0.3.1 - 2026-07-24
 
@@ -99,6 +109,11 @@
 - Added persistent daily summary/package storage plus list, detail, filter, create, and rerun APIs.
 - Added systemd user timer installation and schedule update commands for daily package jobs.
 - Documented the durable daily packaging and AI analysis behavior in `docs/daily-packaging.md`.
+
+## 0.1.2 - 2026-07-03
+
+- Kept sticker and custom-emoji documents as archive metadata without trying to
+  download them as regular media files.
 
 ## 0.1.1 - 2026-07-03
 

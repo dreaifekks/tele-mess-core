@@ -1,0 +1,42 @@
+name: Feature request
+description: Propose an improvement to tele-mess-core
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Describe the need and intended behavior. Do not include private Telegram content, account identifiers, session files, tokens, or local archives.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I searched existing issues for a similar proposal.
+          required: true
+        - label: I removed all credentials, personal data, and private Telegram content.
+          required: true
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user or operator problem should this solve?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior
+      description: Describe the desired behavior, not only an implementation.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+  - type: textarea
+    id: impact
+    attributes:
+      label: Compatibility, privacy, and security impact
+      description: Note API, storage, migration, Telegram-account, or sensitive-data implications.
+    validations:
+      required: true

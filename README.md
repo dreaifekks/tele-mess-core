@@ -1,22 +1,183 @@
 # tele-mess-core
 
-`tele-mess-core` is a single-user, multi-Telegram-account archive core for
-future Mac and web clients.
+[![CI](https://github.com/dreaifekks/tele-mess-core/actions/workflows/ci.yml/badge.svg)](https://github.com/dreaifekks/tele-mess-core/actions/workflows/ci.yml)
+[![PyPI](https://img.shields.io/pypi/v/tele-mess-core.svg)](https://pypi.org/project/tele-mess-core/)
+[![Python](https://img.shields.io/pypi/pyversions/tele-mess-core.svg)](https://pypi.org/project/tele-mess-core/)
+[![License](https://img.shields.io/github/license/dreaifekks/tele-mess-core.svg)](https://github.com/dreaifekks/tele-mess-core/blob/master/LICENSE)
 
-It stores Telegram messages in SQLite and exposes sync plus management endpoints
-for remote clients. The core is meant to run as a long-running local database and
-control plane: clients manage account authentication, origin discovery, backup
-selection, capture policy, topics, and participant metadata through the core API.
+**A local-first Telegram archive and Codex analysis engine that keeps message
+history on infrastructure you control.**
 
-It intentionally does not forward messages to backup Telegram groups. Daily
-package generation and local Codex-backed daily summaries run as local jobs
-against the archive. See
-[product direction](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/product-direction.md)
-for the management interface direction and
-[daily packaging](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md)
-for daily package and AI analysis details.
+`tele-mess-core` supervises multiple Telegram accounts, stores messages and
+media metadata in SQLite, catches up safely after reconnects, and exposes a
+token-protected sync and management API. Durable local jobs turn the archive
+into source-linked daily reports and structured message points through Codex,
+with an optional OpenAI-compatible fallback when the Codex account's usage
+limit is reached.
 
-## Current Scope
+The project is designed for people who want a reusable, self-hosted foundation
+instead of putting sensitive Telegram history into a hosted archival service.
+It can run as a headless Linux service, a local macOS process, or the engine
+behind a separate desktop or web client.
+
+> [!NOTE]
+> This is an actively maintained, early-stage project. It is single-owner rather
+> than multi-tenant, and operators should review the
+> [security policy and runtime boundaries](https://github.com/dreaifekks/tele-mess-core/blob/master/SECURITY.md)
+> before using real Telegram accounts. It is not
+> affiliated with Telegram or OpenAI.
+>
+> “Local-first” describes archive ownership and orchestration, not local AI
+> inference. When AI analysis is enabled, selected message text and images are
+> sent to the configured Codex or OpenAI-compatible provider. Set
+> `daily.ai.provider: disabled` to prevent AI-provider calls.
+
+## Why tele-mess-core
+
+- **Local archive ownership.** Messages, sync cursors, job state, and generated
+  artifacts are persisted in an operator-selected workspace backed by SQLite;
+  optional AI-provider data flow is explicit and can be disabled.
+- **Recovery is part of the design.** Per-account runtimes, fixed-head backfill,
+  reconnect catch-up, durable leases, retries, and delivery outboxes make
+  long-running capture recoverable instead of best-effort.
+- **AI output remains traceable.** Daily reports and message points retain their
+  source time, tags, Telegram links, and evidence rather than becoming detached
+  chat output.
+- **Clients use a versioned, self-describing contract.** The CLI, built-in
+  console, generated OpenAPI document, Markdown API reference, and runtime
+  manifest share the same contract registry and hash.
+- **The maintenance path is public.** Releases are tested, built, smoke-tested,
+  and published to PyPI with GitHub Actions and Trusted Publishing.
+
+## How it works
+
+```mermaid
+flowchart LR
+    telegram["Telegram accounts"] --> runtime["Supervised Telethon runtimes"]
+    runtime --> archive[("SQLite archive")]
+    archive --> api["Token-protected sync and management API"]
+    api --> clients["Built-in console and external clients"]
+    archive --> jobs["Durable daily jobs"]
+    jobs --> codex["Local job invoking Codex CLI or a Responses fallback"]
+    codex --> archive
+    jobs --> delivery["Optional Telegram summary delivery"]
+```
+
+The core intentionally does not forward source messages into backup Telegram
+groups. It archives data locally and runs analysis against that archive.
+
+## Quick start
+
+Inspect the published CLI without cloning the repository:
+
+```bash
+uvx tele-mess-core --help
+uvx tele-mess-core run-local --help
+```
+
+[`uvx`](https://docs.astral.sh/uv/guides/tools/) runs the published package in
+an isolated tool environment. For a reproducible installation, pin the package
+while keeping the executable name explicit:
+
+```bash
+uvx --from "tele-mess-core==X.Y.Z" tele-mess-core --help
+```
+
+To run against a real Telegram account, create a stable workspace:
+
+```bash
+tele_mess_workspace="$HOME/Library/Application Support/tele-mess-core"
+mkdir -p "$tele_mess_workspace"
+```
+
+Save this minimal, single-account configuration as
+`$tele_mess_workspace/config.yml`, replacing both credential placeholders and
+the management token:
+
+```yaml
+storage:
+  data_dir: "./data"
+  database: "./data/archive.db"
+
+telegram:
+  accounts:
+    - account_id: "main"
+      api_id: 123456
+      api_hash: "replace-with-your-telegram-api-hash"
+      session_name: "main"
+      session_dir: "./data/sessions"
+
+server:
+  host: "127.0.0.1"
+  port: 8765
+  token: "replace-with-a-long-random-management-token"
+
+daily:
+  ai:
+    # Archival works without an AI provider. Enable Codex only after reviewing
+    # the provider data boundary below.
+    provider: "disabled"
+```
+
+For first-time authentication and capture-policy setup, temporarily start the
+built-in console:
+
+```bash
+uvx tele-mess-core --workspace "$tele_mess_workspace" run-local --web
+```
+
+Open `http://127.0.0.1:8765/console`, enter the management token from
+`config.yml`, authenticate the Telegram account, discover origins, and enable
+the capture policies you want. Stop that process when setup is complete, then
+run without the web listener:
+
+```bash
+uvx tele-mess-core --workspace "$tele_mess_workspace" run-local
+```
+
+`run-local` never opens a browser automatically and does not open an HTTP
+listener unless `--web` is supplied. A standalone Linux deployment normally
+uses `run-server` plus a supervised service. See the
+[local-mode guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/local-mode.md)
+and
+[server-mode guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/server-mode.md)
+before using production data. After creating the configuration, use
+`uvx tele-mess-core --workspace "$tele_mess_workspace" paths` to inspect all
+resolved non-secret paths without opening the database.
+
+### Enabling Codex analysis
+
+The Python package does not install the Codex CLI. To enable daily AI analysis:
+
+1. Install a current Codex CLI release separately and authenticate it with the
+   account you intend to use.
+2. Confirm `codex --version`, `codex login status`, and `codex exec --help`
+   work in the service user's environment.
+3. Choose a `daily.ai.model` available to that account and set
+   `daily.ai.provider: codex-cli`.
+4. Review the AI data boundary in
+   [SECURITY.md](https://github.com/dreaifekks/tele-mess-core/blob/master/SECURITY.md)
+   and the complete command template in the
+   [daily-packaging guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md).
+
+The default template expects Codex support for `--output-last-message`,
+`--output-schema`, and `--image`. Keep the provider disabled if those
+prerequisites or the data-transfer policy are not acceptable.
+
+## Documentation
+
+| Guide | Purpose |
+| --- | --- |
+| [Local mode](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/local-mode.md) | Workspace discovery, macOS behavior, and local runtime boundaries |
+| [Server mode](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/server-mode.md) | Long-running Linux deployment, auth, and client sync |
+| [Daily packaging](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md) | Codex analysis, message points, durable jobs, and delivery |
+| [API reference](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/api.md) | Generated sync and management endpoint documentation |
+| [OpenAPI](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/openapi.json) | Machine-readable API contract |
+| [Product direction](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/product-direction.md) | Product boundaries and current priorities |
+| [Roadmap](https://github.com/dreaifekks/tele-mess-core/blob/master/ROADMAP.md) | Near-term reliability, security, onboarding, and community work |
+| [Release guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/releasing.md) | Tag validation and PyPI Trusted Publishing |
+
+## Current capabilities
 
 - Telegram ingestion with Telethon.
 - Multiple Telegram accounts feeding one archive.
@@ -35,54 +196,15 @@ for daily package and AI analysis details.
 - macOS-oriented local CLI mode with durable jobs and no HTTP listener by
   default.
 - Daily package generation by origin, tag group, timezone, and local date.
-- Local Codex-backed daily analysis with important-origin full-context reports,
-  all-origin structured message points, and point-based daily digests.
+- Locally orchestrated Codex-backed daily analysis with important-origin
+  full-context reports, all-origin structured message points, and point-based
+  daily digests.
 - Durable daily package-and-summary jobs with deduplication, cancellation,
   restart recovery, leases, and a retryable Telegram delivery outbox.
 - System-managed daily package and summary scheduling through user-level systemd
   timer files.
 - Optional raw Telegram JSON retention cleanup for keeping the SQLite archive
   compact while preserving structured message rows.
-
-## Run from PyPI with uvx
-
-[`uvx`](https://docs.astral.sh/uv/guides/tools/) installs the published package
-and its Python dependencies into an isolated cache, then runs the
-`tele-mess-core` command. It does not clone the repository into the current
-directory, and runtime state remains in the selected workspace rather than the
-tool environment.
-
-Once a release is available on PyPI and the Mac workspace contains a valid
-`config.yml`, the local core is one command:
-
-```bash
-uvx tele-mess-core run-local
-```
-
-Use the same stable workspace across invocations, or select one explicitly:
-
-```bash
-uvx tele-mess-core run-local \
-  --workspace "$HOME/Library/Application Support/tele-mess-core-personal"
-```
-
-For a reproducible launcher, pin the distribution while keeping the executable
-name explicit:
-
-```bash
-uvx --from "tele-mess-core==X.Y.Z" tele-mess-core run-local
-```
-
-Maintainers can find the tag and Trusted Publishing process in the
-[release guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/releasing.md).
-
-A fresh machine still needs Telegram API credentials and a local configuration
-before `run-local` can ingest messages. In the macOS product, `mess-end` owns
-that first-run UI and drives the core management/auth API for code/2FA login,
-origin discovery, and capture-policy management; these are intentionally not
-duplicated as interactive core CLI setup. A standalone operator may enable
-`run-local --web` temporarily as a fallback. The normal local runtime keeps HTTP
-disabled.
 
 ## Source Checkout
 
@@ -316,34 +438,52 @@ turning an already completed summary into a failed run.
   `server/contracts.py`; generated Markdown/OpenAPI files and runtime docs share
   the same contract hash.
 
-The default AI provider is a configurable local `codex exec` command template
-using `--output-last-message`. Templates can use `{output}`, `{images}`, and
-`{task}`. An optional `daily.ai.fallback` can switch the remainder of a run to
-an OpenAI-compatible Responses endpoint only when Codex reports a usage limit.
-The API key is read from an ignored local file; transient fallback failures can
-be durably retried once after a configured delay. Set `daily.ai.provider:
-disabled` only for local testing or dry runs.
+The default AI provider is a configurable, locally invoked `codex exec` command
+template using `--output-last-message`. Templates can use `{output}`, `{images}`,
+and `{task}`. An optional `daily.ai.fallback` can switch the remainder of a run
+to an OpenAI-compatible Responses endpoint only when Codex reports a usage
+limit. The API key is read from an ignored local file; transient fallback
+failures can be durably retried once after a configured delay. Set
+`daily.ai.provider: disabled` whenever analysis must not call an AI provider.
 
 ## Design Boundary
 
 The server is responsible for durable collection, sync, capture-management
-state, daily packaging, and local daily analysis jobs. Client-side features such
-as labels and app-specific UI state should live in the Mac app.
+state, daily packaging, and locally orchestrated daily analysis jobs.
+Client-side features such as labels, installation UI, and app-specific state
+should live in an optional host client.
 
-`mess-end` is the host-facing manager, while `tele-mess-core` remains an
-independently runnable engine:
+`tele-mess-core` remains independently runnable. A host client may add lifecycle
+and onboarding UI without taking ownership of core data:
 
 | Owner | Responsibilities |
 | --- | --- |
 | `tele-mess-core` | Telegram sessions, SQLite schema and migrations, ingestion, capture policy, daily jobs, delivery, and optional HTTP/API service. |
-| `mess-end` | Version selection and installation, workspace selection, first-run UI, process start/stop/status, updates, and macOS LaunchAgent integration. |
+| Optional host client | Version selection and installation, workspace selection, first-run UI, process start/stop/status, updates, and OS service integration. |
 
-`mess-end` should use the public CLI and management API rather than importing
+A host client should use the public CLI and management API rather than importing
 internal Python modules or modifying the archive database directly. It should
 also enforce one core process per workspace: `run-local` and `run-server` must
-not own the same Telegram sessions and SQLite archive simultaneously. For a
-persistent managed installation, `mess-end` should point LaunchAgent at a
-stable, pinned executable rather than an incidental `uvx` cache path.
+not own the same Telegram sessions and SQLite archive simultaneously. Persistent
+managed installations should point their OS service at a stable, pinned
+executable rather than an incidental `uvx` cache path.
+
+## Community
+
+Contributions that improve reliability, portability, security, documentation,
+or the generated API contract are welcome.
+
+- Read
+  [CONTRIBUTING.md](https://github.com/dreaifekks/tele-mess-core/blob/master/CONTRIBUTING.md)
+  before opening a pull request.
+- Use
+  [SECURITY.md](https://github.com/dreaifekks/tele-mess-core/blob/master/SECURITY.md)
+  for vulnerability reports and sensitive findings.
+- See
+  [SUPPORT.md](https://github.com/dreaifekks/tele-mess-core/blob/master/SUPPORT.md)
+  for usage questions and troubleshooting.
+- Participation is governed by the
+  [Contributor Covenant](https://github.com/dreaifekks/tele-mess-core/blob/master/CODE_OF_CONDUCT.md).
 
 ## License
 

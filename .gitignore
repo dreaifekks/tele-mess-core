@@ -1,10 +1,16 @@
 .env
+.env.*
+!.env.example
+!.env.*.example
 .secrets/
 .venv/
 venv/
+.DS_Store
 __pycache__/
 *.py[cod]
 *.egg-info/
+build/
+dist/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -12,11 +18,17 @@ uv.lock
 
 data/
 logs/
+media/
+daily-packages/
+*.log
 *.db
 *.db-shm
 *.db-wal
+*.sqlite*
 *.session
+*.session-*
 *.session-journal
 
 config.yml
+!.github/ISSUE_TEMPLATE/config.yml
 tele_mess_core.yml

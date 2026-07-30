@@ -1,0 +1,45 @@
+name: Usage question
+description: Ask for help using or operating tele-mess-core
+title: "[Question]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Public issues are not a secure support channel. Never include config.yml, Telegram session files, tokens, phone numbers, login codes, 2FA passwords, private messages, archives, media, or unredacted logs. See SUPPORT.md before filing.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Before submitting
+      options:
+        - label: I checked the README, relevant docs, and existing issues.
+          required: true
+        - label: I removed all credentials, personal data, and private Telegram content.
+          required: true
+        - label: This is not a security vulnerability.
+          required: true
+  - type: textarea
+    id: question
+    attributes:
+      label: Question
+      description: What are you trying to accomplish, and where are you blocked?
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: tele-mess-core version or commit
+      placeholder: "0.3.1 or a commit SHA"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Include Python version, operating system, installation method, and runtime mode.
+    validations:
+      required: true
+  - type: textarea
+    id: attempted
+    attributes:
+      label: What have you tried?
+      description: Include only sanitized commands and output.

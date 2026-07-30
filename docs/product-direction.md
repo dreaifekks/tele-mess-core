@@ -4,7 +4,8 @@
 
 `tele-mess-core` is a single-user core for managing multiple Telegram accounts.
 It should behave like a long-running archive database plus a remotely managed
-control plane for Mac clients and a future core web console.
+control plane for Mac clients, other API consumers, and the built-in web
+console.
 
 The main product focus is the client/core interface. Telegram ingestion is the
 foundation, but remote management APIs decide how the Mac client can configure,
@@ -42,8 +43,8 @@ archives, and future Mac/web client workflows.
 - Multiple Telegram accounts under that owner.
 - One local SQLite archive as the server-side source of truth.
 - Remote clients can manage capture configuration and sync archived data.
-- A future core web console should use the same management concepts as the Mac
-  client instead of requiring a separate product model.
+- The built-in web console and external clients use the same management
+  concepts and API contract instead of maintaining separate product models.
 
 This means there is no multi-tenant account system in the initial scope. Remote
 authentication still matters because adding Telegram accounts and changing backup
@@ -75,7 +76,7 @@ configure Telegram origins:
 
 ## Interface Priorities
 
-The next API surface should be management-first, not just sync-first:
+The interface remains management-first, not just sync-first:
 
 - List Telegram accounts and their login/session status.
 - Add or authenticate a Telegram account remotely with a secure challenge flow.
@@ -96,11 +97,11 @@ The next API surface should be management-first, not just sync-first:
 
 ## Open Design Questions
 
-- Whether media-inclusive backup first means media metadata only, downloaded file
-  blobs, or both.
-- How to represent Telegram account login prompts over a remote API without
-  leaking codes or long-lived session material.
 - How much participant data should be stored by default, given privacy and local
   database size concerns.
-- Whether the core web console should be served by this Python process or by a
-  separate frontend that calls the same HTTP API.
+- Which portable export formats should complement the SQLite archive without
+  weakening source provenance or losing edit/delete history.
+- How to evaluate daily reports and message points repeatably without committing
+  private Telegram content as fixtures.
+- Which onboarding and service-management responsibilities should remain in
+  host clients versus the core CLI.

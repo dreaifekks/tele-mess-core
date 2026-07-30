@@ -135,13 +135,14 @@ the directory from which the process happened to start.
 ## Current Boundary
 
 No-Web local mode expects Telegram sessions and SQLite-backed capture policies
-to have already been configured. `mess-end` owns first-run configuration and
-uses the core management API for code/2FA login, origin discovery, and policy
-editing; the core does not duplicate those flows as interactive CLI prompts.
-Standalone operators can enable `--web` temporarily for the same management
-surface. `mess-end` also owns macOS LaunchAgent installation and should restart
-the pinned core command at login; the core then performs update recovery and
-fixed-head history catch-up before continuing live ingestion.
+to have already been configured. An optional host client can own first-run
+configuration and use the core management API for code/2FA login, origin
+discovery, and policy editing; the core does not duplicate those flows as
+interactive CLI prompts. Standalone operators can enable `--web` temporarily
+for the same management surface. A host client may also own OS service
+installation and restart the pinned core command at login; the core then
+performs update recovery and fixed-head history catch-up before continuing live
+ingestion.
 
 Do not run `run-local` and `run-server` against the same workspace at the same
 time; both would try to own the same Telegram session and SQLite archive.

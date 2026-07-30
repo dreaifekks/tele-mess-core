@@ -1,0 +1,24 @@
+name: Private security contact request
+description: Request a private reporting path without disclosing vulnerability details
+title: "[Security contact]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only when GitHub private vulnerability reporting is unavailable. Do not include vulnerability details, exploit steps, logs, code, screenshots, account identifiers, Telegram content, sessions, tokens, archives, or media. The maintainer will use this issue only to arrange a private reporting path.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Safety check
+      options:
+        - label: I have not included vulnerability details or any private data in this public issue.
+          required: true
+        - label: I first tried GitHub private vulnerability reporting and it was unavailable.
+          required: true
+  - type: input
+    id: version
+    attributes:
+      label: Affected public version or commit
+      placeholder: "0.3.1 or a commit SHA"
+    validations:
+      required: true

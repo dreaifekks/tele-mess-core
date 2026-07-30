@@ -26,6 +26,14 @@ The pending publisher creates the PyPI project on its first successful upload.
 It does not reserve the project name before that upload. No long-lived PyPI API
 token belongs in GitHub secrets or this repository.
 
+## Historical Releases
+
+Automated PyPI publication and strict tag/version validation began with
+`v0.3.0`. Earlier changelog entries are source milestones and do not all have a
+matching remote tag. The historical `v0.1.2` tag also predates the current
+metadata-alignment checks. Do not move or replace published tags to rewrite that
+history; use the current release checklist for all new versions.
+
 ## Release Checklist
 
 1. Start from a clean worktree and run the full validation suite:

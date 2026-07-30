@@ -29,7 +29,8 @@ The server does:
   refresh, and media-download failures.
 - Generate daily packages from archived messages by local date, timezone,
   origin, and tag group.
-- Run local Codex-backed daily analysis on demand: image OCR/visual analysis,
+- Run locally invoked Codex-backed daily analysis on demand: image OCR/visual
+  analysis,
   all-origin structured message-point extraction, full-context important-origin
   analysis, an important-only daily report, and a separate point-based digest.
 - Manage a daily package system timer through user-level systemd timer files.
@@ -45,7 +46,7 @@ The server does not:
 Telegram account(s) -> Telethon adapter(s) -> SQLite archive -> Sync API -> Mac client
 Mac/web client -> Management API -> account/origin/policy/participant tables
 Systemd user timer -> CLI daily-package -> SQLite archive -> package files
-Manual/API trigger -> daily-summary -> staged local Codex CLI tasks -> important report + message points + point digest
+Manual/API trigger -> daily-summary -> staged, locally invoked Codex CLI tasks -> important report + message points + point digest
 API/systemd trigger -> durable daily job queue -> package + analysis -> typed summary records + SQLite points -> delivery outbox -> Telegram target
 ```
 

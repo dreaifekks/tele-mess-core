@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/dreaifekks/tele-mess-core/security/advisories/new
+    about: Use GitHub private vulnerability reporting. If unavailable, follow the safe public fallback in SECURITY.md.

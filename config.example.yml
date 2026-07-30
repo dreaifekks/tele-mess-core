@@ -71,7 +71,7 @@ daily:
     timeout_seconds: 900
     fallback:
       # Disabled by default. When enabled, this is activated only after the
-      # local Codex CLI reports a usage-limit error.
+      # Codex CLI process reports a usage-limit error.
       enabled: false
       provider: "openai-compatible"
       trigger: "usage-limit"

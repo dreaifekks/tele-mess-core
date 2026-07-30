@@ -5,10 +5,43 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "tele-mess-core"
 version = "0.3.1"
-description = "Telegram message archive core with SQLite storage and sync API"
+description = "Local-first Telegram archive and Codex analysis engine with SQLite and a sync API"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+  { name = "dreaifekks" },
+]
+maintainers = [
+  { name = "dreaifekks" },
+]
+keywords = [
+  "telegram",
+  "archive",
+  "backup",
+  "sqlite",
+  "codex",
+  "local-first",
+  "self-hosted",
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Framework :: AsyncIO",
+  "Intended Audience :: Developers",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Communications :: Chat",
+  "Topic :: Database",
+  "Topic :: System :: Archiving",
+]
 dependencies = [
   "Telethon>=1.38,<2",
   "PyYAML>=6,<7",
@@ -16,9 +49,11 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/dreaifekks/tele-mess-core"
+Documentation = "https://github.com/dreaifekks/tele-mess-core/tree/master/docs"
 Repository = "https://github.com/dreaifekks/tele-mess-core"
 Issues = "https://github.com/dreaifekks/tele-mess-core/issues"
 Changelog = "https://github.com/dreaifekks/tele-mess-core/blob/master/CHANGELOG.md"
+Security = "https://github.com/dreaifekks/tele-mess-core/security/policy"
 
 [project.scripts]
 tele-mess-core = "tele_mess_core.cli:main"

@@ -1,0 +1,15 @@
+name: Private conduct contact request
+description: Request a private path for reporting a Code of Conduct concern
+title: "[Conduct contact]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form only to request a private reporting path. Do not include names, allegations, private messages, screenshots, links, or other evidence in this public issue.
+  - type: checkboxes
+    id: safety
+    attributes:
+      label: Privacy check
+      options:
+        - label: I have not included conduct-report details or another person's private data in this public issue.
+          required: true

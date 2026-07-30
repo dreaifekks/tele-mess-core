@@ -130,7 +130,15 @@ For groups or origins tagged `info`, point extraction adds an explicit
 information-collection instruction: collect facts, announcements, events,
 resources, and links instead of producing a chat-atmosphere summary.
 
-The default AI provider is a local Codex command template:
+AI analysis is locally orchestrated but is not local inference by default. The
+Codex CLI process receives stage prompts, selected message content, and
+configured image inputs, and may send them to the service associated with the
+operator's Codex account. An enabled fallback sends eligible inputs to its
+configured OpenAI-compatible endpoint. Review provider terms and selected
+origins before analyzing private archives; use `daily.ai.provider: disabled`
+when no provider data transfer is acceptable.
+
+The default AI provider is a locally invoked Codex command template:
 
 ```yaml
 daily:
