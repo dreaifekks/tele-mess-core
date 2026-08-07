@@ -170,6 +170,9 @@ telegram:
 
         self.assertEqual(config.daily.ai.provider, "codex-cli")
         self.assertEqual(config.daily.ai.model, "gpt-5.6-sol")
+        self.assertIn("--ephemeral", config.daily.ai.command)
+        self.assertIn("--disable", config.daily.ai.command)
+        self.assertIn("hooks", config.daily.ai.command)
         self.assertIn("{model}", config.daily.ai.command)
         self.assertIn("{output_schema}", config.daily.ai.command)
         self.assertFalse(config.daily.ai.fallback.enabled)

@@ -3044,6 +3044,12 @@ def _expand_command(
     executable = Path(expanded[0]).name.lower() if expanded else ""
     if executable in {"codex", "codex.exe"} and "exec" in expanded:
         insert_at = expanded.index("exec") + 1
+        if "--ephemeral" not in expanded:
+            expanded.insert(insert_at, "--ephemeral")
+            insert_at += 1
+        if _codex_feature_override(expanded, "hooks") is None:
+            expanded[insert_at:insert_at] = ["--disable", "hooks"]
+            insert_at += 2
         has_model = any(
             token in {"-m", "--model"} or token.startswith("--model=")
             for token in expanded
@@ -3058,6 +3064,29 @@ def _expand_command(
         if output_schema_path is not None and not has_output_schema:
             expanded[insert_at:insert_at] = ["--output-schema", str(output_schema_path)]
     return expanded
+
+
+def _codex_feature_override(command: list[str], feature: str) -> bool | None:
+    """Return the last explicit Codex feature override, if one is present."""
+
+    override: bool | None = None
+    for index, token in enumerate(command):
+        for flag, enabled in (("--enable", True), ("--disable", False)):
+            if token == flag and index + 1 < len(command) and command[index + 1] == feature:
+                override = enabled
+            elif token == f"{flag}={feature}":
+                override = enabled
+        if token in {"-c", "--config"} and index + 1 < len(command):
+            setting = command[index + 1].replace(" ", "").lower()
+        elif token.startswith(("-c=", "--config=")):
+            setting = token.split("=", 1)[1].replace(" ", "").lower()
+        else:
+            setting = ""
+        if setting == f"features.{feature.lower()}=true":
+            override = True
+        elif setting == f"features.{feature.lower()}=false":
+            override = False
+    return override
 
 
 def _collect_image_paths(package_payload: dict[str, Any], limit: int = 20) -> list[str]:

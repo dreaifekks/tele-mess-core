@@ -152,6 +152,9 @@ daily:
       - "-a"
       - "never"
       - "exec"
+      - "--ephemeral"
+      - "--disable"
+      - "hooks"
       - "{model}"
       - "--skip-git-repo-check"
       - "--output-last-message"
@@ -171,9 +174,16 @@ Supported command placeholders:
 - `{images}`: repeated `--image <path>` arguments for image tasks;
 - `{task}`: task name, useful for wrappers and logs.
 
+The default command makes every batch ephemeral and disables Codex lifecycle
+hooks for that invocation. This keeps stage prompts and outputs out of Codex
+session rollout storage and prevents user or plugin hooks from treating each
+batch as an interactive session. It does not change provider-side data handling
+or the report artifacts that `tele-mess-core` intentionally stores.
+
 Recognized direct `codex exec` commands from older configs receive missing
-model and output-schema flags automatically. Custom wrapper commands should
-include the placeholders explicitly.
+`--ephemeral`, `--disable hooks`, model, and output-schema flags automatically.
+An explicit hooks feature override in the command is respected. Custom wrapper
+commands should include the isolation flags and placeholders explicitly.
 
 `daily.ai.work_dir` is resolved like other configured paths and controls only
 the Codex/fallback subprocess current directory. It does not change the config,

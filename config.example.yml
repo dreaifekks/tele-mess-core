@@ -53,6 +53,11 @@ daily:
       - "-a"
       - "never"
       - "exec"
+      # Batch summaries neither invoke configured Codex lifecycle hooks nor
+      # persist Codex session rollout files.
+      - "--ephemeral"
+      - "--disable"
+      - "hooks"
       # Expanded to "--model <daily.ai.model>".
       - "{model}"
       - "--skip-git-repo-check"

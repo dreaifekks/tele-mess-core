@@ -36,6 +36,12 @@ the service used by that Codex account. If the optional OpenAI-compatible
 fallback is enabled and triggered, the remaining eligible stage inputs are sent
 to its configured endpoint.
 
+Default direct Codex batch commands use `--disable hooks` and `--ephemeral`, so
+configured Codex lifecycle hooks do not receive those batches and Codex does not
+persist local session rollout files for them. This local isolation does not
+change what the selected AI provider receives or the summary artifacts retained
+by `tele-mess-core`.
+
 Review the selected origins and provider terms before enabling analysis on
 private archives. Set `daily.ai.provider: disabled` to prevent AI-provider
 calls; archival, sync, and management features remain available, while analysis

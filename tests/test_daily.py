@@ -493,6 +493,9 @@ class DailyPackagingTest(unittest.TestCase):
             [
                 "codex",
                 "exec",
+                "--ephemeral",
+                "--disable",
+                "hooks",
                 "--model",
                 "gpt-5.6-sol",
                 "--output-schema",
@@ -526,11 +529,36 @@ class DailyPackagingTest(unittest.TestCase):
         )
         exec_index = legacy.index("exec")
         self.assertEqual(
-            legacy[exec_index + 1 : exec_index + 5],
-            ["--model", "gpt-5.6-sol", "--output-schema", str(schema_path)],
+            legacy[exec_index + 1 : exec_index + 8],
+            [
+                "--ephemeral",
+                "--disable",
+                "hooks",
+                "--model",
+                "gpt-5.6-sol",
+                "--output-schema",
+                str(schema_path),
+            ],
         )
+        self.assertEqual(legacy.count("--ephemeral"), 1)
+        self.assertEqual(legacy.count("--disable"), 1)
         self.assertEqual(legacy.count("--model"), 1)
         self.assertEqual(legacy.count("--output-schema"), 1)
+
+        explicit_hooks = _expand_command(
+            ["codex", "exec", "--enable", "hooks", "--ephemeral", "{output}"],
+            output_path,
+            [],
+        )
+        self.assertEqual(explicit_hooks.count("--ephemeral"), 1)
+        self.assertNotIn("--disable", explicit_hooks)
+
+        explicit_hooks_equals = _expand_command(
+            ["codex", "--config=features.hooks=true", "exec", "{output}"],
+            output_path,
+            [],
+        )
+        self.assertNotIn("--disable", explicit_hooks_equals)
 
     def test_daily_package_adds_telegram_deeplinks_for_message_links(self) -> None:
         self._origin(-8001, "Public Link", "info")

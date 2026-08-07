@@ -7,6 +7,9 @@ validation rules.
 
 ## Unreleased
 
+- Isolated direct Codex daily-analysis batches with `--disable hooks` and
+  `--ephemeral` so lifecycle hooks do not retain batch prompts and Codex does
+  not create session rollout files for them.
 - Keep Telegram Markdown entities intact across summary message boundaries so
   later delivery chunks retain bold text, links, and fenced code formatting.
 - Reworked the public project overview and package metadata, added a public
