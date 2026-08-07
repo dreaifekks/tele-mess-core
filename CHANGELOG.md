@@ -7,6 +7,8 @@ validation rules.
 
 ## Unreleased
 
+## 0.3.2 - 2026-08-07
+
 - Isolated direct Codex daily-analysis batches with `--disable hooks` and
   `--ephemeral` so lifecycle hooks do not retain batch prompts and Codex does
   not create session rollout files for them.
