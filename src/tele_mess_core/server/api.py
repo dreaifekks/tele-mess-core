@@ -1001,6 +1001,7 @@ def _set_backup_policy(
     account_id = _required_str(payload, "account_id")
     origin_id = _required_int(payload, "origin_id")
     topic_id = _payload_int(payload, "topic_id", 0)
+    existing_policy = store.get_backup_policy(source, account_id, origin_id, topic_id)
     store.set_backup_policy(
         BackupPolicyRecord(
             source=source,
@@ -1011,6 +1012,11 @@ def _set_backup_policy(
             capture_text=_payload_bool(payload, "capture_text", True),
             capture_media_metadata=_payload_bool(payload, "capture_media_metadata", True),
             download_media=_payload_bool(payload, "download_media", False),
+            download_stickers=_payload_bool(
+                payload,
+                "download_stickers",
+                bool(existing_policy and existing_policy.get("download_stickers")),
+            ),
             tags=_optional_payload_str(payload, "tags"),
             updated_at=utc_now_iso(),
         )

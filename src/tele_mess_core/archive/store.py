@@ -32,7 +32,7 @@ from tele_mess_core.models import (
 from tele_mess_core.archive.migrations import apply_migrations
 
 
-SCHEMA_VERSION = 18
+SCHEMA_VERSION = 19
 LEGACY_SCHEMA_BASELINE = 12
 
 
@@ -451,6 +451,7 @@ class ArchiveStore:
               p.capture_text,
               p.capture_media_metadata,
               p.download_media,
+              p.download_stickers,
               p.tags,
               p.updated_at AS policy_updated_at
             FROM origins o
@@ -483,7 +484,15 @@ class ArchiveStore:
             data = _row_to_dict(
                 row,
                 json_fields={"raw_json"},
-                bool_fields={"is_forum", "important", "backup_enabled", "capture_text", "capture_media_metadata", "download_media"},
+                bool_fields={
+                    "is_forum",
+                    "important",
+                    "backup_enabled",
+                    "capture_text",
+                    "capture_media_metadata",
+                    "download_media",
+                    "download_stickers",
+                },
             )
             backup_enabled = data.pop("backup_enabled")
             if backup_enabled is None:
@@ -491,6 +500,7 @@ class ArchiveStore:
                 data.pop("capture_text", None)
                 data.pop("capture_media_metadata", None)
                 data.pop("download_media", None)
+                data.pop("download_stickers", None)
                 data.pop("tags", None)
                 data.pop("policy_updated_at", None)
             else:
@@ -499,6 +509,7 @@ class ArchiveStore:
                     "capture_text": data.pop("capture_text"),
                     "capture_media_metadata": data.pop("capture_media_metadata"),
                     "download_media": data.pop("download_media"),
+                    "download_stickers": data.pop("download_stickers"),
                     "tags": data.pop("tags"),
                     "updated_at": data.pop("policy_updated_at"),
                 }
@@ -532,14 +543,16 @@ class ArchiveStore:
                 """
                 INSERT INTO backup_policies(
                   source, account_id, origin_id, topic_id, enabled,
-                  capture_text, capture_media_metadata, download_media, tags, updated_at
+                  capture_text, capture_media_metadata, download_media,
+                  download_stickers, tags, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
                   enabled = excluded.enabled,
                   capture_text = excluded.capture_text,
                   capture_media_metadata = excluded.capture_media_metadata,
                   download_media = excluded.download_media,
+                  download_stickers = excluded.download_stickers,
                   tags = excluded.tags,
                   updated_at = excluded.updated_at
                 """,
@@ -552,6 +565,7 @@ class ArchiveStore:
                     int(policy.capture_text),
                     int(policy.capture_media_metadata),
                     int(policy.download_media),
+                    int(policy.download_stickers),
                     policy.tags,
                     now,
                 ),
@@ -573,7 +587,8 @@ class ArchiveStore:
     def list_backup_policies(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
             SELECT source, account_id, origin_id, topic_id, enabled,
-                   capture_text, capture_media_metadata, download_media, tags, updated_at
+                   capture_text, capture_media_metadata, download_media,
+                   download_stickers, tags, updated_at
             FROM backup_policies
         """
         params: tuple[Any, ...] = ()
@@ -586,7 +601,13 @@ class ArchiveStore:
         return [
             _row_to_dict(
                 row,
-                bool_fields={"enabled", "capture_text", "capture_media_metadata", "download_media"},
+                bool_fields={
+                    "enabled",
+                    "capture_text",
+                    "capture_media_metadata",
+                    "download_media",
+                    "download_stickers",
+                },
             )
             for row in rows
         ]
@@ -603,7 +624,8 @@ class ArchiveStore:
             row = self._conn.execute(
                 """
                 SELECT source, account_id, origin_id, topic_id, enabled,
-                       capture_text, capture_media_metadata, download_media, tags, updated_at
+                       capture_text, capture_media_metadata, download_media,
+                       download_stickers, tags, updated_at
                 FROM backup_policies
                 WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
                 """,
@@ -613,7 +635,13 @@ class ArchiveStore:
             return None
         return _row_to_dict(
             row,
-            bool_fields={"enabled", "capture_text", "capture_media_metadata", "download_media"},
+            bool_fields={
+                "enabled",
+                "capture_text",
+                "capture_media_metadata",
+                "download_media",
+                "download_stickers",
+            },
         )
 
     def get_capture_cursor(
@@ -2941,6 +2969,11 @@ class ArchiveStore:
             self._conn.execute("ALTER TABLE origins ADD COLUMN important INTEGER NOT NULL DEFAULT 0")
         if self._has_table("backup_policies") and not self._has_column("backup_policies", "tags"):
             self._conn.execute("ALTER TABLE backup_policies ADD COLUMN tags TEXT")
+        self._ensure_column(
+            "backup_policies",
+            "download_stickers",
+            "INTEGER NOT NULL DEFAULT 0",
+        )
         self._ensure_column("daily_package_runs", "progress_total", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("daily_package_runs", "progress_current", "INTEGER NOT NULL DEFAULT 0")
         self._ensure_column("daily_package_runs", "progress_label", "TEXT")

@@ -195,9 +195,12 @@ basic control-plane model for future Mac and web clients:
 4. Use `GET` and `POST /manage/origins` to maintain group/channel/chat/topic
    metadata.
 5. Use `GET` and `POST` or `PATCH /manage/backup-policies` to control whether
-   an origin is backed up and whether text, media metadata, or media files are
-   desired. Downloaded media files are stored under `media/` next to the SQLite
-   database and exposed through `GET /sync/media-files`.
+   an origin is backed up and whether text, media metadata, media files, or the
+   original sticker files are desired. Sticker/custom-emoji document messages
+   are archived as their associated emoji text by default;
+   `download_stickers` opts into additionally downloading the original file.
+   Downloaded media files are stored under `media/` next to the SQLite database
+   and exposed through `GET /sync/media-files`.
 6. Use `GET /manage/capture-cursors` to inspect backfill/catch-up progress.
 7. Use `GET /manage/operation-events` to inspect recent structured runtime
    failures and partial operations.

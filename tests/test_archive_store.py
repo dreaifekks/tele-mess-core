@@ -491,6 +491,7 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertTrue(topic["backup_policy"]["enabled"])
         self.assertTrue(topic["backup_policy"]["capture_media_metadata"])
         self.assertFalse(topic["backup_policy"]["download_media"])
+        self.assertFalse(topic["backup_policy"]["download_stickers"])
         self.assertEqual(topic["backup_policy"]["tags"], "ops,important")
 
         self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 42, True)
@@ -594,6 +595,7 @@ class ArchiveStoreTest(unittest.TestCase):
         assert policy is not None
         self.assertFalse(policy["capture_text"])
         self.assertFalse(policy["capture_media_metadata"])
+        self.assertFalse(policy["download_stickers"])
         self.assertEqual(policy["tags"], "alpha,beta")
 
         self.store.upsert_capture_cursor(
@@ -1163,6 +1165,93 @@ class ArchiveStoreTest(unittest.TestCase):
 
 
 class ArchiveMigrationTest(unittest.TestCase):
+    def test_v19_initialize_repairs_missing_sticker_download_column(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "archive.db"
+            conn = sqlite3.connect(database_path)
+            conn.executescript(
+                """
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '19');
+                PRAGMA user_version = 19;
+                CREATE TABLE backup_policies (
+                  source TEXT NOT NULL,
+                  account_id TEXT NOT NULL,
+                  origin_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  enabled INTEGER NOT NULL DEFAULT 0,
+                  capture_text INTEGER NOT NULL DEFAULT 1,
+                  capture_media_metadata INTEGER NOT NULL DEFAULT 1,
+                  download_media INTEGER NOT NULL DEFAULT 0,
+                  tags TEXT,
+                  updated_at TEXT NOT NULL,
+                  PRIMARY KEY (source, account_id, origin_id, topic_id)
+                );
+                INSERT INTO backup_policies(
+                  source, account_id, origin_id, topic_id, enabled,
+                  capture_text, capture_media_metadata, download_media, tags, updated_at
+                ) VALUES(
+                  'telegram', 'main', -1001, 0, 1,
+                  1, 1, 0, 'important', '2026-01-01T00:00:00+00:00'
+                );
+                """
+            )
+            conn.close()
+
+            store = ArchiveStore(database_path)
+            try:
+                store.initialize()
+                policy = store.get_backup_policy(SOURCE_TELEGRAM, "main", -1001)
+                assert policy is not None
+                self.assertFalse(policy["download_stickers"])
+                self.assertEqual(store.state()["schema_version"], 19)
+            finally:
+                store.close()
+
+    def test_v19_backup_policy_migration_disables_sticker_download_by_default(self) -> None:
+        conn = sqlite3.connect(":memory:")
+        conn.executescript(
+            """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta(key, value) VALUES('schema_version', '18');
+            PRAGMA user_version = 18;
+            CREATE TABLE backup_policies (
+              source TEXT NOT NULL,
+              account_id TEXT NOT NULL,
+              origin_id INTEGER NOT NULL,
+              topic_id INTEGER NOT NULL DEFAULT 0,
+              enabled INTEGER NOT NULL DEFAULT 0,
+              capture_text INTEGER NOT NULL DEFAULT 1,
+              capture_media_metadata INTEGER NOT NULL DEFAULT 1,
+              download_media INTEGER NOT NULL DEFAULT 0,
+              tags TEXT,
+              updated_at TEXT NOT NULL,
+              PRIMARY KEY (source, account_id, origin_id, topic_id)
+            );
+            INSERT INTO backup_policies(
+              source, account_id, origin_id, topic_id, enabled,
+              capture_text, capture_media_metadata, download_media, tags, updated_at
+            ) VALUES(
+              'telegram', 'main', -1001, 0, 1,
+              1, 1, 1, 'important', '2026-01-01T00:00:00+00:00'
+            );
+            """
+        )
+
+        apply_migrations(conn, 18, 19)
+
+        columns = {row[1] for row in conn.execute("PRAGMA table_info(backup_policies)")}
+        self.assertIn("download_stickers", columns)
+        self.assertEqual(
+            conn.execute(
+                "SELECT download_stickers FROM backup_policies WHERE account_id = 'main'"
+            ).fetchone()[0],
+            0,
+        )
+        self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 19)
+        self.assertEqual(conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0], "19")
+        conn.close()
+
     def test_v18_capture_cursor_migration_splits_legacy_watermark_and_marks_rescan(self) -> None:
         conn = sqlite3.connect(":memory:")
         conn.executescript(
@@ -1321,7 +1410,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 18)
+                self.assertEqual(store.state()["schema_version"], 19)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
@@ -1375,7 +1464,7 @@ class ArchiveMigrationTest(unittest.TestCase):
                 """
             )
 
-            apply_migrations(conn, 12, 18)
+            apply_migrations(conn, 12, 19)
 
             columns = {row[1] for row in conn.execute("PRAGMA table_info(daily_summary_jobs)")}
             self.assertTrue(
@@ -1404,10 +1493,10 @@ class ArchiveMigrationTest(unittest.TestCase):
                 conn.execute("SELECT record_type FROM daily_summary_records WHERE summary_id='legacy_summary'").fetchone()[0],
                 "important_origin",
             )
-            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 18)
+            self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 19)
             self.assertEqual(
                 conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
-                "18",
+                "19",
             )
             self.assertEqual(conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id='legacy_job'").fetchone()[0], "queued")
 
@@ -1466,7 +1555,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 18)
+                self.assertEqual(store.state()["schema_version"], 19)
                 record = store.get_daily_summary_record(summary_id="legacy_v15")
                 assert record is not None
                 self.assertEqual(record["record_type"], "important_origin")

@@ -278,6 +278,10 @@
           "download_media": {
             "type": "boolean"
           },
+          "download_stickers": {
+            "description": "Download sticker and custom-emoji document files independently of download_media; their emoji text is always archived.",
+            "type": "boolean"
+          },
           "enabled": {
             "type": "boolean"
           },
@@ -351,6 +355,11 @@
           },
           "download_media": {
             "default": false,
+            "type": "boolean"
+          },
+          "download_stickers": {
+            "default": false,
+            "description": "Download sticker and custom-emoji document files independently of download_media; their emoji text is always archived.",
             "type": "boolean"
           },
           "enabled": {
@@ -2561,8 +2570,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-07-19.1",
-    "x-contract-hash": "4ef7a958cada8ce2"
+    "version": "2026-08-08.1",
+    "x-contract-hash": "78b805811ef04667"
   },
   "openapi": "3.1.0",
   "paths": {

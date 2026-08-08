@@ -7,6 +7,10 @@ validation rules.
 
 ## Unreleased
 
+- Changed Telegram sticker backup to archive the associated emoji text by
+  default, and added an opt-in per-origin `download_stickers` policy for also
+  saving the original sticker or custom-emoji document file.
+
 ## 0.3.2 - 2026-08-07
 
 - Isolated direct Codex daily-analysis batches with `--disable hooks` and

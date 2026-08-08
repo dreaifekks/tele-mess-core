@@ -63,7 +63,10 @@ configure Telegram origins:
 - Origin identity: stable source, `account_id`, origin type, Telegram origin ID,
   username/title, and raw origin metadata for later migration.
 - Backup policy: whether an origin is selected for backup, whether only text is
-  archived, and whether media metadata or media files should be included.
+  archived, whether media metadata or media files should be included, and
+  whether the original files for sticker/custom-emoji document messages should
+  also be downloaded. These messages are archived as compact emoji text by
+  default.
 - Member/person profile: group participants and sender profiles used later to
   identify important information sources.
 - Daily package run: a local-date package of enabled archived origins, grouped

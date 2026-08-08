@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 
-API_CONTRACT_VERSION = "2026-07-19.1"
+API_CONTRACT_VERSION = "2026-08-08.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -288,6 +288,13 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "capture_text": {"type": "boolean"},
             "capture_media_metadata": {"type": "boolean"},
             "download_media": {"type": "boolean"},
+            "download_stickers": {
+                "type": "boolean",
+                "description": (
+                    "Download sticker and custom-emoji document files independently of download_media; "
+                    "their emoji text is always archived."
+                ),
+            },
             "tags": {"type": "string", "nullable": True},
             "updated_at": {"type": "string", "nullable": True},
         },
@@ -303,6 +310,14 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "capture_text": {"type": "boolean", "default": True},
             "capture_media_metadata": {"type": "boolean", "default": True},
             "download_media": {"type": "boolean", "default": False},
+            "download_stickers": {
+                "type": "boolean",
+                "default": False,
+                "description": (
+                    "Download sticker and custom-emoji document files independently of download_media; "
+                    "their emoji text is always archived."
+                ),
+            },
             "tags": {"type": "string"},
         },
         required=["account_id", "origin_id"],

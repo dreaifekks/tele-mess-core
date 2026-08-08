@@ -369,16 +369,26 @@ server is bound to a loopback address.
 
 ## Media Backup Semantics
 
-Backup policy separates three media modes:
+Backup policy separates four capture choices:
 
 - `capture_text`: store message text.
 - `capture_media_metadata`: store Telegram media metadata in the message row.
 - `download_media`: download media files and expose them through `/sync/media-files`.
+- `download_stickers`: additionally download original sticker/custom-emoji
+  document files and expose them through `/sync/media-files`. It defaults to
+  `false`.
+
+Sticker and custom-emoji document messages are always compressed to their
+Telegram-associated emoji in archived message text. Enabling
+`download_stickers` keeps that compact text and also saves the original file.
 
 Media files requested by `download_media: true` are stored under a `media/`
 directory next to the SQLite database. Download failures are retried according
 to `telegram.media_download` and then recorded in `/manage/operation-events`
 if they still fail.
+
+Changing `download_stickers` affects newly ingested or revisited history.
+Disabling it does not delete sticker files that were already downloaded.
 
 ## Daily Packaging
 

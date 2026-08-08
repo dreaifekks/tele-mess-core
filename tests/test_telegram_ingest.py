@@ -86,11 +86,13 @@ class Document:
 
 
 class DocumentAttributeSticker:
-    pass
+    def __init__(self, alt: str = ""):
+        self.alt = alt
 
 
 class DocumentAttributeCustomEmoji:
-    pass
+    def __init__(self, alt: str = ""):
+        self.alt = alt
 
 
 class WebPage:
@@ -390,7 +392,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         files = self.store.list_media_files(account_id="main", chat_id=-1019, message_id=23)
         self.assertEqual(len(files), 1)
 
-    async def test_sticker_document_metadata_does_not_download_file(self) -> None:
+    async def test_sticker_is_stored_as_emoji_when_download_media_is_enabled(self) -> None:
         self.store.set_backup_policy(
             BackupPolicyRecord(
                 source=SOURCE_TELEGRAM,
@@ -405,7 +407,8 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         message = FakeMessage(
             18,
             -1010,
-            media=MessageMediaDocument(Document(attributes=[DocumentAttributeSticker()])),
+            text="",
+            media=MessageMediaDocument(Document(attributes=[DocumentAttributeSticker("🙂")])),
         )
 
         stored = await self.service._store_message(message, event_type="new")
@@ -415,24 +418,66 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         files = self.store.list_media_files(account_id="main", chat_id=-1010, message_id=18)
         self.assertEqual(files, [])
         messages = self.store.list_messages_after(after_event_seq=0)["items"]
-        self.assertEqual(messages[0]["has_media"], 1)
-        self.assertEqual(messages[0]["media_kind"], "MessageMediaDocument")
+        self.assertEqual(messages[0]["text"], "🙂")
+        self.assertEqual(messages[0]["has_media"], 0)
+        self.assertIsNone(messages[0]["media_kind"])
+        self.assertIsNone(messages[0]["grouped_id"])
+        self.assertIsNone(messages[0]["raw_json"])
         self.assertEqual(self.store.list_operation_events(account_id="main"), [])
 
-    async def test_custom_emoji_document_metadata_does_not_download_file(self) -> None:
+    async def test_download_stickers_downloads_file_independently_of_download_media(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1012,
+                enabled=True,
+                download_media=False,
+                download_stickers=True,
+            )
+        )
+        message = FakeMessage(
+            24,
+            -1012,
+            text="",
+            media=MessageMediaDocument(Document(attributes=[DocumentAttributeSticker("🙃")])),
+        )
+
+        stored = await self.service._store_message(message, event_type="new")
+
+        self.assertTrue(stored)
+        self.assertEqual(message.download_attempts, 1)
+        files = self.store.list_media_files(account_id="main", chat_id=-1012, message_id=24)
+        self.assertEqual(len(files), 1)
+        self.assertTrue(Path(files[0]["file_path"]).exists())
+        self.assertEqual(files[0]["file_size"], 5)
+        messages = self.store.list_messages_after(after_event_seq=0)["items"]
+        self.assertEqual(messages[0]["text"], "🙃")
+        self.assertEqual(messages[0]["has_media"], 1)
+        self.assertEqual(messages[0]["media_kind"], "MessageMediaDocument")
+        self.assertEqual(messages[0]["grouped_id"], "99")
+        self.assertIsNotNone(messages[0]["raw_json"])
+        cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, "main", -1012)
+        self.assertIsNotNone(cursor)
+        assert cursor is not None
+        self.assertEqual(cursor["last_message_id"], 24)
+
+    async def test_custom_emoji_document_is_stored_from_attribute_alt(self) -> None:
         self.store.set_backup_policy(
             BackupPolicyRecord(
                 source=SOURCE_TELEGRAM,
                 account_id="main",
                 origin_id=-1011,
                 enabled=True,
+                capture_text=False,
                 download_media=True,
             )
         )
         message = FakeMessage(
             19,
             -1011,
-            media=MessageMediaDocument(Document(attributes=[DocumentAttributeCustomEmoji()])),
+            text="",
+            media=MessageMediaDocument(Document(attributes=[DocumentAttributeCustomEmoji("🔥")])),
         )
 
         stored = await self.service._store_message(message, event_type="new")
@@ -440,7 +485,36 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(stored)
         self.assertEqual(message.download_attempts, 0)
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=-1011, message_id=19), [])
+        messages = self.store.list_messages_after(after_event_seq=0)["items"]
+        self.assertEqual(messages[0]["text"], "🔥")
+        self.assertEqual(messages[0]["has_media"], 0)
+        self.assertIsNone(messages[0]["media_kind"])
+        self.assertIsNone(messages[0]["raw_json"])
         self.assertEqual(self.store.list_operation_events(account_id="main"), [])
+
+    async def test_sticker_without_alt_uses_compact_fallback(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-1013,
+                enabled=True,
+            )
+        )
+        message = FakeMessage(
+            25,
+            -1013,
+            text="",
+            media=MessageMediaDocument(Document(attributes=[DocumentAttributeSticker()])),
+        )
+
+        stored = await self.service._store_message(message, event_type="new")
+
+        self.assertTrue(stored)
+        messages = self.store.list_messages_after(after_event_seq=0)["items"]
+        self.assertEqual(messages[0]["text"], "[sticker]")
+        self.assertEqual(messages[0]["has_media"], 0)
+        self.assertEqual(message.download_attempts, 0)
 
     async def test_download_media_retries_and_records_recovered_attempt(self) -> None:
         self.store.set_backup_policy(

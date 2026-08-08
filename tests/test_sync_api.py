@@ -193,6 +193,8 @@ class SyncApiTest(unittest.TestCase):
         connection.close()
 
         self.assertIn("Save policy", html)
+        self.assertIn('name="download_stickers"', html)
+        self.assertIn("Save stickers as media", html)
         self.assertIn("escapeHtml", html)
         self.assertIn("API token required", html)
         self.assertIn("Enter server.token", html)
@@ -821,12 +823,37 @@ class SyncApiTest(unittest.TestCase):
                 "capture_text": True,
                 "capture_media_metadata": True,
                 "download_media": False,
+                "download_stickers": True,
                 "tags": "alpha,beta",
             },
         )["item"]
         self.assertTrue(policy["enabled"])
         self.assertFalse(policy["download_media"])
+        self.assertTrue(policy["download_stickers"])
         self.assertEqual(policy["tags"], "alpha,beta")
+
+        listed_policy = next(
+            item
+            for item in self.request_json("/manage/backup-policies?account_id=main")["items"]
+            if item["origin_id"] == -1001 and item["topic_id"] == 123
+        )
+        self.assertTrue(listed_policy["download_stickers"])
+
+        legacy_patch = self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={
+                "account_id": "main",
+                "origin_id": -1001,
+                "topic_id": 123,
+                "enabled": True,
+                "capture_text": True,
+                "capture_media_metadata": True,
+                "download_media": False,
+                "tags": "alpha,beta",
+            },
+        )["item"]
+        self.assertTrue(legacy_patch["download_stickers"])
 
         participant = self.request_json(
             "/manage/participants",
@@ -846,6 +873,7 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(next(item for item in origins if item["topic_id"] == 0)["last_message_at"], "2026-01-01T00:00:00+00:00")
         saved_topic = next(item for item in origins if item["topic_id"] == 123)
         self.assertTrue(saved_topic["backup_policy"]["enabled"])
+        self.assertTrue(saved_topic["backup_policy"]["download_stickers"])
         self.assertEqual(saved_topic["backup_policy"]["tags"], "alpha,beta")
         participants = self.request_json("/manage/participants?account_id=main&origin_id=-1001")["items"]
         self.assertEqual(participants[0]["display_name"], "Alice")
@@ -909,11 +937,12 @@ class SyncApiTest(unittest.TestCase):
             method="POST",
             payload={"account_id": "main", "origin_id": -1001, "origin_type": "group", "title": "Source Group"},
         )
-        self.request_json(
+        default_policy = self.request_json(
             "/manage/backup-policies",
             method="PATCH",
             payload={"account_id": "main", "origin_id": -1001, "enabled": True},
-        )
+        )["item"]
+        self.assertFalse(default_policy["download_stickers"])
         self.request_json(
             "/manage/participants",
             method="POST",

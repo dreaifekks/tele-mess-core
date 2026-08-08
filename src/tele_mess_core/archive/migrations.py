@@ -286,6 +286,20 @@ def _migration_18(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_19(connection: sqlite3.Connection) -> None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'backup_policies'"
+    ).fetchone()
+    if table is None:
+        return
+    _ensure_column(
+        connection,
+        "backup_policies",
+        "download_stickers",
+        "INTEGER NOT NULL DEFAULT 0",
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -300,4 +314,5 @@ MIGRATIONS: dict[int, Migration] = {
     16: _migration_16,
     17: _migration_17,
     18: _migration_18,
+    19: _migration_19,
 }

@@ -593,6 +593,44 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(messages[42]["telegram_deeplink"], "tg://resolve?domain=example_channel&post=42")
         self.assertEqual(messages[99]["telegram_deeplink"], "tg://privatepost?channel=1234567890&post=99")
 
+    def test_daily_package_preserves_sticker_emoji_without_media_file(self) -> None:
+        self._origin(-8040, "Sticker Source", "info")
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-8040,
+                message_id=7,
+                sent_at="2026-07-03T01:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="🙂",
+                has_media=False,
+            ),
+            event_type="new",
+        )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        message = payload["point_origins"][0]["messages"][0]
+        self.assertEqual(message["text"], "🙂")
+        self.assertFalse(message["has_media"])
+        self.assertIsNone(message["media_kind"])
+        self.assertEqual(message["media_files"], [])
+        self.assertEqual(payload["stats"]["message_count"], 1)
+        self.assertEqual(payload["stats"]["media_count"], 0)
+        origin_markdown = "\n".join(
+            path.read_text(encoding="utf-8")
+            for path in (Path(package["output_dir"]) / "point-origins").glob("*.md")
+        )
+        self.assertIn(": 🙂", origin_markdown)
+
     def test_daily_package_pages_through_complete_origin_history(self) -> None:
         self._origin(-8050, "Paged Origin", "info")
         for message_id in range(1, 6):

@@ -316,6 +316,7 @@
     <label class="check"><input type="checkbox" name="capture_text"> Text</label>
     <label class="check"><input type="checkbox" name="capture_media_metadata"> Media metadata</label>
     <label class="check"><input type="checkbox" name="download_media"> Download media</label>
+    <label class="check"><input type="checkbox" name="download_stickers"> Save stickers as media</label>
     <label>Tags
       <div class="tag-editor" data-tag-editor>
         <div class="tag-chips" data-tag-chips></div>
@@ -1420,6 +1421,7 @@ function openPolicy(button) {
   form.capture_text.checked = policy.capture_text ?? origin?.backup_policy?.capture_text ?? true;
   form.capture_media_metadata.checked = policy.capture_media_metadata ?? origin?.backup_policy?.capture_media_metadata ?? true;
   form.download_media.checked = policy.download_media ?? origin?.backup_policy?.download_media ?? false;
+  form.download_stickers.checked = policy.download_stickers ?? origin?.backup_policy?.download_stickers ?? false;
   setupTagEditor(form.querySelector('[data-tag-editor]'), policy.tags ?? origin?.backup_policy?.tags ?? '');
   form.addEventListener('submit', async (event) => { event.preventDefault(); try { await post('/manage/backup-policies', numberFields(formData(form), ['origin_id','topic_id']), 'PATCH'); row.remove(); } catch (error) { setStatus(String(error), 'error'); } });
   cell.appendChild(form); row.appendChild(cell); button.closest('tr').after(row);

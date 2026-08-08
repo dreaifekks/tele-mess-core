@@ -98,6 +98,7 @@ class BackupPolicyRecord:
     capture_text: bool = True
     capture_media_metadata: bool = True
     download_media: bool = False
+    download_stickers: bool = False
     tags: str | None = None
     updated_at: str | None = None
 

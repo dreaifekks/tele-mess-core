@@ -255,6 +255,25 @@ class TelegramArchiveService:
         if not policy.get("enabled", False):
             return False
 
+        sent_at = to_iso(getattr(message, "date", None)) or utc_now_iso()
+        is_sticker_like = _message_media_is_sticker_like(message)
+        capture_text = policy.get("capture_text", True)
+        capture_media_metadata = policy.get("capture_media_metadata", True)
+        download_media = policy.get("download_media", False)
+        download_stickers = policy.get("download_stickers", False)
+        message_text = getattr(message, "text", None) if capture_text else None
+        if is_sticker_like:
+            message_text = _sticker_archive_text(message, include_message_text=capture_text)
+
+        captures_media = (
+            bool(getattr(message, "media", None))
+            and (
+                download_stickers
+                if is_sticker_like
+                else capture_media_metadata or download_media
+            )
+        )
+
         sender = None
         chat = None
         try:
@@ -280,19 +299,14 @@ class TelegramArchiveService:
             sender_id=getattr(sender, "id", None) if sender else getattr(message, "sender_id", None),
             sender_name=_display_name(sender),
             sender_username=getattr(sender, "username", None) if sender else None,
-            sent_at=to_iso(getattr(message, "date", None)) or utc_now_iso(),
+            sent_at=sent_at,
             edited_at=to_iso(getattr(message, "edit_date", None)),
             ingested_at=utc_now_iso(),
-            text=getattr(message, "text", None) if policy.get("capture_text", True) else None,
-            has_media=bool(getattr(message, "media", None))
-            and (policy.get("capture_media_metadata", True) or policy.get("download_media", False)),
-            media_kind=type(message.media).__name__
-            if getattr(message, "media", None)
-            and (policy.get("capture_media_metadata", True) or policy.get("download_media", False))
-            else None,
+            text=message_text,
+            has_media=captures_media,
+            media_kind=type(message.media).__name__ if captures_media else None,
             grouped_id=str(message.grouped_id)
-            if getattr(message, "grouped_id", None)
-            and (policy.get("capture_media_metadata", True) or policy.get("download_media", False))
+            if captures_media and getattr(message, "grouped_id", None)
             else None,
             reply_to_message_id=getattr(message, "reply_to_msg_id", None),
             forward_from_id=_forward_from_id(message),
@@ -302,11 +316,15 @@ class TelegramArchiveService:
             if getattr(message, "reactions", None)
             else None,
             raw_json=json.dumps(_safe_dict(message), ensure_ascii=False, default=str)
-            if policy.get("capture_media_metadata", True)
+            if capture_media_metadata and (not is_sticker_like or download_stickers)
             else None,
         )
         self.store.upsert_message(record, event_type=event_type)
-        if policy.get("download_media", False) and _message_media_downloadable(message):
+        should_download_media = download_stickers if is_sticker_like else download_media
+        if should_download_media and _message_media_downloadable(
+            message,
+            include_stickers=download_stickers,
+        ):
             existing_media = (
                 self.store.list_media_files(
                     account_id=self.account_id,
@@ -714,6 +732,7 @@ class TelegramArchiveService:
             "capture_text": True,
             "capture_media_metadata": True,
             "download_media": False,
+            "download_stickers": False,
         }
 
     def _has_enabled_policy_for_chat(self, chat_id: int) -> bool:
@@ -871,11 +890,11 @@ def _coerce_messages(value: Any) -> list[Any]:
         return [value]
 
 
-def _message_media_downloadable(message: Any) -> bool:
+def _message_media_downloadable(message: Any, *, include_stickers: bool = False) -> bool:
     media = getattr(message, "media", None)
     if media is None:
         return False
-    if _message_media_is_sticker_like(message):
+    if _message_media_is_sticker_like(message) and not include_stickers:
         return False
     media_type = type(media).__name__
     downloadable_types = {
@@ -913,6 +932,41 @@ def _message_media_is_sticker_like(message: Any) -> bool:
     if type(webpage).__name__ == "WebPage":
         return _document_has_sticker_attribute(getattr(webpage, "document", None))
     return False
+
+
+def _sticker_archive_text(message: Any, *, include_message_text: bool) -> str:
+    original_text = getattr(message, "text", None) if include_message_text else None
+    original_text = str(original_text).strip() if original_text else ""
+    emoji = _message_sticker_emoji(message)
+    if original_text and emoji and original_text != emoji:
+        return f"{original_text}\n{emoji}"
+    return original_text or emoji or "[sticker]"
+
+
+def _message_sticker_emoji(message: Any) -> str | None:
+    file_info = getattr(message, "file", None)
+    file_emoji = getattr(file_info, "emoji", None) if file_info is not None else None
+    if file_emoji and str(file_emoji).strip():
+        return str(file_emoji).strip()
+
+    media = getattr(message, "media", None)
+    documents = [getattr(message, "sticker", None)]
+    if type(media).__name__ == "Document":
+        documents.append(media)
+    documents.append(getattr(media, "document", None))
+    webpage = getattr(media, "webpage", None)
+    if type(webpage).__name__ == "WebPage":
+        documents.append(getattr(webpage, "document", None))
+
+    sticker_attribute_types = {"DocumentAttributeSticker", "DocumentAttributeCustomEmoji"}
+    for document in documents:
+        for attribute in getattr(document, "attributes", []) or []:
+            if type(attribute).__name__ not in sticker_attribute_types:
+                continue
+            alt = getattr(attribute, "alt", None)
+            if alt and str(alt).strip():
+                return str(alt).strip()
+    return None
 
 
 def _document_has_sticker_attribute(document: Any) -> bool:

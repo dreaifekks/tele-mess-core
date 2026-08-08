@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-07-19.1`
-- Contract hash: `4ef7a958cada8ce2`
+- Contract version: `2026-08-08.1`
+- Contract hash: `78b805811ef04667`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1032,6 +1032,7 @@ Response: `ParticipantRefreshResultResponse`
 | `capture_text` | `boolean` | no |
 | `capture_media_metadata` | `boolean` | no |
 | `download_media` | `boolean` | no |
+| `download_stickers` | `boolean` | no |
 | `tags` | `string` | no |
 | `updated_at` | `string` | no |
 
@@ -1053,6 +1054,7 @@ Response: `ParticipantRefreshResultResponse`
 | `capture_text` | `boolean` | no |
 | `capture_media_metadata` | `boolean` | no |
 | `download_media` | `boolean` | no |
+| `download_stickers` | `boolean` | no |
 | `tags` | `string` | no |
 
 ### BackupPolicyItemResponse

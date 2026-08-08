@@ -71,6 +71,11 @@ Each package run writes files under:
   `tg://` deeplink;
 - media metadata: kind, MIME type, file size, downloaded file path.
 
+Sticker and custom-emoji document messages appear in the message list as their
+Telegram-associated emoji text. When the backup policy enables
+`download_stickers`, the original document file is additionally included as a
+media entry and contributes to media counts.
+
 `package.md` and the per-group/per-origin Markdown files are human review
 entrances.
 Origin history is read in pages, so the previous implicit 10,000-message daily

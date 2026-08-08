@@ -83,6 +83,7 @@ CREATE TABLE IF NOT EXISTS backup_policies (
   capture_text INTEGER NOT NULL DEFAULT 1,
   capture_media_metadata INTEGER NOT NULL DEFAULT 1,
   download_media INTEGER NOT NULL DEFAULT 0,
+  download_stickers INTEGER NOT NULL DEFAULT 0,
   tags TEXT,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (source, account_id, origin_id, topic_id)

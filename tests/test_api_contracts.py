@@ -40,6 +40,11 @@ class ApiContractTest(unittest.TestCase):
         daily_job_properties = openapi["components"]["schemas"]["DailySummaryJob"]["properties"]
         self.assertIn("retry_at", daily_job_properties)
         self.assertIn("retry_count", daily_job_properties)
+        backup_policy_properties = openapi["components"]["schemas"]["BackupPolicy"]["properties"]
+        self.assertEqual(backup_policy_properties["download_stickers"]["type"], "boolean")
+        backup_policy_input_properties = openapi["components"]["schemas"]["BackupPolicyInput"]["properties"]
+        self.assertEqual(backup_policy_input_properties["download_stickers"]["type"], "boolean")
+        self.assertIs(backup_policy_input_properties["download_stickers"]["default"], False)
         self.assertIn("ApiManifest", openapi["components"]["schemas"])
         self.assertEqual(set(ENDPOINTS_BY_ROUTE), {(method.upper(), path) for method, path in expected})
         self.assertEqual(
