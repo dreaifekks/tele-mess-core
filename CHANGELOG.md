@@ -7,6 +7,15 @@ validation rules.
 
 ## Unreleased
 
+## 0.3.4 - 2026-08-08
+
+- Added server-side filename, normalized media-type, and exact extension filters
+  to `GET /sync/media-files`; filters compose with existing criteria and run
+  before ordering and limiting results.
+- Added derived `filename`, `file_extension`, and `media_type` fields to shared
+  media responses so macOS and other clients can consume one authoritative
+  classification contract.
+
 ## 0.3.3 - 2026-08-08
 
 - Changed Telegram sticker backup to archive the associated emoji text by

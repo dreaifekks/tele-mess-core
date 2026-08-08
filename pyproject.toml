@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tele-mess-core"
-version = "0.3.3"
+version = "0.3.4"
 description = "Local-first Telegram archive and Codex analysis engine with SQLite and a sync API"
 readme = "README.md"
 requires-python = ">=3.11"
