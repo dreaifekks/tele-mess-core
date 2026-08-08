@@ -30,6 +30,14 @@ from tele_mess_core.models import (
     utc_now_iso,
 )
 from tele_mess_core.archive.migrations import apply_migrations
+from tele_mess_core.media import (
+    classify_media_type,
+    media_file_extension,
+    media_filename,
+    media_filename_contains,
+    normalize_file_extension_filter,
+    normalize_media_type_filter,
+)
 
 
 SCHEMA_VERSION = 19
@@ -68,6 +76,10 @@ class ArchiveStore:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 30000")
+        connection.create_function("tmc_media_filename", 1, media_filename, deterministic=True)
+        connection.create_function("tmc_media_file_extension", 1, media_file_extension, deterministic=True)
+        connection.create_function("tmc_media_type", 3, classify_media_type, deterministic=True)
+        connection.create_function("tmc_media_filename_contains", 2, media_filename_contains, deterministic=True)
         self._local.connection = connection
         with self._state_lock:
             if self._closed:
@@ -1114,10 +1126,16 @@ class ArchiveStore:
         chat_id: int | None = None,
         message_id: int | None = None,
         limit: int = 500,
+        filename_query: str | None = None,
+        media_type: str | None = None,
+        file_extension: str | None = None,
     ) -> list[dict[str, Any]]:
         sql = """
             SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
                    m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                   tmc_media_filename(m.file_path) AS filename,
+                   tmc_media_file_extension(m.file_path) AS file_extension,
+                   tmc_media_type(m.media_kind, m.mime_type, m.file_path) AS media_type,
                    COALESCE(c.title, o.title) AS chat_title
             FROM media_files m
             LEFT JOIN chats c
@@ -1141,6 +1159,15 @@ class ArchiveStore:
         if message_id is not None:
             clauses.append("m.message_id = ?")
             params.append(message_id)
+        if filename_query is not None:
+            clauses.append("tmc_media_filename_contains(m.file_path, ?)")
+            params.append(filename_query)
+        if media_type is not None:
+            clauses.append("tmc_media_type(m.media_kind, m.mime_type, m.file_path) = ?")
+            params.append(normalize_media_type_filter(media_type))
+        if file_extension is not None:
+            clauses.append("tmc_media_file_extension(m.file_path) = ?")
+            params.append(normalize_file_extension_filter(file_extension))
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY m.downloaded_at DESC, m.account_id, m.chat_id, m.message_id, m.file_index LIMIT ?"
@@ -1162,6 +1189,9 @@ class ArchiveStore:
                 """
                 SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
                        m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                       tmc_media_filename(m.file_path) AS filename,
+                       tmc_media_file_extension(m.file_path) AS file_extension,
+                       tmc_media_type(m.media_kind, m.mime_type, m.file_path) AS media_type,
                        COALESCE(c.title, o.title) AS chat_title
                 FROM media_files m
                 LEFT JOIN chats c
@@ -1209,6 +1239,9 @@ class ArchiveStore:
         lookup_sql = """
             SELECT m.source, m.account_id, m.chat_id, m.message_id, m.file_index, m.file_path,
                    m.media_kind, m.mime_type, m.file_size, m.downloaded_at, m.raw_json,
+                   tmc_media_filename(m.file_path) AS filename,
+                   tmc_media_file_extension(m.file_path) AS file_extension,
+                   tmc_media_type(m.media_kind, m.mime_type, m.file_path) AS media_type,
                    COALESCE(c.title, o.title) AS chat_title
             FROM media_files m
             LEFT JOIN chats c

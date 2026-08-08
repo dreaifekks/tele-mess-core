@@ -5,8 +5,10 @@ import json
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from tele_mess_core.media import MEDIA_TYPES
 
-API_CONTRACT_VERSION = "2026-08-08.1"
+
+API_CONTRACT_VERSION = "2026-08-08.2"
 API_MANIFEST_PATH = "/manage/api-manifest"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
@@ -19,6 +21,7 @@ class ApiParam:
     required: bool = False
     description: str = ""
     default: Any | None = None
+    enum: tuple[str, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -513,6 +516,19 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "message_id": {"type": "integer"},
             "file_index": {"type": "integer"},
             "file_path": {"type": "string"},
+            "filename": {
+                "type": "string",
+                "description": "Lexical basename of file_path; resolving it never probes the local filesystem.",
+            },
+            "file_extension": {
+                "type": "string",
+                "description": "Case-folded final filename extension without a leading dot, or an empty string.",
+            },
+            "media_type": {
+                "type": "string",
+                "enum": list(MEDIA_TYPES),
+                "description": "Normalized media classification shared with server-side filtering.",
+            },
             "media_kind": {"type": "string", "nullable": True},
             "mime_type": {"type": "string", "nullable": True},
             "file_size": {"type": "integer", "nullable": True},
@@ -525,7 +541,16 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "download_url": {"type": "string"},
             "raw_json": {"type": "object", "nullable": True},
         },
-        required=["source", "account_id", "chat_id", "message_id", "file_index"],
+        required=[
+            "source",
+            "account_id",
+            "chat_id",
+            "message_id",
+            "file_index",
+            "filename",
+            "file_extension",
+            "media_type",
+        ],
     ),
     "DailySummaryDelivery": _object(
         {
@@ -947,11 +972,27 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
         "GET",
         "/sync/media-files",
         "sync",
-        "Return downloaded media file records.",
+        "Return downloaded media file records; filters use AND semantics before ordering and limit.",
         query=(
             COMMON_ACCOUNT_PARAM,
             ApiParam("chat_id", "integer", description="Filter to a Telegram chat or origin ID."),
             ApiParam("message_id", "integer", description="Filter to a message ID."),
+            ApiParam(
+                "filename_query",
+                description="Case-insensitive substring filter against the lexical basename of file_path only.",
+            ),
+            ApiParam(
+                "media_type",
+                description=(
+                    "Normalized type: image, video, text, audio, document, or other; "
+                    "any other value returns 400."
+                ),
+                enum=MEDIA_TYPES,
+            ),
+            ApiParam(
+                "file_extension",
+                description="Case-insensitive exact extension filter; an optional leading dot is ignored.",
+            ),
             COMMON_LIMIT_PARAM,
         ),
         response_schema="MediaFileListResponse",
@@ -1277,6 +1318,9 @@ def validate_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -
                 "off",
             }:
                 raise ValueError(f"Query parameter {item.name} must be a boolean")
+            if item.enum and value not in item.enum:
+                allowed = ", ".join(item.enum)
+                raise ValueError(f"Query parameter {item.name} must be one of: {allowed}")
 
 
 def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
@@ -1411,6 +1455,8 @@ def _openapi_param(param: ApiParam) -> dict[str, Any]:
     schema: dict[str, Any] = {"type": param.type}
     if param.default is not None:
         schema["default"] = param.default
+    if param.enum:
+        schema["enum"] = list(param.enum)
     return {
         "name": param.name,
         "in": "query",

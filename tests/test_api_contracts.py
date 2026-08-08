@@ -45,6 +45,22 @@ class ApiContractTest(unittest.TestCase):
         backup_policy_input_properties = openapi["components"]["schemas"]["BackupPolicyInput"]["properties"]
         self.assertEqual(backup_policy_input_properties["download_stickers"]["type"], "boolean")
         self.assertIs(backup_policy_input_properties["download_stickers"]["default"], False)
+        media_file_schema = openapi["components"]["schemas"]["MediaFile"]
+        self.assertTrue({"filename", "file_extension", "media_type"}.issubset(media_file_schema["properties"]))
+        self.assertTrue({"filename", "file_extension", "media_type"}.issubset(media_file_schema["required"]))
+        self.assertEqual(
+            media_file_schema["properties"]["media_type"]["enum"],
+            ["image", "video", "text", "audio", "document", "other"],
+        )
+        media_parameters = {
+            item["name"]: item
+            for item in openapi["paths"]["/sync/media-files"]["get"]["parameters"]
+        }
+        self.assertTrue({"filename_query", "file_extension", "media_type"}.issubset(media_parameters))
+        self.assertEqual(
+            media_parameters["media_type"]["schema"]["enum"],
+            ["image", "video", "text", "audio", "document", "other"],
+        )
         self.assertIn("ApiManifest", openapi["components"]["schemas"])
         self.assertEqual(set(ENDPOINTS_BY_ROUTE), {(method.upper(), path) for method, path in expected})
         self.assertEqual(
@@ -91,6 +107,15 @@ class ApiContractTest(unittest.TestCase):
         )
         with self.assertRaisesRegex(ValueError, "account_id"):
             validate_query_params(media_endpoint, {"chat_id": ["-1001"], "message_id": ["1"]})
+
+        media_list_endpoint = next(
+            endpoint
+            for endpoint in API_ENDPOINTS
+            if endpoint.method == "GET" and endpoint.path == "/sync/media-files"
+        )
+        validate_query_params(media_list_endpoint, {"media_type": ["text"], "file_extension": [".MD"]})
+        with self.assertRaisesRegex(ValueError, "media_type must be one of"):
+            validate_query_params(media_list_endpoint, {"media_type": ["archive"]})
 
         points_endpoint = next(
             endpoint

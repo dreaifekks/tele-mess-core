@@ -1701,6 +1701,10 @@
             "nullable": true,
             "type": "string"
           },
+          "file_extension": {
+            "description": "Case-folded final filename extension without a leading dot, or an empty string.",
+            "type": "string"
+          },
           "file_index": {
             "type": "integer"
           },
@@ -1711,8 +1715,24 @@
             "nullable": true,
             "type": "integer"
           },
+          "filename": {
+            "description": "Lexical basename of file_path; resolving it never probes the local filesystem.",
+            "type": "string"
+          },
           "media_kind": {
             "nullable": true,
+            "type": "string"
+          },
+          "media_type": {
+            "description": "Normalized media classification shared with server-side filtering.",
+            "enum": [
+              "image",
+              "video",
+              "text",
+              "audio",
+              "document",
+              "other"
+            ],
             "type": "string"
           },
           "message_id": {
@@ -1742,7 +1762,10 @@
           "account_id",
           "chat_id",
           "message_id",
-          "file_index"
+          "file_index",
+          "filename",
+          "file_extension",
+          "media_type"
         ],
         "type": "object"
       },
@@ -2570,8 +2593,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-08-08.1",
-    "x-contract-hash": "78b805811ef04667"
+    "version": "2026-08-08.2",
+    "x-contract-hash": "f3cf0bee1672e797"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -6567,6 +6590,41 @@
             }
           },
           {
+            "description": "Case-insensitive substring filter against the lexical basename of file_path only.",
+            "in": "query",
+            "name": "filename_query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "description": "Normalized type: image, video, text, audio, document, or other; any other value returns 400.",
+            "in": "query",
+            "name": "media_type",
+            "required": false,
+            "schema": {
+              "enum": [
+                "image",
+                "video",
+                "text",
+                "audio",
+                "document",
+                "other"
+              ],
+              "type": "string"
+            }
+          },
+          {
+            "description": "Case-insensitive exact extension filter; an optional leading dot is ignored.",
+            "in": "query",
+            "name": "file_extension",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
             "description": "Maximum rows to return.",
             "in": "query",
             "name": "limit",
@@ -6627,7 +6685,7 @@
             "ApiTokenAuth": []
           }
         ],
-        "summary": "Return downloaded media file records.",
+        "summary": "Return downloaded media file records; filters use AND semantics before ordering and limit.",
         "tags": [
           "sync"
         ]

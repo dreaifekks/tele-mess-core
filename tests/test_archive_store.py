@@ -713,6 +713,142 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(files[0]["chat_title"], "Media Chat")
 
+    def test_media_file_filters_apply_before_limit(self) -> None:
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-1002,
+                message_id=9000,
+                file_path="/archive/Needle_Report.MD",
+                media_kind="MessageMediaDocument",
+                mime_type="application/octet-stream",
+                downloaded_at="2020-01-01T00:00:00+00:00",
+            )
+        )
+        for message_id in range(1, 502):
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    chat_id=-1002,
+                    message_id=message_id,
+                    file_path=f"/archive/filler-{message_id}.bin",
+                    media_kind="MessageMediaDocument",
+                    downloaded_at="2026-08-08T00:00:00+00:00",
+                )
+            )
+
+        unfiltered = self.store.list_media_files(limit=500)
+        filtered = self.store.list_media_files(
+            filename_query="needle_report",
+            media_type="text",
+            file_extension=".MD",
+            limit=500,
+        )
+
+        self.assertNotIn(9000, {item["message_id"] for item in unfiltered})
+        self.assertEqual([item["message_id"] for item in filtered], [9000])
+        self.assertEqual(filtered[0]["filename"], "Needle_Report.MD")
+        self.assertEqual(filtered[0]["file_extension"], "md")
+        self.assertEqual(filtered[0]["media_type"], "text")
+
+    def test_media_filename_filter_is_basename_only_casefolded_and_literal(self) -> None:
+        now = utc_now_iso()
+        for message_id, file_path in (
+            (1, "/Report_Directory/plain.txt"),
+            (2, "/archive/Literal%_Name.txt"),
+            (3, "/archive/literalXXname.txt"),
+        ):
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    chat_id=-1002,
+                    message_id=message_id,
+                    file_path=file_path,
+                    downloaded_at=now,
+                )
+            )
+
+        self.assertEqual(self.store.list_media_files(filename_query="report"), [])
+        matches = self.store.list_media_files(filename_query="%_n")
+        self.assertEqual([item["message_id"] for item in matches], [2])
+
+    def test_media_type_classification_and_filters_cover_all_normalized_types(self) -> None:
+        now = utc_now_iso()
+        cases = (
+            (1, "/archive/photo.JPG", "MessageMediaDocument", None, "image"),
+            (2, "/archive/movie.ts", "MessageMediaDocument", "video/mp2t", "video"),
+            (3, "/archive/notes.JSON", "MessageMediaDocument", "application/octet-stream", "text"),
+            (4, "/archive/voice.bin", "MessageMediaDocument", "audio/ogg", "audio"),
+            (5, "/archive/report.pdf", "MessageMediaDocument", None, "document"),
+            (6, "/archive/payload.bin", None, "application/octet-stream", "other"),
+            (7, "/archive/source.ts", "MessageMediaDocument", "application/octet-stream", "text"),
+            (8, "/archive/container.ogv", "MessageMediaDocument", "application/ogg", "video"),
+            (9, "/archive/container.oga", "MessageMediaDocument", "application/ogg", "audio"),
+        )
+        for message_id, file_path, media_kind, mime_type, _ in cases:
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    chat_id=-1002,
+                    message_id=message_id,
+                    file_path=file_path,
+                    media_kind=media_kind,
+                    mime_type=mime_type,
+                    downloaded_at=now,
+                )
+            )
+
+        items = {item["message_id"]: item for item in self.store.list_media_files()}
+        for message_id, _, _, _, expected_type in cases:
+            self.assertEqual(items[message_id]["media_type"], expected_type)
+            filtered_ids = {
+                item["message_id"] for item in self.store.list_media_files(media_type=expected_type)
+            }
+            self.assertIn(message_id, filtered_ids)
+
+        with self.assertRaisesRegex(ValueError, "media_type must be one of"):
+            self.store.list_media_files(media_type="archive")
+        with self.assertRaisesRegex(ValueError, "file_extension must be one extension"):
+            self.store.list_media_files(file_extension="..md")
+
+    def test_media_filters_combine_with_identity_filters(self) -> None:
+        now = utc_now_iso()
+        for account_id, chat_id, message_id in (
+            ("main", -1002, 22),
+            ("other", -1002, 22),
+            ("main", -1003, 22),
+            ("main", -1002, 23),
+        ):
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=account_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    file_path=f"/archive/report-{account_id}-{chat_id}-{message_id}.md",
+                    media_kind="MessageMediaDocument",
+                    downloaded_at=now,
+                )
+            )
+
+        matches = self.store.list_media_files(
+            account_id="main",
+            chat_id=-1002,
+            message_id=22,
+            filename_query="REPORT",
+            media_type="text",
+            file_extension="MD",
+        )
+
+        self.assertEqual(len(matches), 1)
+        self.assertEqual(matches[0]["account_id"], "main")
+        self.assertEqual(matches[0]["chat_id"], -1002)
+        self.assertEqual(matches[0]["message_id"], 22)
+
     def test_media_files_can_be_grouped_by_message(self) -> None:
         now = utc_now_iso()
         self.store.upsert_media_file(

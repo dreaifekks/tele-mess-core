@@ -23,6 +23,7 @@ from tele_mess_core.models import (
     SOURCE_TELEGRAM,
     utc_now_iso,
 )
+from tele_mess_core.media import classify_media_type, media_file_extension, media_filename
 from tele_mess_core.server.contracts import (
     API_ENDPOINTS,
     API_CONTRACT_HASH,
@@ -245,6 +246,9 @@ class SyncApiServer:
                         chat_id=_optional_int_param(params, "chat_id"),
                         message_id=_optional_int_param(params, "message_id"),
                         limit=_int_param(params, "limit", 500),
+                        filename_query=_optional_str_param(params, "filename_query"),
+                        media_type=_optional_str_param(params, "media_type"),
+                        file_extension=_optional_str_param(params, "file_extension"),
                     )
                     self._json(
                         {
@@ -680,6 +684,13 @@ def _attach_message_media(store: ArchiveStore, payload: dict[str, Any]) -> None:
 
 def _media_public_item(item: dict[str, Any]) -> dict[str, Any]:
     public = dict(item)
+    public["filename"] = media_filename(public.get("file_path"))
+    public["file_extension"] = media_file_extension(public.get("file_path"))
+    public["media_type"] = classify_media_type(
+        public.get("media_kind"),
+        public.get("mime_type"),
+        public.get("file_path"),
+    )
     content_type = _media_content_type(public)
     access_url = _media_access_url(public)
     public["content_type"] = content_type

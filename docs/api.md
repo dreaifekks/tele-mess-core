@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-08-08.1`
-- Contract hash: `78b805811ef04667`
+- Contract version: `2026-08-08.2`
+- Contract hash: `f3cf0bee1672e797`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -25,7 +25,7 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /sync/accounts` (sync, token) - Return archive account metadata.
 - `GET /sync/chats` (sync, token) - Return archived chat metadata.
 - `GET /sync/search` (sync, token) - Search archived message text.
-- `GET /sync/media-files` (sync, token) - Return downloaded media file records.
+- `GET /sync/media-files` (sync, token) - Return downloaded media file records; filters use AND semantics before ordering and limit.
 - `GET /sync/media-files/content` (sync, token) - Return the binary contents of a registered media file.
 - `GET /manage/capabilities` (management, token) - Return supported management capabilities.
 - `GET /manage/api-manifest` (management, token) - Return the machine-readable API contract manifest.
@@ -228,7 +228,7 @@ Response: `MessageListResponse`
 
 ### GET /sync/media-files
 
-Return downloaded media file records.
+Return downloaded media file records; filters use AND semantics before ordering and limit.
 
 - Tag: `sync`
 - Auth: `required`
@@ -239,6 +239,9 @@ Query parameters:
 - `account_id` (`string`, optional) - Local Telegram account ID.
 - `chat_id` (`integer`, optional) - Filter to a Telegram chat or origin ID.
 - `message_id` (`integer`, optional) - Filter to a message ID.
+- `filename_query` (`string`, optional) - Case-insensitive substring filter against the lexical basename of file_path only.
+- `media_type` (`string`, optional) - Normalized type: image, video, text, audio, document, or other; any other value returns 400.
+- `file_extension` (`string`, optional) - Case-insensitive exact extension filter; an optional leading dot is ignored.
 - `limit` (`integer`, optional, default `500`) - Maximum rows to return.
 
 Request body: none
@@ -1527,6 +1530,9 @@ Response: `ParticipantRefreshResultResponse`
 | `message_id` | `integer` | yes |
 | `file_index` | `integer` | yes |
 | `file_path` | `string` | no |
+| `filename` | `string` | yes |
+| `file_extension` | `string` | yes |
+| `media_type` | `string` | yes |
 | `media_kind` | `string` | no |
 | `mime_type` | `string` | no |
 | `file_size` | `integer` | no |

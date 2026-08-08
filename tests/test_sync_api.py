@@ -615,8 +615,48 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
         self.assertEqual(payload["items"][0]["content_type"], "image/jpeg")
         self.assertEqual(payload["items"][0]["preview_kind"], "image")
+        self.assertEqual(payload["items"][0]["filename"], "api-media.jpg")
+        self.assertEqual(payload["items"][0]["file_extension"], "jpg")
+        self.assertEqual(payload["items"][0]["media_type"], "image")
         self.assertIn("/sync/media-files/content?", payload["items"][0]["access_url"])
         self.assertIn("message_id=1", payload["items"][0]["access_url"])
+
+    def test_media_files_endpoint_applies_server_side_filters(self) -> None:
+        for message_id, filename in ((10, "Quarterly_Report.MD"), (11, "photo.jpg")):
+            self.store.upsert_media_file(
+                MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="default",
+                    chat_id=-1001,
+                    message_id=message_id,
+                    file_path=str(Path(self.tmp.name) / filename),
+                    media_kind="MessageMediaDocument",
+                    downloaded_at=utc_now_iso(),
+                )
+            )
+
+        payload = self.request_json(
+            "/sync/media-files?account_id=default&chat_id=-1001&message_id=10"
+            "&filename_query=quarterly&media_type=text&file_extension=.MD&limit=500"
+        )
+
+        self.assertEqual([item["message_id"] for item in payload["items"]], [10])
+        self.assertEqual(payload["items"][0]["filename"], "Quarterly_Report.MD")
+        self.assertEqual(payload["items"][0]["file_extension"], "md")
+        self.assertEqual(payload["items"][0]["media_type"], "text")
+
+    def test_media_files_endpoint_rejects_invalid_media_type(self) -> None:
+        req = Request(f"http://127.0.0.1:{self.port}/sync/media-files?media_type=archive")
+        req.add_header("Authorization", "Bearer secret")
+
+        with self.assertRaises(HTTPError) as caught:
+            urlopen(req, timeout=3)
+
+        self.assertEqual(caught.exception.code, 400)
+        payload = json.loads(caught.exception.read().decode("utf-8"))
+        caught.exception.close()
+        self.assertEqual(payload["error"], "bad_request")
+        self.assertIn("media_type must be one of", payload["detail"])
 
     def test_media_file_content_endpoint_serves_registered_file(self) -> None:
         media_path = Path(self.tmp.name) / "api-media.txt"
@@ -671,6 +711,9 @@ class SyncApiTest(unittest.TestCase):
 
         self.assertEqual(payload["items"][0]["media_count"], 1)
         self.assertEqual(payload["items"][0]["media_files"][0]["message_id"], 1)
+        self.assertEqual(payload["items"][0]["media_files"][0]["filename"], "api-media.bin")
+        self.assertEqual(payload["items"][0]["media_files"][0]["file_extension"], "bin")
+        self.assertEqual(payload["items"][0]["media_files"][0]["media_type"], "document")
         self.assertIn("/sync/media-files/content?", payload["items"][0]["media_files"][0]["access_url"])
 
     def test_operation_events_endpoint(self) -> None:
