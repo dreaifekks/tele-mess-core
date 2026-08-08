@@ -140,7 +140,7 @@ class SyncApiServer:
         daily_worker = self.daily_worker
 
         class Handler(BaseHTTPRequestHandler):
-            server_version = "tele-mess-core/0.3.2"
+            server_version = "tele-mess-core/0.3.3"
 
             def log_message(self, fmt: str, *args: Any) -> None:
                 logging.getLogger("tele_mess_core.server").info(fmt, *args)
