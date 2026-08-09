@@ -20,10 +20,19 @@ from tele_mess_core.config import (
     LoggingConfig,
     ServerConfig,
     StorageConfig,
+    TelegramAccountConfig,
     TelegramConfig,
 )
-from tele_mess_core.daily_jobs import DailyJobWorker
-from tele_mess_core.models import BackupPolicyRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.daily_jobs import DailyJobWorker, DailyJobWorkerStopping
+from tele_mess_core.models import (
+    AccountRecord,
+    BackupPolicyRecord,
+    DailyPackageRunRecord,
+    MessageRecord,
+    OriginRecord,
+    SOURCE_TELEGRAM,
+    utc_now_iso,
+)
 from tele_mess_core.telegram.delivery import split_telegram_markdown
 
 
@@ -33,6 +42,9 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.store = ArchiveStore(self.root / "archive.db")
         self.store.initialize()
+        self.store.upsert_account(
+            AccountRecord(source=SOURCE_TELEGRAM, account_id="main", display_name="Main", kind="telegram")
+        )
         self.config = AppConfig(
             storage=StorageConfig(data_dir=self.root, database=self.root / "archive.db"),
             telegram=TelegramConfig(),
@@ -232,6 +244,108 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(completed["job_id"], job["job_id"])
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["attempt"], 2)
+
+    def test_worker_interruption_requeues_and_reuses_planned_package_id(self) -> None:
+        worker = DailyJobWorker(self.store, self.config, worker_id="stopping")
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        with patch(
+            "tele_mess_core.daily_jobs.build_daily_package",
+            side_effect=DailyJobWorkerStopping("worker stopping"),
+        ):
+            queued = worker.run_once()
+
+        assert queued is not None
+        planned_package_id = str(queued["package_run_id"])
+        self.assertEqual(queued["job_id"], job["job_id"])
+        self.assertEqual(queued["status"], "queued")
+        self.assertIsNone(queued["worker_id"])
+        self.assertIsNone(queued["lease_until"])
+        self.assertEqual(queued["progress_label"], "queued after worker stop")
+
+        completed = DailyJobWorker(
+            self.store,
+            self.config,
+            worker_id="replacement",
+        ).run_once()
+
+        assert completed is not None
+        self.assertEqual(completed["status"], "completed")
+        self.assertEqual(completed["package_run_id"], planned_package_id)
+
+    def test_expired_running_package_is_rebuilt_with_same_run_id(self) -> None:
+        old_worker = DailyJobWorker(self.store, self.config, worker_id="old")
+        job = old_worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        claimed = self.store.claim_daily_summary_job(
+            "old",
+            now="2000-01-01T00:00:00+00:00",
+            lease_until="2000-01-01T00:01:00+00:00",
+        )
+        assert claimed is not None
+        package_run_id = "pkg_expired_running"
+        self.store.upsert_daily_package_run(
+            DailyPackageRunRecord(
+                run_id=package_run_id,
+                status="running",
+                date="2026-07-03",
+                timezone="UTC",
+                scope_json='{"account_id": "main"}',
+                output_dir=str(self.config.daily.output_dir / "2026-07-03" / package_run_id),
+                progress_label="packaging",
+            )
+        )
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE daily_summary_jobs SET package_run_id = ? WHERE job_id = ?",
+                (package_run_id, job["job_id"]),
+            )
+            self.store._conn.commit()
+
+        recovered = DailyJobWorker(
+            self.store,
+            self.config,
+            worker_id="replacement",
+        ).run_once()
+
+        assert recovered is not None
+        self.assertEqual(recovered["status"], "completed")
+        self.assertEqual(recovered["package_run_id"], package_run_id)
+        rebuilt = self.store.get_daily_package_run(package_run_id)
+        assert rebuilt is not None
+        self.assertEqual(rebuilt["status"], "completed")
+
+    def test_worker_interruption_with_cancel_request_finishes_canceled(self) -> None:
+        worker = DailyJobWorker(self.store, self.config, worker_id="stopping")
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        def cancel_then_interrupt(*args: object, **kwargs: object) -> dict[str, object]:
+            self.store.request_daily_summary_job_cancel(job["job_id"])
+            raise DailyJobWorkerStopping("worker stopping")
+
+        with patch(
+            "tele_mess_core.daily_jobs.build_daily_package",
+            side_effect=cancel_then_interrupt,
+        ):
+            canceled = worker.run_once()
+
+        assert canceled is not None
+        self.assertEqual(canceled["status"], "canceled")
+        self.assertEqual(canceled["progress_label"], "canceled")
+        self.assertIsNone(canceled["worker_id"])
+        self.assertIsNone(canceled["lease_until"])
+        self.assertIsNotNone(canceled["finished_at"])
 
     def test_recovery_reuses_a_summary_completed_before_job_commit(self) -> None:
         first_worker = DailyJobWorker(self.store, self.config, worker_id="first")
@@ -518,6 +632,194 @@ class DailyJobWorkerTest(unittest.TestCase):
         parsed_calls = [telethon_markdown.parse(item[2]) for item in runtime.calls]
         self.assertTrue(any(entities for _, entities in parsed_calls))
         self.assertTrue(all("**" not in parsed and "```" not in parsed for parsed, _ in parsed_calls))
+
+    def test_delivery_outbox_uses_database_managed_telegram_account(self) -> None:
+        self.store.upsert_account(
+            AccountRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="dynamic",
+                display_name="Dynamic",
+                kind="telegram",
+            )
+        )
+        template = TelegramAccountConfig(
+            account_id="template",
+            api_id=123,
+            api_hash="hash",
+            session_name="template",
+            session_dir=self.root / "sessions",
+            timezone="UTC",
+        )
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=TelegramConfig(accounts=[template]),
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(
+                    enabled=True,
+                    account_id="dynamic",
+                    origin_id=-9001,
+                ),
+            ),
+        )
+        resolved_accounts: list[TelegramAccountConfig] = []
+
+        class FakeDeliveryService:
+            def __init__(self, account: TelegramAccountConfig, store: ArchiveStore) -> None:
+                resolved_accounts.append(account)
+
+            async def send_summary(
+                self,
+                delivery: DailyDeliveryConfig,
+                content: str,
+                *,
+                split_content: bool,
+            ) -> dict[str, object]:
+                return {"status": "sent", "message_ids": [90210], "message_count": 1}
+
+        worker = DailyJobWorker(self.store, delivery_config)
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        with patch(
+            "tele_mess_core.daily_jobs.TelegramSummaryDeliveryService",
+            FakeDeliveryService,
+        ):
+            completed = worker.run_once()
+
+        assert completed is not None
+        self.assertEqual(completed["job_id"], job["job_id"])
+        self.assertEqual(completed["status"], "completed")
+        self.assertTrue(resolved_accounts)
+        self.assertTrue(all(account.account_id == "dynamic" for account in resolved_accounts))
+        self.assertTrue(all(account.api_id == template.api_id for account in resolved_accounts))
+        outbox = self.store.list_delivery_outbox(summary_run_id=completed["summary_run_id"])
+        self.assertTrue(outbox)
+        self.assertTrue(all(item["status"] == "sent" for item in outbox))
+
+    def test_stop_interrupts_runtime_delivery_and_requeues_job(self) -> None:
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+
+        class BlockingRuntime:
+            def __init__(self) -> None:
+                self.entered = threading.Event()
+
+            def call(
+                self,
+                account_id: str,
+                operation: str,
+                *,
+                cancel_event: threading.Event,
+                **kwargs: object,
+            ) -> dict[str, object]:
+                self.entered.set()
+                if not cancel_event.wait(3):
+                    raise TimeoutError("delivery was not interrupted")
+                raise RuntimeError("delivery interrupted")
+
+        runtime = BlockingRuntime()
+        worker = DailyJobWorker(
+            self.store,
+            delivery_config,
+            telegram_runtime=runtime,
+            poll_interval=0.01,
+        )
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        worker.start()
+        try:
+            self.assertTrue(runtime.entered.wait(3), "worker did not reach delivery")
+        finally:
+            worker.stop(timeout=2)
+
+        current = self.store.get_daily_summary_job(job["job_id"])
+        assert current is not None
+        self.assertEqual(current["status"], "queued")
+        outbox = self.store.list_delivery_outbox(summary_run_id=current["summary_run_id"])
+        self.assertTrue(outbox)
+        self.assertTrue(all(item["status"] == "retry" for item in outbox))
+
+    def test_stop_cancels_direct_async_delivery_and_requeues_job(self) -> None:
+        account = TelegramAccountConfig(
+            account_id="main",
+            api_id=123,
+            api_hash="hash",
+            session_name="main",
+            session_dir=self.root / "sessions",
+            timezone="UTC",
+        )
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=TelegramConfig(accounts=[account]),
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+        entered = threading.Event()
+        canceled = threading.Event()
+
+        class BlockingDeliveryService:
+            def __init__(self, account: TelegramAccountConfig, store: ArchiveStore) -> None:
+                pass
+
+            async def send_summary(
+                self,
+                delivery: DailyDeliveryConfig,
+                content: str,
+                *,
+                split_content: bool,
+            ) -> dict[str, object]:
+                entered.set()
+                try:
+                    await asyncio.Future()
+                finally:
+                    canceled.set()
+
+        worker = DailyJobWorker(self.store, delivery_config, poll_interval=0.01)
+        job = worker.enqueue(
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        with patch(
+            "tele_mess_core.daily_jobs.TelegramSummaryDeliveryService",
+            BlockingDeliveryService,
+        ):
+            worker.start()
+            try:
+                self.assertTrue(entered.wait(3), "worker did not reach direct delivery")
+            finally:
+                worker.stop(timeout=2)
+
+        self.assertTrue(canceled.is_set())
+        current = self.store.get_daily_summary_job(job["job_id"])
+        assert current is not None
+        self.assertEqual(current["status"], "queued")
+        outbox = self.store.list_delivery_outbox(summary_run_id=current["summary_run_id"])
+        self.assertTrue(outbox)
+        self.assertTrue(all(item["status"] == "retry" for item in outbox))
 
     def test_cancel_during_delivery_discards_remaining_outbox_chunks(self) -> None:
         self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 0, True)

@@ -8,7 +8,7 @@ from typing import Any
 from tele_mess_core.media import MEDIA_TYPES
 
 
-API_CONTRACT_VERSION = "2026-10-13.1"
+API_CONTRACT_VERSION = "2026-11-20.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
 MCP_PATH = "/mcp"
 OPENAPI_PATH = "/openapi.json"
@@ -205,10 +205,10 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "account_id": {"type": "string"},
             "auth_state": {"type": "string"},
             "status": {"type": "string"},
-            "phone": {"type": "string"},
-            "session_name": {"type": "string"},
-            "session_dir": {"type": "string"},
-            "last_error": {"type": "string"},
+            "phone": {"type": "string", "nullable": True},
+            "session_name": {"type": "string", "nullable": True},
+            "session_dir": {"type": "string", "nullable": True},
+            "last_error": {"type": "string", "nullable": True},
         },
         required=["account_id"],
     ),
@@ -346,7 +346,28 @@ SCHEMAS: dict[str, dict[str, Any]] = {
                     "their emoji text is always archived."
                 ),
             },
-            "tags": {"type": "string"},
+            "tags": {"type": "string", "nullable": True},
+        },
+        required=["account_id", "origin_id"],
+    ),
+    "BackupPolicyPatchInput": _object(
+        {
+            "source": {"type": "string", "default": "telegram"},
+            "account_id": {"type": "string"},
+            "origin_id": {"type": "integer"},
+            "topic_id": {"type": "integer", "default": 0},
+            "enabled": {"type": "boolean"},
+            "capture_text": {"type": "boolean"},
+            "capture_media_metadata": {"type": "boolean"},
+            "download_media": {"type": "boolean"},
+            "download_stickers": {
+                "type": "boolean",
+                "description": (
+                    "Download sticker and custom-emoji document files independently of download_media; "
+                    "their emoji text is always archived."
+                ),
+            },
+            "tags": {"type": "string", "nullable": True},
         },
         required=["account_id", "origin_id"],
     ),
@@ -1041,8 +1062,24 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
     ApiEndpoint("GET", "/manage/accounts", "management", "List management account state.", response_schema="AccountListResponse"),
     ApiEndpoint("POST", "/manage/accounts", "management", "Create or update account metadata.", body_schema="AccountInput", response_schema="AccountItemResponse", status=201),
     ApiEndpoint("DELETE", "/manage/accounts", "management", "Delete management account metadata.", body_schema="AuthStatusInput", response_schema="AccountDeleteResponse"),
-    ApiEndpoint("POST", "/manage/accounts/auth", "management", "Create or update account auth state.", body_schema="AccountAuthInput", response_schema="AccountItemResponse"),
-    ApiEndpoint("PATCH", "/manage/accounts/auth", "management", "Patch account auth state.", body_schema="AccountAuthInput", response_schema="AccountItemResponse"),
+    ApiEndpoint(
+        "POST",
+        "/manage/accounts/auth",
+        "management",
+        "Create or replace account auth state.",
+        body_schema="AccountAuthInput",
+        response_schema="AccountItemResponse",
+        notes="Omitted optional fields use creation defaults; null or empty strings clear nullable fields.",
+    ),
+    ApiEndpoint(
+        "PATCH",
+        "/manage/accounts/auth",
+        "management",
+        "Patch account auth state.",
+        body_schema="AccountAuthInput",
+        response_schema="AccountItemResponse",
+        notes="Omitted auth fields retain their stored values; null or empty strings clear nullable fields.",
+    ),
     ApiEndpoint("POST", "/manage/accounts/auth/status", "management", "Check live Telegram auth status.", body_schema="AuthStatusInput", response_schema="AuthResultResponse"),
     ApiEndpoint("POST", "/manage/accounts/auth/request-code", "management", "Request a Telegram login code.", body_schema="RequestCodeInput", response_schema="AuthResultResponse"),
     ApiEndpoint("POST", "/manage/accounts/auth/submit-code", "management", "Submit a Telegram login code and optional 2FA password.", body_schema="SubmitCodeInput", response_schema="AuthResultResponse"),
@@ -1069,8 +1106,27 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
         query=(COMMON_ACCOUNT_PARAM,),
         response_schema="BackupPolicyListResponse",
     ),
-    ApiEndpoint("POST", "/manage/backup-policies", "management", "Create or update an origin backup policy.", body_schema="BackupPolicyInput", response_schema="BackupPolicyItemResponse"),
-    ApiEndpoint("PATCH", "/manage/backup-policies", "management", "Patch an origin backup policy.", body_schema="BackupPolicyInput", response_schema="BackupPolicyItemResponse"),
+    ApiEndpoint(
+        "POST",
+        "/manage/backup-policies",
+        "management",
+        "Create or update an origin backup policy.",
+        body_schema="BackupPolicyInput",
+        response_schema="BackupPolicyItemResponse",
+        notes=(
+            "Omitted policy fields use creation defaults; an existing download_stickers value is "
+            "retained for compatibility with older clients. Null or an empty string clears tags."
+        ),
+    ),
+    ApiEndpoint(
+        "PATCH",
+        "/manage/backup-policies",
+        "management",
+        "Patch an origin backup policy.",
+        body_schema="BackupPolicyPatchInput",
+        response_schema="BackupPolicyItemResponse",
+        notes="Omitted policy fields retain their stored values; null or an empty string clears tags.",
+    ),
     ApiEndpoint("DELETE", "/manage/backup-policies", "management", "Delete an origin backup policy.", body_schema="BackupPolicyInput", response_schema="BackupPolicyDeleteResponse"),
     ApiEndpoint(
         "GET",

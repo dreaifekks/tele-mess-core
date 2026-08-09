@@ -85,6 +85,8 @@ class DailyAiConfig:
             "never",
             "exec",
             "--ephemeral",
+            "--sandbox",
+            "read-only",
             "--disable",
             "hooks",
             "{model}",

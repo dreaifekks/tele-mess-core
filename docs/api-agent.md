@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-10-13.1`
-- Contract hash: `80a9e50f0f946f3b`
+- Contract version: `2026-11-20.1`
+- Contract hash: `0657cc8c2ecd4084`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -20,7 +20,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 
 - `POST /manage/accounts` body `AccountInput` - Create or update account metadata.
 - `DELETE /manage/accounts` body `AuthStatusInput` - Delete management account metadata.
-- `POST /manage/accounts/auth` body `AccountAuthInput` - Create or update account auth state.
+- `POST /manage/accounts/auth` body `AccountAuthInput` - Create or replace account auth state.
 - `PATCH /manage/accounts/auth` body `AccountAuthInput` - Patch account auth state.
 - `POST /manage/accounts/auth/status` body `AuthStatusInput` - Check live Telegram auth status.
 - `POST /manage/accounts/auth/request-code` body `RequestCodeInput` - Request a Telegram login code.
@@ -30,7 +30,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `PATCH /manage/origins/archive` body `OriginArchiveInput` - Archive or restore an origin.
 - `PATCH /manage/origins/important` body `OriginImportantInput` - Mark or unmark an origin as important.
 - `POST /manage/backup-policies` body `BackupPolicyInput` - Create or update an origin backup policy.
-- `PATCH /manage/backup-policies` body `BackupPolicyInput` - Patch an origin backup policy.
+- `PATCH /manage/backup-policies` body `BackupPolicyPatchInput` - Patch an origin backup policy.
 - `DELETE /manage/backup-policies` body `BackupPolicyInput` - Delete an origin backup policy.
 - `POST /manage/participants` body `ParticipantInput` - Create or update a participant profile.
 - `DELETE /manage/participants` body `ParticipantInput` - Delete a participant profile.

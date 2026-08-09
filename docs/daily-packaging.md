@@ -149,7 +149,7 @@ The default AI provider is a locally invoked Codex command template:
 daily:
   ai:
     provider: "codex-cli"
-    # Optional cwd for the external AI process. Defaults to storage.data_dir.
+    # Optional cwd for the external AI process. Defaults to storage.data_dir/ai-work.
     work_dir: "./data/ai-work"
     model: "gpt-5.6-sol"
     command:
@@ -158,6 +158,8 @@ daily:
       - "never"
       - "exec"
       - "--ephemeral"
+      - "--sandbox"
+      - "read-only"
       - "--disable"
       - "hooks"
       - "{model}"
@@ -179,20 +181,24 @@ Supported command placeholders:
 - `{images}`: repeated `--image <path>` arguments for image tasks;
 - `{task}`: task name, useful for wrappers and logs.
 
-The default command makes every batch ephemeral and disables Codex lifecycle
-hooks for that invocation. This keeps stage prompts and outputs out of Codex
-session rollout storage and prevents user or plugin hooks from treating each
-batch as an interactive session. It does not change provider-side data handling
-or the report artifacts that `tele-mess-core` intentionally stores.
+The default command makes every batch ephemeral, selects a read-only command
+sandbox, and disables lifecycle hooks for that invocation. This keeps stage
+prompts and outputs out of Codex session rollout storage, prevents user or
+plugin hooks from treating each batch as an interactive session, and prevents
+model-generated shell commands from writing files. It does not prevent
+all reads available to the service OS user, change provider-side data handling,
+or remove report artifacts that `tele-mess-core` intentionally stores.
 
 Recognized direct `codex exec` commands from older configs receive missing
-`--ephemeral`, `--disable hooks`, model, and output-schema flags automatically.
-An explicit hooks feature override in the command is respected. Custom wrapper
-commands should include the isolation flags and placeholders explicitly.
+`--ephemeral`, `--sandbox read-only`, `--disable hooks`, model, and output-schema
+flags automatically. Explicit sandbox and hooks overrides in the command are
+respected. Custom wrapper commands should include the isolation flags and
+placeholders explicitly.
 
 `daily.ai.work_dir` is resolved like other configured paths and controls only
-the Codex/fallback subprocess current directory. It does not change the config,
-database, session, or output path roots.
+the Codex/fallback subprocess current directory. It defaults to
+`storage.data_dir/ai-work` and does not change the config, database, session, or
+output path roots.
 
 An optional fallback is activated when a direct Codex command has a definitive
 usage-limit signal. Before the first AI stage, `tele-mess-core` makes a

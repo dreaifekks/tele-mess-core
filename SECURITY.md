@@ -39,11 +39,13 @@ the service used by that Codex account. If the optional OpenAI-compatible
 fallback is enabled and triggered, the remaining eligible stage inputs are sent
 to its configured endpoint.
 
-Default direct Codex batch commands use `--disable hooks` and `--ephemeral`, so
-configured Codex lifecycle hooks do not receive those batches and Codex does not
-persist local session rollout files for them. This local isolation does not
-change what the selected AI provider receives or the summary artifacts retained
-by `tele-mess-core`.
+Default direct Codex batch commands use `--sandbox read-only`, `--disable
+hooks`, and `--ephemeral`. This prevents model-generated shell commands from
+writing files, keeps configured lifecycle hooks out of the batch, and avoids
+local session rollout persistence. The subprocess uses a dedicated
+`storage.data_dir/ai-work` working directory unless `daily.ai.work_dir` is set. These controls do not make archived Telegram content
+trusted, prevent all reads available to the service OS user, or change what the
+selected AI provider and intentionally retained summary artifacts receive.
 
 Review the selected origins and provider terms before enabling analysis on
 private archives. Set `daily.ai.provider: disabled` to prevent AI-provider

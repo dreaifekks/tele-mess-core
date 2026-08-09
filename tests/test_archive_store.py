@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.archive.migrations import MIGRATIONS, apply_migrations
+from tele_mess_core.archive.store import SCHEMA_VERSION
 from tele_mess_core.models import (
     AccountAuthRecord,
     AccountRecord,
@@ -253,6 +254,89 @@ class ArchiveStoreTest(unittest.TestCase):
         results = self.store.search_messages("indexed")
         self.assertEqual(len(results), 1)
         self.assertEqual(results[0]["message_id"], 11)
+
+    def test_search_messages_treats_invalid_fts_syntax_as_literal_text(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=12,
+                sent_at=now,
+                ingested_at=now,
+                text='release-notes contain hello OR and a "quote"',
+            ),
+            event_type="new",
+        )
+
+        self.assertEqual(self.store.search_messages("release-notes")[0]["message_id"], 12)
+        self.assertEqual(self.store.search_messages("hello OR")[0]["message_id"], 12)
+        self.assertEqual(self.store.search_messages('"'), [])
+        self.assertEqual(self.store.search_messages("*"), [])
+        self.assertEqual(self.store.search_messages("\x00"), [])
+
+    def test_initialize_rebuilds_fts_index_when_virtual_table_was_missing(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=13,
+                sent_at=now,
+                ingested_at=now,
+                text="historical searchable payload",
+            ),
+            event_type="new",
+        )
+        self.assertEqual(len(self.store.search_messages("historical")), 1)
+        with self.store._lock:
+            self.store._conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS messages_ai;
+                DROP TRIGGER IF EXISTS messages_ad;
+                DROP TRIGGER IF EXISTS messages_au;
+                DROP TABLE message_fts;
+                """
+            )
+
+        self.store.initialize()
+
+        self.assertEqual(self.store.search_messages("historical")[0]["message_id"], 13)
+
+    def test_initialize_repairs_existing_empty_fts_index_once(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=14,
+                sent_at=now,
+                ingested_at=now,
+                text="legacy index repair payload",
+            ),
+            event_type="new",
+        )
+        with self.store._lock:
+            self.store._conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS messages_ai;
+                DROP TRIGGER IF EXISTS messages_ad;
+                DROP TRIGGER IF EXISTS messages_au;
+                DROP TABLE message_fts;
+                CREATE VIRTUAL TABLE message_fts USING fts5(
+                  text,
+                  sender_name,
+                  content='messages',
+                  content_rowid='rowid'
+                );
+                DELETE FROM meta WHERE key = 'message_fts_integrity_version';
+                """
+            )
+        self.assertEqual(self.store.search_messages("legacy"), [])
+
+        self.store.initialize()
+
+        self.assertEqual(self.store.search_messages("legacy")[0]["message_id"], 14)
 
     def test_clear_old_message_raw_json_keeps_structured_message_data(self) -> None:
         self.store.upsert_message(
@@ -1301,6 +1385,45 @@ class ArchiveStoreTest(unittest.TestCase):
 
 
 class ArchiveMigrationTest(unittest.TestCase):
+    def test_initialize_rejects_newer_database_before_schema_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "future.db"
+            conn = sqlite3.connect(database_path)
+            conn.executescript(
+                f"""
+                CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '{SCHEMA_VERSION}');
+                CREATE TABLE future_only(value TEXT);
+                INSERT INTO future_only(value) VALUES('preserve-me');
+                PRAGMA user_version = {SCHEMA_VERSION + 1};
+                """
+            )
+            conn.close()
+
+            store = ArchiveStore(database_path)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "newer than supported"):
+                    store.initialize()
+            finally:
+                store.close()
+
+            conn = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(conn.execute("PRAGMA journal_mode").fetchone()[0], "delete")
+                self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], SCHEMA_VERSION + 1)
+                self.assertEqual(
+                    conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0],
+                    str(SCHEMA_VERSION),
+                )
+                self.assertEqual(conn.execute("SELECT value FROM future_only").fetchone()[0], "preserve-me")
+                self.assertIsNone(
+                    conn.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name='messages'"
+                    ).fetchone()
+                )
+            finally:
+                conn.close()
+
     def test_v19_initialize_repairs_missing_sticker_download_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "archive.db"
@@ -1343,6 +1466,44 @@ class ArchiveMigrationTest(unittest.TestCase):
                 self.assertEqual(store.state()["schema_version"], 19)
             finally:
                 store.close()
+
+    def test_v18_upgrade_with_healthy_fts_and_no_integrity_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "archive.db"
+            store = ArchiveStore(database_path)
+            store.initialize()
+            store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    chat_id=-1001,
+                    message_id=1,
+                    sent_at="2026-01-01T00:00:00+00:00",
+                    ingested_at="2026-01-01T00:00:00+00:00",
+                    text="healthy migration index",
+                ),
+                event_type="new",
+            )
+            self.assertEqual(len(store.search_messages("healthy")), 1)
+            store.close()
+
+            conn = sqlite3.connect(database_path)
+            conn.executescript(
+                """
+                UPDATE meta SET value = '18' WHERE key = 'schema_version';
+                DELETE FROM meta WHERE key = 'message_fts_integrity_version';
+                PRAGMA user_version = 18;
+                """
+            )
+            conn.close()
+
+            upgraded = ArchiveStore(database_path)
+            try:
+                upgraded.initialize()
+                self.assertEqual(upgraded.state()["schema_version"], 19)
+                self.assertEqual(len(upgraded.search_messages("healthy")), 1)
+                self.assertEqual(upgraded.get_meta("message_fts_integrity_version"), "1")
+            finally:
+                upgraded.close()
 
     def test_v19_backup_policy_migration_disables_sticker_download_by_default(self) -> None:
         conn = sqlite3.connect(":memory:")

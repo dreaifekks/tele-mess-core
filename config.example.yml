@@ -47,7 +47,7 @@ daily:
   cli_path: "tele-mess-core"
   ai:
     provider: "codex-cli"
-    # Optional cwd for Codex/fallback subprocesses. Defaults to storage.data_dir.
+    # Optional cwd for Codex/fallback subprocesses. Defaults to storage.data_dir/ai-work.
     work_dir: "./data/ai-work"
     # Frontier default used by every AI stage unless this value is overridden.
     model: "gpt-5.6-sol"
@@ -56,9 +56,12 @@ daily:
       - "-a"
       - "never"
       - "exec"
-      # Batch summaries neither invoke configured Codex lifecycle hooks nor
-      # persist Codex session rollout files.
+      # Batch summaries cannot write through model-generated shell commands,
+      # do not invoke lifecycle hooks, and do not persist Codex session rollout
+      # files.
       - "--ephemeral"
+      - "--sandbox"
+      - "read-only"
       - "--disable"
       - "hooks"
       # Expanded to "--model <daily.ai.model>".

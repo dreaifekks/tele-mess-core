@@ -10,7 +10,7 @@ import unittest
 import uuid
 from contextlib import redirect_stdout
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, Mock, patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
@@ -24,21 +24,27 @@ from tele_mess_core.config import (
     LoggingConfig,
     ServerConfig,
     StorageConfig,
+    TelegramAccountConfig,
     TelegramConfig,
 )
 from tele_mess_core.daily import (
     AiProviderError,
     AiProviderResult,
     AiProviderRuntimeState,
+    DailyJobInterrupted,
     _codex_provider_error,
+    _daily_ai_work_dir,
     _expand_command,
     _run_summary_provider,
     build_daily_package,
+    deliver_daily_summary,
+    resolve_daily_summary_delivery,
     run_daily_summary,
     update_daily_package_schedule,
+    update_daily_summary_delivery,
 )
 from tele_mess_core.daily_jobs import DailyJobWorker
-from tele_mess_core.models import BackupPolicyRecord, DailySummaryDeliveryRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
+from tele_mess_core.models import AccountAuthRecord, AccountRecord, BackupPolicyRecord, DailySummaryDeliveryRecord, MediaFileRecord, MessageRecord, OriginRecord, SOURCE_TELEGRAM, utc_now_iso
 
 
 class DailyPackagingTest(unittest.TestCase):
@@ -47,6 +53,9 @@ class DailyPackagingTest(unittest.TestCase):
         self.root = Path(self.tmp.name)
         self.store = ArchiveStore(self.root / "archive.db")
         self.store.initialize()
+        self.store.upsert_account(
+            AccountRecord(source=SOURCE_TELEGRAM, account_id="main", display_name="Main", kind="telegram")
+        )
         self.config = AppConfig(
             storage=StorageConfig(data_dir=self.root, database=self.root / "archive.db"),
             telegram=TelegramConfig(),
@@ -63,6 +72,63 @@ class DailyPackagingTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.tmp.cleanup()
+
+    def test_worker_interruption_does_not_fail_package_run(self) -> None:
+        checks = 0
+
+        def interrupt_after_start() -> None:
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise DailyJobInterrupted("worker stopping")
+
+        run_id = "pkg_interrupted"
+        with self.assertRaises(DailyJobInterrupted):
+            build_daily_package(
+                self.store,
+                self.config,
+                run_date="2026-07-03",
+                timezone_name="UTC",
+                run_id=run_id,
+                cancel_check=interrupt_after_start,
+            )
+
+        package = self.store.get_daily_package_run(run_id)
+        assert package is not None
+        self.assertEqual(package["status"], "running")
+        self.assertIsNone(package["error"])
+        self.assertIsNone(package["finished_at"])
+
+    def test_worker_interruption_does_not_fail_summary_run(self) -> None:
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+        )
+        checks = 0
+
+        def interrupt_after_start() -> None:
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise DailyJobInterrupted("worker stopping")
+
+        run_id = "sum_interrupted"
+        with self.assertRaises(DailyJobInterrupted):
+            run_daily_summary(
+                self.store,
+                self.config,
+                package_run_id=str(package["run_id"]),
+                run_id=run_id,
+                cancel_check=interrupt_after_start,
+            )
+
+        summary = self.store.get_daily_summary_run(run_id)
+        assert summary is not None
+        self.assertEqual(summary["status"], "running")
+        self.assertIsNone(summary["error"])
+        self.assertIsNone(summary["finished_at"])
 
     def test_tag_groups_assign_specific_groups_first_and_exclude_important_origins(self) -> None:
         self._origin(-1001, "Web3 Broad", "web3,info")
@@ -250,6 +316,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("- Tags: #point", delivered_content)
         self.assertIn("- Summary provider: `disabled`", delivered_content)
         self.assertIn("No message points were extracted", delivered_content)
+
         self.assertEqual(deliver.call_args.kwargs["delivery"].origin_id, -9001)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["progress_current"], summary["progress_total"])
@@ -257,6 +324,128 @@ class DailyPackagingTest(unittest.TestCase):
         summary_payload = json.loads((Path(summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary_payload["delivery"]["status"], "sent")
         self.assertEqual(summary_payload["delivery"]["deliveries"], [{"kind": "point_summary", "result": delivery_result}])
+
+    def test_daily_delivery_accepts_sqlite_telegram_management_account(self) -> None:
+        self.config.telegram.accounts.append(
+            TelegramAccountConfig(
+                account_id="credential-template",
+                api_id=123,
+                api_hash="template-hash",
+                session_name="credential-template",
+                session_dir=self.root / "template-sessions",
+                timezone="UTC",
+            )
+        )
+        self.store.upsert_account(
+            AccountRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="runtime-account",
+                display_name="Runtime Account",
+                kind="telegram",
+            )
+        )
+        self.store.upsert_account_auth(
+            AccountAuthRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="runtime-account",
+                auth_state="authorized",
+                session_name="runtime-session",
+                session_dir="runtime-sessions",
+            )
+        )
+
+        stored = update_daily_summary_delivery(
+            self.store,
+            self.config,
+            {
+                "enabled": True,
+                "account_id": "runtime-account",
+                "origin_id": -9001,
+                "topic_id": 42,
+            },
+        )
+        resolved = resolve_daily_summary_delivery(self.store, self.config)
+
+        self.assertTrue(stored["enabled"])
+        self.assertEqual(resolved.account_id, "runtime-account")
+        self.assertEqual(resolved.origin_id, -9001)
+        self.assertEqual(resolved.topic_id, 42)
+        runtime = Mock()
+        runtime.call.return_value = {"status": "sent", "message_ids": [123]}
+
+        result = deliver_daily_summary(self.store, self.config, "summary", telegram_runtime=runtime)
+
+        self.assertEqual(result, {"status": "sent", "message_ids": [123]})
+        runtime.call.assert_called_once_with(
+            "runtime-account",
+            "deliver_summary",
+            delivery=resolved,
+            content="summary",
+        )
+
+        with patch("tele_mess_core.telegram.delivery.TelegramSummaryDeliveryService") as service_class:
+            service_class.return_value.send_summary = AsyncMock(
+                return_value={"status": "sent", "message_ids": [456]}
+            )
+            direct_result = deliver_daily_summary(self.store, self.config, "direct summary")
+
+        self.assertEqual(direct_result, {"status": "sent", "message_ids": [456]})
+        account = service_class.call_args.args[0]
+        self.assertEqual(account.account_id, "runtime-account")
+        self.assertEqual(account.api_id, 123)
+        self.assertEqual(account.api_hash, "template-hash")
+        self.assertEqual(account.session_name, "runtime-session")
+        self.assertEqual(account.session_dir, self.root / "runtime-sessions")
+        self.assertEqual(account.timezone, "UTC")
+        service_class.return_value.send_summary.assert_awaited_once_with(
+            resolved,
+            "direct summary",
+        )
+
+    def test_daily_delivery_rejects_non_telegram_management_account(self) -> None:
+        self.store.upsert_account(
+            AccountRecord(
+                source="other",
+                account_id="shared-id",
+                display_name="Other Account",
+                kind="other",
+            )
+        )
+
+        with self.assertRaisesRegex(ValueError, "Unknown daily summary delivery account_id: shared-id"):
+            update_daily_summary_delivery(
+                self.store,
+                self.config,
+                {"enabled": True, "account_id": "shared-id", "origin_id": -9001},
+            )
+
+        self.store.set_daily_summary_delivery(
+            DailySummaryDeliveryRecord(enabled=True, account_id="shared-id", origin_id=-9001)
+        )
+        with self.assertRaisesRegex(ValueError, "Unknown daily summary delivery account_id: shared-id"):
+            resolve_daily_summary_delivery(self.store, self.config)
+
+    def test_daily_delivery_keeps_yaml_account_compatibility(self) -> None:
+        self.config.telegram.accounts.append(
+            TelegramAccountConfig(
+                account_id="configured-account",
+                api_id=1,
+                api_hash="test",
+                session_name="configured-account",
+                session_dir=self.root / "sessions",
+            )
+        )
+
+        update_daily_summary_delivery(
+            self.store,
+            self.config,
+            {"enabled": True, "account_id": "configured-account", "origin_id": -9002},
+        )
+
+        self.assertEqual(
+            resolve_daily_summary_delivery(self.store, self.config).account_id,
+            "configured-account",
+        )
 
     def test_structured_points_are_persisted_for_normal_and_important_origins(self) -> None:
         self._origin(-9001, "Normal Source", "normal,info")
@@ -496,6 +685,8 @@ class DailyPackagingTest(unittest.TestCase):
                 "codex",
                 "exec",
                 "--ephemeral",
+                "--sandbox",
+                "read-only",
                 "--disable",
                 "hooks",
                 "--model",
@@ -531,9 +722,11 @@ class DailyPackagingTest(unittest.TestCase):
         )
         exec_index = legacy.index("exec")
         self.assertEqual(
-            legacy[exec_index + 1 : exec_index + 8],
+            legacy[exec_index + 1 : exec_index + 10],
             [
                 "--ephemeral",
+                "--sandbox",
+                "read-only",
                 "--disable",
                 "hooks",
                 "--model",
@@ -543,6 +736,7 @@ class DailyPackagingTest(unittest.TestCase):
             ],
         )
         self.assertEqual(legacy.count("--ephemeral"), 1)
+        self.assertEqual(legacy.count("--sandbox"), 1)
         self.assertEqual(legacy.count("--disable"), 1)
         self.assertEqual(legacy.count("--model"), 1)
         self.assertEqual(legacy.count("--output-schema"), 1)
@@ -561,6 +755,74 @@ class DailyPackagingTest(unittest.TestCase):
             [],
         )
         self.assertNotIn("--disable", explicit_hooks_equals)
+
+        explicit_sandbox = _expand_command(
+            ["codex", "exec", "--sandbox", "workspace-write", "{output}"],
+            output_path,
+            [],
+        )
+        self.assertEqual(explicit_sandbox.count("--sandbox"), 1)
+        self.assertIn("workspace-write", explicit_sandbox)
+
+    def test_default_codex_command_uses_read_only_sandbox(self) -> None:
+        command = DailyAiConfig().command
+
+        sandbox_index = command.index("--sandbox")
+        self.assertEqual(command[sandbox_index + 1], "read-only")
+        self.assertEqual(_daily_ai_work_dir(self.config), self.root / "ai-work")
+
+    def test_worker_interruption_terminates_running_provider_process(self) -> None:
+        provider_path = self.root / "slow_interrupted_provider.py"
+        provider_path.write_text(
+            "import sys\n"
+            "import time\n"
+            "sys.stdin.read()\n"
+            "time.sleep(30)\n",
+            encoding="utf-8",
+        )
+        config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="fake",
+                    command=[sys.executable, str(provider_path)],
+                    timeout_seconds=60,
+                ),
+            ),
+        )
+        checks = 0
+        processes = []
+
+        def interrupt_after_process_start() -> None:
+            nonlocal checks
+            checks += 1
+            if checks > 1:
+                raise DailyJobInterrupted("worker stopping")
+
+        def track_process(process: object | None, task_name: str) -> None:
+            processes.append(process)
+
+        with self.assertRaises(DailyJobInterrupted):
+            _run_summary_provider(
+                config,
+                "prompt",
+                self.root / "interrupted-output.md",
+                [],
+                cancel_check=interrupt_after_process_start,
+                process_callback=track_process,
+                provider_state=AiProviderRuntimeState(),
+            )
+
+        self.assertEqual(len(processes), 2)
+        process = processes[0]
+        self.assertIsNotNone(process)
+        assert process is not None
+        self.assertIsNotNone(process.poll())
+        self.assertIsNone(processes[1])
 
     def test_daily_package_adds_telegram_deeplinks_for_message_links(self) -> None:
         self._origin(-8001, "Public Link", "info")

@@ -45,6 +45,14 @@ class ApiContractTest(unittest.TestCase):
         backup_policy_input_properties = openapi["components"]["schemas"]["BackupPolicyInput"]["properties"]
         self.assertEqual(backup_policy_input_properties["download_stickers"]["type"], "boolean")
         self.assertIs(backup_policy_input_properties["download_stickers"]["default"], False)
+        backup_policy_patch_properties = openapi["components"]["schemas"]["BackupPolicyPatchInput"]["properties"]
+        self.assertNotIn("default", backup_policy_patch_properties["enabled"])
+        self.assertNotIn("default", backup_policy_patch_properties["download_media"])
+        self.assertEqual(
+            openapi["paths"]["/manage/backup-policies"]["patch"]["requestBody"]["content"]
+            ["application/json"]["schema"]["$ref"],
+            "#/components/schemas/BackupPolicyPatchInput",
+        )
         media_file_schema = openapi["components"]["schemas"]["MediaFile"]
         self.assertTrue({"filename", "file_extension", "media_type"}.issubset(media_file_schema["properties"]))
         self.assertTrue({"filename", "file_extension", "media_type"}.issubset(media_file_schema["required"]))

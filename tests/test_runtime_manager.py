@@ -123,6 +123,18 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
 
         self.assertGreaterEqual(clients[0].disconnect_count, 1)
 
+    async def test_completed_future_wins_race_with_cancel_event(self) -> None:
+        manager = TelegramRuntimeManager(self.config, self.store)
+        completed: Future[dict[str, object]] = Future()
+        completed.set_result({"status": "sent"})
+        cancel_event = threading.Event()
+        cancel_event.set()
+
+        result = manager._wait_for_future(completed, cancel_event=cancel_event)
+
+        self.assertEqual(result, {"status": "sent"})
+        self.assertFalse(completed.cancelled())
+
     async def test_one_account_connection_failure_does_not_stop_other_account(self) -> None:
         alt = TelegramAccountConfig(
             account_id="alt",

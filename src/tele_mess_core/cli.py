@@ -278,7 +278,7 @@ def _paths_payload(
     if config is None:
         return payload
     daily_output_dir = config.daily.output_dir or (config.storage.data_dir / "daily-packages")
-    ai_work_dir = config.daily.ai.work_dir or config.storage.data_dir
+    ai_work_dir = config.daily.ai.work_dir or (config.storage.data_dir / "ai-work")
     payload.update(
         {
             "data_dir": str(config.storage.data_dir),

@@ -161,10 +161,11 @@ The Python package does not install the Codex CLI. To enable daily AI analysis:
    [daily-packaging guide](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md).
 
 The default template expects Codex support for `--output-last-message`,
-`--output-schema`, `--image`, `--ephemeral`, and `--disable hooks`. Batch runs
-therefore do not invoke configured lifecycle hooks or persist Codex session
-rollouts. Keep the provider disabled if those prerequisites or the data-transfer
-policy are not acceptable.
+`--output-schema`, `--image`, `--ephemeral`, `--sandbox read-only`, and
+`--disable hooks`. Batch runs therefore cannot write through model-generated
+shell commands, do not invoke configured lifecycle hooks, and do not persist
+Codex session rollouts. Keep the provider disabled if those prerequisites or
+the data-transfer policy are not acceptable.
 
 ## Documentation
 
@@ -447,8 +448,8 @@ sent as separate logical messages to the configured target. The point digest
 uses the fixed searchable tag `#point`; the important report keeps its source
 tags.
 
-The default Codex CLI template selects `gpt-5.6-sol`, disables lifecycle hooks,
-runs ephemerally, and expands task-specific `{model}` and `{output_schema}`
+The default Codex CLI template selects `gpt-5.6-sol`, uses a read-only command
+sandbox, disables lifecycle hooks, runs ephemerally, and expands task-specific `{model}` and `{output_schema}`
 placeholders before invoking the provider.
 
 API and scheduled package-plus-summary requests use the same durable SQLite job

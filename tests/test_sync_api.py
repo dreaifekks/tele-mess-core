@@ -7,6 +7,7 @@ import time
 import unittest
 from pathlib import Path
 from urllib.error import HTTPError
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
 from tele_mess_core.archive import ArchiveStore
@@ -132,6 +133,30 @@ class SyncApiTest(unittest.TestCase):
             payload = json.loads(resp.read().decode("utf-8"))
         self.assertEqual(payload["items"][0]["text"], "api payload")
         self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
+
+    def test_search_endpoint_treats_invalid_fts_syntax_as_literal_text(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=99,
+                sent_at=now,
+                ingested_at=now,
+                text="release-notes contain hello OR",
+            ),
+            event_type="new",
+        )
+
+        result = self.request_json(f"/sync/search?q={quote('release-notes', safe='')}")
+        empty = self.request_json(f"/sync/search?q={quote(chr(34), safe='')}")
+        wildcard = self.request_json(f"/sync/search?q={quote('*', safe='')}")
+        nul = self.request_json("/sync/search?q=%00")
+
+        self.assertEqual(result["items"][0]["message_id"], 99)
+        self.assertEqual(empty["items"], [])
+        self.assertEqual(wildcard["items"], [])
+        self.assertEqual(nul["items"], [])
 
     def test_latest_messages_endpoint(self) -> None:
         now = utc_now_iso()
@@ -682,6 +707,72 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(body, b"registered media")
         self.assertEqual(content_type, "text/plain")
 
+    def test_media_file_content_endpoint_supports_unicode_filename(self) -> None:
+        media_path = Path(self.tmp.name) / "日本語 media.png"
+        content = b"unicode filename media body"
+        media_path.write_bytes(content)
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-1001,
+                message_id=1,
+                file_path=str(media_path),
+                media_kind="photo",
+                mime_type="image/png",
+                file_size=len(content),
+                downloaded_at=utc_now_iso(),
+            )
+        )
+
+        req = Request(
+            f"http://127.0.0.1:{self.port}/sync/media-files/content"
+            "?source=telegram&account_id=default&chat_id=-1001&message_id=1&file_index=0"
+        )
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            body = resp.read()
+            disposition = resp.headers.get("Content-Disposition", "")
+            status = resp.status
+
+        self.assertEqual(status, 200)
+        self.assertEqual(body, content)
+        self.assertTrue(disposition.isascii())
+        self.assertIn('filename="___ media.png"', disposition)
+        self.assertIn(f"filename*=UTF-8''{quote(media_path.name, safe='')}", disposition)
+
+    def test_media_file_content_endpoint_rejects_unsafe_mime_header_value(self) -> None:
+        media_path = Path(self.tmp.name) / "safe-content.txt"
+        content = b"safe media body"
+        media_path.write_bytes(content)
+        self.store.upsert_media_file(
+            MediaFileRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="default",
+                chat_id=-1001,
+                message_id=2,
+                file_path=str(media_path),
+                media_kind="document",
+                mime_type="text/plain\r\nX-Injected: yes",
+                file_size=len(content),
+                downloaded_at=utc_now_iso(),
+            )
+        )
+
+        req = Request(
+            f"http://127.0.0.1:{self.port}/sync/media-files/content"
+            "?source=telegram&account_id=default&chat_id=-1001&message_id=2&file_index=0"
+        )
+        req.add_header("Authorization", "Bearer secret")
+        with urlopen(req, timeout=3) as resp:
+            body = resp.read()
+            content_type = resp.headers.get("Content-Type")
+            injected = resp.headers.get("X-Injected")
+
+        self.assertEqual(body, content)
+        self.assertEqual(content_type, "text/plain")
+        self.assertIsNone(injected)
+
     def test_media_file_content_endpoint_requires_token(self) -> None:
         req = Request(
             f"http://127.0.0.1:{self.port}/sync/media-files/content?source=telegram&account_id=default&chat_id=-1001&message_id=1&file_index=0"
@@ -968,6 +1059,116 @@ class SyncApiTest(unittest.TestCase):
         )["item"]
         self.assertFalse(restore["archived"])
         self.assertEqual(len(self.request_json("/manage/origins?account_id=main")["items"]), 2)
+
+    def test_account_auth_patch_merges_omitted_fields_and_clears_explicit_empty_values(self) -> None:
+        created = self.request_json(
+            "/manage/accounts/auth",
+            method="POST",
+            payload={
+                "account_id": "partial-auth",
+                "auth_state": "code_sent",
+                "phone": "+10000000000",
+                "session_name": "stable-session",
+                "session_dir": "managed-sessions",
+                "last_error": "temporary failure",
+            },
+        )["item"]
+        expected_session_dir = str((Path(self.tmp.name) / "managed-sessions").resolve())
+        self.assertEqual(created["session_dir"], expected_session_dir)
+
+        patched = self.request_json(
+            "/manage/accounts/auth",
+            method="PATCH",
+            payload={"account_id": "partial-auth", "auth_state": "authorized"},
+        )["item"]
+
+        self.assertEqual(patched["auth_state"], "authorized")
+        self.assertEqual(patched["phone"], "+10000000000")
+        self.assertEqual(patched["session_name"], "stable-session")
+        self.assertEqual(patched["session_dir"], expected_session_dir)
+        self.assertEqual(patched["last_error"], "temporary failure")
+
+        cleared = self.request_json(
+            "/manage/accounts/auth",
+            method="PATCH",
+            payload={
+                "account_id": "partial-auth",
+                "phone": None,
+                "session_name": "",
+                "session_dir": None,
+                "last_error": "",
+            },
+        )["item"]
+
+        self.assertEqual(cleared["auth_state"], "authorized")
+        self.assertIsNone(cleared["phone"])
+        self.assertIsNone(cleared["session_name"])
+        self.assertIsNone(cleared["session_dir"])
+        self.assertIsNone(cleared["last_error"])
+
+        defaults = self.request_json(
+            "/manage/accounts/auth",
+            method="POST",
+            payload={"account_id": "post-auth-defaults"},
+        )["item"]
+        self.assertEqual(defaults["auth_state"], "pending_auth")
+        self.assertIsNone(defaults["phone"])
+        self.assertIsNone(defaults["session_name"])
+        self.assertIsNone(defaults["session_dir"])
+
+    def test_backup_policy_patch_merges_omitted_fields_and_clears_tags(self) -> None:
+        created = self.request_json(
+            "/manage/backup-policies",
+            method="POST",
+            payload={
+                "account_id": "main",
+                "origin_id": -2001,
+                "enabled": True,
+                "capture_text": False,
+                "capture_media_metadata": False,
+                "download_media": True,
+                "download_stickers": True,
+                "tags": "keep-me",
+            },
+        )["item"]
+        self.assertTrue(created["enabled"])
+
+        patched = self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -2001, "enabled": False},
+        )["item"]
+
+        self.assertFalse(patched["enabled"])
+        self.assertFalse(patched["capture_text"])
+        self.assertFalse(patched["capture_media_metadata"])
+        self.assertTrue(patched["download_media"])
+        self.assertTrue(patched["download_stickers"])
+        self.assertEqual(patched["tags"], "keep-me")
+
+        cleared = self.request_json(
+            "/manage/backup-policies",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -2001, "tags": None},
+        )["item"]
+        self.assertIsNone(cleared["tags"])
+        self.assertFalse(cleared["enabled"])
+        self.assertFalse(cleared["capture_text"])
+        self.assertFalse(cleared["capture_media_metadata"])
+        self.assertTrue(cleared["download_media"])
+        self.assertTrue(cleared["download_stickers"])
+
+        defaults = self.request_json(
+            "/manage/backup-policies",
+            method="POST",
+            payload={"account_id": "main", "origin_id": -2002},
+        )["item"]
+        self.assertFalse(defaults["enabled"])
+        self.assertTrue(defaults["capture_text"])
+        self.assertTrue(defaults["capture_media_metadata"])
+        self.assertFalse(defaults["download_media"])
+        self.assertFalse(defaults["download_stickers"])
+        self.assertIsNone(defaults["tags"])
 
     def test_management_delete_endpoints_remove_console_records(self) -> None:
         self.request_json(

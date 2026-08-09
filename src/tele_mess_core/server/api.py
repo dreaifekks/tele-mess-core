@@ -11,7 +11,7 @@ from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
-from urllib.parse import parse_qs, urlencode, urlparse
+from urllib.parse import parse_qs, quote, urlencode, urlparse
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.models import (
@@ -434,7 +434,12 @@ class SyncApiServer:
                     item = _delete_management_account(store, payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth" and method in {"POST", "PATCH"}:
-                    item = _update_account_auth(config, store, payload)
+                    item = _update_account_auth(
+                        config,
+                        store,
+                        payload,
+                        partial=method == "PATCH",
+                    )
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth/status" and method == "POST":
                     item = _auth_status(config, store, payload, telegram_runtime)
@@ -455,7 +460,12 @@ class SyncApiServer:
                     item = _set_origin_important(store, payload)
                     self._json({"item": item})
                 elif path == "/manage/backup-policies" and method in {"POST", "PATCH"}:
-                    item = _set_backup_policy(store, payload, telegram_runtime)
+                    item = _set_backup_policy(
+                        store,
+                        payload,
+                        telegram_runtime,
+                        partial=method == "PATCH",
+                    )
                     self._json({"item": item})
                 elif path == "/manage/backup-policies" and method == "DELETE":
                     item = _delete_backup_policy(store, payload)
@@ -595,12 +605,12 @@ class SyncApiServer:
                     self._json({"error": "not_found", "detail": "media file is missing"}, status=HTTPStatus.NOT_FOUND)
                     return
                 content_type = _media_content_type(item)
-                disposition = _content_disposition_filename(path.name)
+                disposition = _content_disposition(path.name)
                 self.send_response(int(HTTPStatus.OK))
                 self._security_headers()
                 self.send_header("Content-Type", content_type)
                 self.send_header("Content-Length", str(path.stat().st_size))
-                self.send_header("Content-Disposition", f'inline; filename="{disposition}"')
+                self.send_header("Content-Disposition", disposition)
                 self.send_header("Cache-Control", "private, max-age=3600")
                 self.end_headers()
                 with path.open("rb") as f:
@@ -747,10 +757,14 @@ def _media_access_url(item: dict[str, Any]) -> str:
 
 def _media_content_type(item: dict[str, Any]) -> str:
     mime_type = item.get("mime_type")
-    if isinstance(mime_type, str) and mime_type:
+    if isinstance(mime_type, str) and _safe_http_header_value(mime_type):
         return mime_type
     guessed, _ = mimetypes.guess_type(str(item.get("file_path") or ""))
     return guessed or "application/octet-stream"
+
+
+def _safe_http_header_value(value: str) -> bool:
+    return bool(value) and value.isascii() and all(0x20 <= ord(char) <= 0x7E for char in value)
 
 
 def _media_preview_kind(content_type: str) -> str:
@@ -763,9 +777,17 @@ def _media_preview_kind(content_type: str) -> str:
     return "file"
 
 
-def _content_disposition_filename(filename: str) -> str:
-    cleaned = "".join("_" if char in {'"', "\\", "/", "\r", "\n"} else char for char in filename)
-    return cleaned or "media"
+def _content_disposition(filename: str) -> str:
+    name = filename or "media"
+    fallback = "".join(
+        char
+        if 0x20 <= ord(char) <= 0x7E and char not in {'"', "\\", "/"}
+        else "_"
+        for char in name
+    )
+    fallback = fallback or "media"
+    encoded = quote(name, safe="", encoding="utf-8", errors="replace")
+    return f'inline; filename="{fallback}"; filename*=UTF-8\'\'{encoded}'
 
 
 def _operation_event_public_item(item: dict[str, Any]) -> dict[str, Any]:
@@ -934,19 +956,48 @@ def _update_account_auth(
     config: "AppConfig | None",
     store: ArchiveStore,
     payload: dict[str, Any],
+    *,
+    partial: bool = False,
 ) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
+    existing = _find_account(store, source, account_id) if partial else None
     now = utc_now_iso()
+    auth_state = str(
+        payload.get("auth_state")
+        or payload.get("status")
+        or (existing or {}).get("auth_state")
+        or "pending_auth"
+    )
+    phone = (
+        (existing or {}).get("phone")
+        if partial and "phone" not in payload
+        else _optional_payload_str(payload, "phone")
+    )
+    session_name = (
+        (existing or {}).get("session_name")
+        if partial and "session_name" not in payload
+        else _optional_payload_str(payload, "session_name")
+    )
+    session_dir = (
+        (existing or {}).get("session_dir")
+        if partial and "session_dir" not in payload
+        else _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
+    )
+    last_error = (
+        (existing or {}).get("last_error")
+        if partial and "last_error" not in payload
+        else _optional_payload_str(payload, "last_error")
+    )
     store.upsert_account_auth(
         AccountAuthRecord(
             source=source,
             account_id=account_id,
-            auth_state=str(payload.get("auth_state") or payload.get("status") or "pending_auth"),
-            phone=_optional_payload_str(payload, "phone"),
-            session_name=_optional_payload_str(payload, "session_name"),
-            session_dir=_normalized_session_dir(config, _optional_payload_str(payload, "session_dir")),
-            last_error=_optional_payload_str(payload, "last_error"),
+            auth_state=auth_state,
+            phone=phone,
+            session_name=session_name,
+            session_dir=session_dir,
+            last_error=last_error,
             updated_at=now,
             raw_json=_public_raw_json(payload, hidden={"api_hash", "password", "code"}),
         )
@@ -1040,28 +1091,40 @@ def _set_backup_policy(
     store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
+    *,
+    partial: bool = False,
 ) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
     origin_id = _required_int(payload, "origin_id")
     topic_id = _payload_int(payload, "topic_id", 0)
     existing_policy = store.get_backup_policy(source, account_id, origin_id, topic_id)
+
+    def policy_bool(key: str, default: bool) -> bool:
+        if partial and existing_policy is not None and key not in payload:
+            return bool(existing_policy.get(key))
+        return _payload_bool(payload, key, default)
+
+    tags = (
+        existing_policy.get("tags")
+        if partial and existing_policy is not None and "tags" not in payload
+        else _optional_payload_str(payload, "tags")
+    )
     store.set_backup_policy(
         BackupPolicyRecord(
             source=source,
             account_id=account_id,
             origin_id=origin_id,
             topic_id=topic_id,
-            enabled=_payload_bool(payload, "enabled", False),
-            capture_text=_payload_bool(payload, "capture_text", True),
-            capture_media_metadata=_payload_bool(payload, "capture_media_metadata", True),
-            download_media=_payload_bool(payload, "download_media", False),
-            download_stickers=_payload_bool(
-                payload,
+            enabled=policy_bool("enabled", False),
+            capture_text=policy_bool("capture_text", True),
+            capture_media_metadata=policy_bool("capture_media_metadata", True),
+            download_media=policy_bool("download_media", False),
+            download_stickers=policy_bool(
                 "download_stickers",
                 bool(existing_policy and existing_policy.get("download_stickers")),
             ),
-            tags=_optional_payload_str(payload, "tags"),
+            tags=tags,
             updated_at=utc_now_iso(),
         )
     )

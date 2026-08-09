@@ -43,6 +43,7 @@ from tele_mess_core.media import (
 
 SCHEMA_VERSION = 19
 LEGACY_SCHEMA_BASELINE = 12
+MESSAGE_FTS_INTEGRITY_VERSION = "1"
 
 # Compact message projection shared by the read-only message queries; a topic's
 # origin_title is prefixed with its parent group title.
@@ -101,7 +102,6 @@ class ArchiveStore:
         connection = sqlite3.connect(str(self.database_path), check_same_thread=False, timeout=30.0)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA journal_mode = WAL")
         connection.execute("PRAGMA busy_timeout = 30000")
         connection.create_function("tmc_media_filename", 1, media_filename, deterministic=True)
         connection.create_function("tmc_media_file_extension", 1, media_file_extension, deterministic=True)
@@ -141,23 +141,73 @@ class ArchiveStore:
     def initialize(self) -> None:
         with self._lock:
             try:
+                existing_schema_version = self._validate_existing_schema_version()
+                self._conn.execute("PRAGMA journal_mode = WAL")
+                message_fts_existed = self._has_table("message_fts")
+                message_fts_integrity_verified = (
+                    self._has_table("meta")
+                    and self.get_meta("message_fts_integrity_version")
+                    == MESSAGE_FTS_INTEGRITY_VERSION
+                )
+                rebuild_message_fts = not message_fts_existed
+                if message_fts_existed and not message_fts_integrity_verified:
+                    rebuild_message_fts = not self._message_fts_integrity_is_valid()
                 if self._has_table("messages") and not self._has_column("messages", "account_id"):
                     self._migrate_v1_to_v2()
                 else:
                     self._conn.executescript(_schema_sql())
-                self._ensure_current_schema()
+                self._ensure_current_schema(
+                    rebuild_message_fts=rebuild_message_fts,
+                )
                 meta_version = self.get_meta("schema_version")
-                current_version = int(meta_version) if meta_version else LEGACY_SCHEMA_BASELINE
+                current_version = int(meta_version) if meta_version else existing_schema_version
+                current_version = current_version or LEGACY_SCHEMA_BASELINE
                 current_version = max(current_version, LEGACY_SCHEMA_BASELINE)
                 apply_migrations(self._conn, current_version, SCHEMA_VERSION)
                 if self.get_meta("database_id") is None:
                     self.set_meta("database_id", str(uuid.uuid4()))
+                self.set_meta("message_fts_integrity_version", MESSAGE_FTS_INTEGRITY_VERSION)
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _validate_existing_schema_version(self) -> int:
+        user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+        meta_version = 0
+        if self._has_table("meta"):
+            row = self._conn.execute(
+                "SELECT value FROM meta WHERE key = 'schema_version'"
+            ).fetchone()
+            if row is not None:
+                try:
+                    meta_version = int(row["value"])
+                except (TypeError, ValueError) as exc:
+                    raise RuntimeError("Database schema_version metadata is invalid") from exc
+        newest = max(user_version, meta_version)
+        if newest > SCHEMA_VERSION:
+            raise RuntimeError(
+                f"Database schema version {newest} is newer than supported version {SCHEMA_VERSION}"
+            )
+        if user_version and meta_version and user_version != meta_version:
+            raise RuntimeError(
+                "Database schema version metadata is inconsistent: "
+                f"meta={meta_version}, user_version={user_version}"
+            )
+        return newest
+
+    def _message_fts_integrity_is_valid(self) -> bool:
+        try:
+            self._conn.execute(
+                "INSERT INTO message_fts(message_fts, rank) VALUES('integrity-check', 1)"
+            )
+        except sqlite3.DatabaseError:
+            self._conn.rollback()
+            return False
+        self._conn.rollback()
+        return True
 
     def get_meta(self, key: str) -> str | None:
         row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (key,)).fetchone()
@@ -1927,12 +1977,28 @@ class ArchiveStore:
             cur = self._conn.execute(
                 """
                 UPDATE daily_summary_jobs
-                SET status = 'queued', worker_id = NULL, lease_until = NULL,
+                SET status = CASE
+                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                      THEN 'canceled'
+                      ELSE 'queued'
+                    END,
+                    worker_id = NULL, lease_until = NULL,
                     heartbeat_at = NULL, retry_at = NULL,
-                    progress_label = 'queued after worker stop', updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND status = 'running'
+                    progress_label = CASE
+                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                      THEN 'canceled'
+                      ELSE 'queued after worker stop'
+                    END,
+                    finished_at = CASE
+                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                      THEN COALESCE(finished_at, ?)
+                      ELSE NULL
+                    END,
+                    updated_at = ?
+                WHERE job_id = ? AND worker_id = ?
+                  AND status IN ('running', 'cancel_requested')
                 """,
-                (now, job_id, worker_id),
+                (now, now, job_id, worker_id),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -2971,18 +3037,21 @@ class ArchiveStore:
 
     def search_messages(self, query: str, limit: int = 50) -> list[dict[str, Any]]:
         limit = _bounded_limit(limit, max_limit=100)
-        with self._lock:
-            rows = self._conn.execute(
-                """
+        sql = """
                 SELECT m.*
                 FROM message_fts f
                 JOIN messages m ON m.rowid = f.rowid
                 WHERE message_fts MATCH ?
                 ORDER BY m.sent_at DESC
                 LIMIT ?
-                """,
-                (query, limit),
-            ).fetchall()
+                """
+        with self._lock:
+            try:
+                rows = self._conn.execute(sql, (query, limit)).fetchall()
+            except sqlite3.OperationalError as exc:
+                if not _is_fts_query_syntax_error(exc):
+                    raise
+                rows = self._conn.execute(sql, (_fts_literal_query(query), limit)).fetchall()
         return [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}) for row in rows]
 
     def query_messages(
@@ -3181,7 +3250,11 @@ class ArchiveStore:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(row["name"] == column for row in rows)
 
-    def _ensure_current_schema(self) -> None:
+    def _ensure_current_schema(
+        self,
+        *,
+        rebuild_message_fts: bool = False,
+    ) -> None:
         if self._has_table("origins") and not self._has_column("origins", "archived_at"):
             self._conn.execute("ALTER TABLE origins ADD COLUMN archived_at TEXT")
         if self._has_table("origins") and not self._has_column("origins", "last_message_at"):
@@ -3248,7 +3321,9 @@ class ArchiveStore:
                 "ON daily_summary_records(record_type, date, created_at)"
             )
         if self._has_table("messages"):
-            self._ensure_message_fts_triggers()
+            self._ensure_message_fts_triggers(
+                rebuild=rebuild_message_fts,
+            )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         if self._has_table(table) and not self._has_column(table, column):
@@ -3326,7 +3401,11 @@ class ArchiveStore:
             """
         )
 
-    def _ensure_message_fts_triggers(self) -> None:
+    def _ensure_message_fts_triggers(
+        self,
+        *,
+        rebuild: bool = False,
+    ) -> None:
         self._conn.executescript(
             """
             CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
@@ -3356,6 +3435,8 @@ class ArchiveStore:
             END;
             """
         )
+        if rebuild:
+            self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
 
     def _migrate_v1_to_v2(self) -> None:
         self._conn.executescript(
@@ -3547,6 +3628,29 @@ def _normalize_tag(tag: Any) -> str:
 def _like_pattern(term: str) -> str:
     escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{escaped}%"
+
+
+def _is_fts_query_syntax_error(exc: sqlite3.OperationalError) -> bool:
+    message = str(exc).lower()
+    return any(
+        marker in message
+        for marker in (
+            "fts5: syntax error",
+            "malformed match expression",
+            "unterminated string",
+            "no such column",
+            "unknown special query",
+        )
+    )
+
+
+def _fts_literal_query(query: str) -> str:
+    quoted: list[str] = []
+    safe_query = "".join(character if character >= " " else " " for character in query)
+    for token in safe_query.split():
+        escaped = token.replace('"', '""')
+        quoted.append(f'"{escaped}"')
+    return " ".join(quoted) or '""'
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

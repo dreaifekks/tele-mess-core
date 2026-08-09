@@ -66,15 +66,19 @@
             "type": "string"
           },
           "last_error": {
+            "nullable": true,
             "type": "string"
           },
           "phone": {
+            "nullable": true,
             "type": "string"
           },
           "session_dir": {
+            "nullable": true,
             "type": "string"
           },
           "session_name": {
+            "nullable": true,
             "type": "string"
           },
           "source": {
@@ -374,6 +378,7 @@
             "type": "string"
           },
           "tags": {
+            "nullable": true,
             "type": "string"
           },
           "topic_id": {
@@ -409,6 +414,49 @@
         },
         "required": [
           "items"
+        ],
+        "type": "object"
+      },
+      "BackupPolicyPatchInput": {
+        "properties": {
+          "account_id": {
+            "type": "string"
+          },
+          "capture_media_metadata": {
+            "type": "boolean"
+          },
+          "capture_text": {
+            "type": "boolean"
+          },
+          "download_media": {
+            "type": "boolean"
+          },
+          "download_stickers": {
+            "description": "Download sticker and custom-emoji document files independently of download_media; their emoji text is always archived.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "origin_id": {
+            "type": "integer"
+          },
+          "source": {
+            "default": "telegram",
+            "type": "string"
+          },
+          "tags": {
+            "nullable": true,
+            "type": "string"
+          },
+          "topic_id": {
+            "default": 0,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "account_id",
+          "origin_id"
         ],
         "type": "object"
       },
@@ -2664,8 +2712,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-10-13.1",
-    "x-contract-hash": "80a9e50f0f946f3b"
+    "version": "2026-11-20.1",
+    "x-contract-hash": "0657cc8c2ecd4084"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -3049,6 +3097,7 @@
     },
     "/manage/accounts/auth": {
       "patch": {
+        "description": "Omitted auth fields retain their stored values; null or empty strings clear nullable fields.",
         "operationId": "patch_manage_accounts_auth",
         "requestBody": {
           "content": {
@@ -3116,6 +3165,7 @@
         ]
       },
       "post": {
+        "description": "Omitted optional fields use creation defaults; null or empty strings clear nullable fields.",
         "operationId": "post_manage_accounts_auth",
         "requestBody": {
           "content": {
@@ -3177,7 +3227,7 @@
             "ApiTokenAuth": []
           }
         ],
-        "summary": "Create or update account auth state.",
+        "summary": "Create or replace account auth state.",
         "tags": [
           "management"
         ]
@@ -3586,12 +3636,13 @@
         ]
       },
       "patch": {
+        "description": "Omitted policy fields retain their stored values; null or an empty string clears tags.",
         "operationId": "patch_manage_backup_policies",
         "requestBody": {
           "content": {
             "application/json": {
               "schema": {
-                "$ref": "#/components/schemas/BackupPolicyInput"
+                "$ref": "#/components/schemas/BackupPolicyPatchInput"
               }
             }
           },
@@ -3653,6 +3704,7 @@
         ]
       },
       "post": {
+        "description": "Omitted policy fields use creation defaults; an existing download_stickers value is retained for compatibility with older clients. Null or an empty string clears tags.",
         "operationId": "post_manage_backup_policies",
         "requestBody": {
           "content": {

@@ -109,8 +109,8 @@ For backward compatibility, omitted `storage.database` and account
 `storage.data_dir`.
 
 `daily.ai.work_dir` controls only the current directory of the Codex or fallback
-subprocess. It defaults to `storage.data_dir` for backward compatibility and
-does not change config or data path resolution.
+subprocess. It defaults to `storage.data_dir/ai-work` and does not change config
+or data path resolution.
 
 ```yaml
 storage:

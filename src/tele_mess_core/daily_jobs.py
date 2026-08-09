@@ -16,10 +16,12 @@ from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import AppConfig, DailyDeliveryConfig
 from tele_mess_core.daily import (
     DailyJobCancelled,
+    DailyJobInterrupted,
     _resolve_package_date,
     _terminate_process,
     _zoneinfo,
     build_daily_package,
+    resolve_daily_delivery_account_config,
     resolve_daily_summary_delivery,
     run_daily_summary,
 )
@@ -31,7 +33,7 @@ TERMINAL_JOB_STATUSES = {"completed", "failed", "canceled"}
 LOGGER = logging.getLogger(__name__)
 
 
-class DailyJobWorkerStopping(RuntimeError):
+class DailyJobWorkerStopping(DailyJobInterrupted):
     pass
 
 
@@ -141,6 +143,8 @@ class DailyJobWorker:
         self._process_lock = threading.RLock()
         self._current_job_id: str | None = None
         self._current_process: subprocess.Popen[str] | None = None
+        self._current_delivery_loop: asyncio.AbstractEventLoop | None = None
+        self._current_delivery_task: asyncio.Task[Any] | None = None
         self._lease_seconds = max(300, int(config.daily.ai.timeout_seconds) + 120)
 
     def start(self) -> None:
@@ -157,6 +161,7 @@ class DailyJobWorker:
             process = self._current_process
         if process is not None and process.poll() is None:
             _terminate_process(process)
+        self._cancel_current_delivery()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout)
@@ -193,6 +198,7 @@ class DailyJobWorker:
             process = self._current_process if self._current_job_id == job_id else None
         if process is not None and process.poll() is None:
             _terminate_process(process)
+        self._cancel_current_delivery(job_id=job_id)
         self._wake_event.set()
         return self.store.get_daily_summary_job(job_id) or item
 
@@ -331,8 +337,8 @@ class DailyJobWorker:
         try:
             check_cancel()
             package = self.store.get_daily_package_run(str(package_run_id)) if package_run_id else None
-            if package is None:
-                planned_package_id = f"pkg_{uuid.uuid4().hex[:12]}"
+            if package is None or package.get("status") == "running":
+                planned_package_id = str(package_run_id or job.get("package_run_id") or f"pkg_{uuid.uuid4().hex[:12]}")
                 write_job(
                     "running",
                     {"stage": "package", "phase": "queued", "current": 0, "total": 0, "label": "package queued"},
@@ -441,7 +447,7 @@ class DailyJobWorker:
                 summary_id=str(summary["run_id"]),
                 finished_at=utc_now_iso(),
             )
-        except DailyJobWorkerStopping:
+        except DailyJobInterrupted:
             self.store.requeue_daily_summary_job(job_id, self.worker_id, now=utc_now_iso())
         except DailyJobCancelled as exc:
             self.store.discard_unsent_delivery_outbox(job_id=job_id)
@@ -510,13 +516,8 @@ class DailyJobWorker:
                     content=str(item["content"]),
                 )
             else:
-                account = next(
-                    (candidate for candidate in self.config.telegram.accounts if candidate.account_id == delivery.account_id),
-                    None,
-                )
-                if account is None:
-                    raise ValueError(f"Unknown delivery account_id: {delivery.account_id}")
-                result = asyncio.run(
+                account = resolve_daily_delivery_account_config(self.store, self.config, delivery)
+                result = self._run_delivery_coroutine(
                     TelegramSummaryDeliveryService(account, self.store).send_summary(
                         delivery,
                         str(item["content"]),
@@ -540,6 +541,41 @@ class DailyJobWorker:
                 now=utc_now_iso(),
             )
             return False
+
+    def _run_delivery_coroutine(self, coroutine: Any) -> dict[str, Any]:
+        loop = asyncio.new_event_loop()
+        task = loop.create_task(coroutine)
+        with self._process_lock:
+            self._current_delivery_loop = loop
+            self._current_delivery_task = task
+        if self._stop_event.is_set():
+            task.cancel()
+        try:
+            return loop.run_until_complete(task)
+        except asyncio.CancelledError as exc:
+            raise DailyJobWorkerStopping("delivery interrupted") from exc
+        finally:
+            with self._process_lock:
+                if self._current_delivery_task is task:
+                    self._current_delivery_task = None
+                    self._current_delivery_loop = None
+            try:
+                loop.run_until_complete(loop.shutdown_asyncgens())
+            finally:
+                loop.close()
+
+    def _cancel_current_delivery(self, *, job_id: str | None = None) -> None:
+        with self._process_lock:
+            if job_id is not None and self._current_job_id != job_id:
+                return
+            loop = self._current_delivery_loop
+            task = self._current_delivery_task
+        if loop is None or task is None or task.done():
+            return
+        try:
+            loop.call_soon_threadsafe(task.cancel)
+        except RuntimeError:
+            pass
 
 
 def _is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:

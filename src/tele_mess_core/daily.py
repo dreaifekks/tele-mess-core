@@ -25,7 +25,13 @@ from tele_mess_core.codex_limits import (
     codex_app_server_command,
     read_codex_rate_limit_status,
 )
-from tele_mess_core.config import AppConfig, DailyDeliveryConfig, app_workspace_dir
+from tele_mess_core.config import (
+    AppConfig,
+    DailyDeliveryConfig,
+    TelegramAccountConfig,
+    app_workspace_dir,
+    resolve_workspace_path,
+)
 from tele_mess_core.models import (
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
@@ -41,6 +47,10 @@ from tele_mess_core.models import (
 DAILY_SYSTEMD_BASENAME = "tele-mess-core-daily-package"
 MESSAGE_POINT_CHUNK_SIZE = 200
 PACKAGE_MESSAGE_PAGE_SIZE = 5000
+
+
+class DailyJobInterrupted(RuntimeError):
+    """A recoverable interruption that must be handled by the durable worker."""
 
 
 class DailyJobCancelled(RuntimeError):
@@ -489,6 +499,8 @@ def build_daily_package(
                 finished_at=finished,
             )
         )
+    except DailyJobInterrupted:
+        raise
     except DailyJobCancelled as exc:
         return store.upsert_daily_package_run(
             DailyPackageRunRecord(
@@ -897,6 +909,8 @@ def run_daily_summary(
                 finished_at=utc_now_iso(),
             )
         )
+    except DailyJobInterrupted:
+        raise
     except DailyJobCancelled as exc:
         return store.upsert_daily_summary_run(
             DailySummaryRunRecord(
@@ -1028,7 +1042,7 @@ def deliver_daily_summary(
             delivery=delivery,
             content=content,
         )
-    account = _delivery_account_config(config, delivery)
+    account = resolve_daily_delivery_account_config(store, config, delivery)
     from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
     return asyncio.run(TelegramSummaryDeliveryService(account, store).send_summary(delivery, content))
@@ -1051,12 +1065,15 @@ def daily_summary_delivery_state(store: ArchiveStore, config: AppConfig) -> dict
 
 def resolve_daily_summary_delivery(store: ArchiveStore, config: AppConfig) -> DailyDeliveryConfig:
     state = daily_summary_delivery_state(store, config)
-    return DailyDeliveryConfig(
+    delivery = DailyDeliveryConfig(
         enabled=bool(state.get("enabled")),
         account_id=str(state.get("account_id") or ""),
         origin_id=int(state["origin_id"]) if state.get("origin_id") is not None else None,
         topic_id=int(state.get("topic_id") or 0),
     )
+    if delivery.enabled:
+        _validate_daily_summary_delivery_account(store, config, delivery.account_id)
+    return delivery
 
 
 def update_daily_summary_delivery(
@@ -1079,8 +1096,7 @@ def update_daily_summary_delivery(
             raise ValueError("daily summary delivery account_id is required when enabled is true")
         if origin_id is None:
             raise ValueError("daily summary delivery origin_id is required when enabled is true")
-        if not any(account.account_id == account_id for account in config.telegram.accounts):
-            raise ValueError(f"Unknown daily summary delivery account_id: {account_id}")
+        _validate_daily_summary_delivery_account(store, config, account_id)
     stored = store.set_daily_summary_delivery(
         DailySummaryDeliveryRecord(
             enabled=enabled,
@@ -1093,11 +1109,58 @@ def update_daily_summary_delivery(
     return {**stored, "source": "database"}
 
 
-def _delivery_account_config(config: AppConfig, delivery: DailyDeliveryConfig):
+def _validate_daily_summary_delivery_account(
+    store: ArchiveStore,
+    config: AppConfig,
+    account_id: str,
+) -> None:
+    if any(account.account_id == account_id for account in config.telegram.accounts):
+        return
+    if any(
+        item.get("source") == SOURCE_TELEGRAM and item.get("account_id") == account_id
+        for item in store.list_management_accounts()
+    ):
+        return
+    raise ValueError(f"Unknown daily summary delivery account_id: {account_id}")
+
+
+def resolve_daily_delivery_account_config(
+    store: ArchiveStore,
+    config: AppConfig,
+    delivery: DailyDeliveryConfig,
+) -> TelegramAccountConfig:
     account_id = delivery.account_id
     for account in config.telegram.accounts:
         if account.account_id == account_id:
             return account
+    stored = next(
+        (
+            item
+            for item in store.list_management_accounts()
+            if item.get("source") == SOURCE_TELEGRAM and item.get("account_id") == account_id
+        ),
+        None,
+    )
+    if stored is not None:
+        if not config.telegram.accounts:
+            raise ValueError(
+                "At least one configured Telegram account is required as an API credential template"
+            )
+        template = config.telegram.accounts[0]
+        session_dir_raw = stored.get("session_dir")
+        session_dir = (
+            resolve_workspace_path(config, str(session_dir_raw))
+            if session_dir_raw
+            else template.session_dir
+        )
+        return TelegramAccountConfig(
+            account_id=account_id,
+            api_id=template.api_id,
+            api_hash=template.api_hash,
+            session_name=str(stored.get("session_name") or account_id),
+            session_dir=session_dir,
+            timezone=template.timezone,
+        )
     raise ValueError(f"Unknown daily.delivery.account_id: {account_id}")
 
 
@@ -2840,8 +2903,9 @@ def _run_codex_provider(
                         kind="codex_timeout",
                         provider="codex-cli",
                     )
-    except DailyJobCancelled:
+    except (DailyJobCancelled, DailyJobInterrupted):
         _terminate_process(process)
+        _close_process_pipes(process)
         raise
     finally:
         if process_callback:
@@ -2996,8 +3060,9 @@ def _run_openai_fallback_provider(
                         provider=f"openai-compatible:{fallback.model}",
                         retryable=True,
                     )
-    except DailyJobCancelled:
+    except (DailyJobCancelled, DailyJobInterrupted):
         _terminate_process(process)
+        _close_process_pipes(process)
         raise
     finally:
         if process_callback:
@@ -3062,6 +3127,16 @@ def _terminate_process(process: subprocess.Popen[str]) -> None:
             pass
 
 
+def _close_process_pipes(process: subprocess.Popen[str]) -> None:
+    for pipe in (process.stdin, process.stdout, process.stderr):
+        if pipe is None:
+            continue
+        try:
+            pipe.close()
+        except OSError:
+            pass
+
+
 def _expand_command(
     command: list[str],
     output_path: Path,
@@ -3097,6 +3172,14 @@ def _expand_command(
         if "--ephemeral" not in expanded:
             expanded.insert(insert_at, "--ephemeral")
             insert_at += 1
+        has_sandbox = any(
+            token in {"-s", "--sandbox"}
+            or token.startswith(("-s=", "--sandbox="))
+            for token in expanded
+        )
+        if not has_sandbox:
+            expanded[insert_at:insert_at] = ["--sandbox", "read-only"]
+            insert_at += 2
         if _codex_feature_override(expanded, "hooks") is None:
             expanded[insert_at:insert_at] = ["--disable", "hooks"]
             insert_at += 2
@@ -3319,7 +3402,7 @@ def _daily_output_dir(config: AppConfig) -> Path:
 
 
 def _daily_ai_work_dir(config: AppConfig) -> Path:
-    return config.daily.ai.work_dir or config.storage.data_dir
+    return config.daily.ai.work_dir or (config.storage.data_dir / "ai-work")
 
 
 def _resolve_package_date(raw_date: Any, tz: ZoneInfo) -> date_type:

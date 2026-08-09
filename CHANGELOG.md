@@ -7,6 +7,19 @@ validation rules.
 
 ## Unreleased
 
+- `PATCH /manage/backup-policies` and `PATCH /manage/accounts/auth` keep
+  fields the request omits instead of resetting them to defaults.
+- Full-text search treats invalid FTS syntax as literal text.
+- An archive from a newer schema version is rejected before anything is
+  written to it.
+- Stopping the service requeues interrupted daily jobs and leaves their package
+  and summary runs resumable instead of failing them.
+- Daily delivery accepts Telegram accounts that were added through the
+  management API and exist only in SQLite.
+- Media responses send RFC 5987 filenames and only header-safe MIME types.
+- Codex batches run in a read-only sandbox from `storage.data_dir/ai-work`
+  unless `daily.ai.work_dir` is set.
+
 ## 0.3.5 - 2026-10-13
 
 - Added a read-only MCP endpoint at `POST /mcp` (stateless Streamable HTTP,

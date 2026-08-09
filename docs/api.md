@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-10-13.1`
-- Contract hash: `80a9e50f0f946f3b`
+- Contract version: `2026-11-20.1`
+- Contract hash: `0657cc8c2ecd4084`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -33,7 +33,7 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /manage/accounts` (management, token) - List management account state.
 - `POST /manage/accounts` (management, token) - Create or update account metadata.
 - `DELETE /manage/accounts` (management, token) - Delete management account metadata.
-- `POST /manage/accounts/auth` (management, token) - Create or update account auth state.
+- `POST /manage/accounts/auth` (management, token) - Create or replace account auth state.
 - `PATCH /manage/accounts/auth` (management, token) - Patch account auth state.
 - `POST /manage/accounts/auth/status` (management, token) - Check live Telegram auth status.
 - `POST /manage/accounts/auth/request-code` (management, token) - Request a Telegram login code.
@@ -332,7 +332,7 @@ Response: `AccountDeleteResponse`
 
 ### POST /manage/accounts/auth
 
-Create or update account auth state.
+Create or replace account auth state.
 
 - Tag: `management`
 - Auth: `required`
@@ -491,7 +491,7 @@ Patch an origin backup policy.
 - Auth: `required`
 - Success: `200`
 
-Request body: `BackupPolicyInput`
+Request body: `BackupPolicyPatchInput`
 
 Response: `BackupPolicyItemResponse`
 
@@ -1085,6 +1085,21 @@ Response: `McpJsonRpcResponse`
 | Field | Type | Required |
 | --- | --- | --- |
 | `items` | `array<BackupPolicy>` | yes |
+
+### BackupPolicyPatchInput
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `source` | `string` | no |
+| `account_id` | `string` | yes |
+| `origin_id` | `integer` | yes |
+| `topic_id` | `integer` | no |
+| `enabled` | `boolean` | no |
+| `capture_text` | `boolean` | no |
+| `capture_media_metadata` | `boolean` | no |
+| `download_media` | `boolean` | no |
+| `download_stickers` | `boolean` | no |
+| `tags` | `string` | no |
 
 ### CapabilitiesResponse
 
