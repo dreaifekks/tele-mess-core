@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import TimeoutError as FutureTimeoutError
 import inspect
 import json
 import logging
 from pathlib import Path
 import threading
+import time
 from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
@@ -19,6 +21,7 @@ from tele_mess_core.telegram.ingest import TelegramArchiveService
 
 ClientFactory = Callable[[TelegramAccountConfig], Any]
 INGEST_RETRY_INITIAL_SECONDS = 1.0
+CONNECTION_RETRY_INITIAL_SECONDS = 1.0
 
 
 class TelegramAccountRuntime:
@@ -147,7 +150,7 @@ class TelegramAccountRuntime:
         }
 
     async def _supervise_connection(self) -> None:
-        delay = 1.0
+        delay = CONNECTION_RETRY_INITIAL_SECONDS
         while not self._stopping.is_set():
             client = None
             try:
@@ -159,7 +162,7 @@ class TelegramAccountRuntime:
                 await client.connect()
                 self.client = client
                 self._ready.set()
-                delay = 1.0
+                delay = CONNECTION_RETRY_INITIAL_SECONDS
                 authorized = await client.is_user_authorized()
                 self._record_auth_state("authorized" if authorized else "needs_login")
                 if authorized:
@@ -184,7 +187,10 @@ class TelegramAccountRuntime:
                 delay = min(delay * 2, 60.0)
             finally:
                 self._ready.clear()
-                await self._stop_ingestion()
+                try:
+                    await self._stop_ingestion()
+                except Exception as exc:
+                    self._record_runtime_failure(exc, operation="ingest_stop")
                 if client is not None:
                     try:
                         await client.disconnect()
@@ -295,19 +301,31 @@ class TelegramAccountRuntime:
     def _record_runtime_failure(self, exc: Exception, operation: str = "account_runtime") -> None:
         message = str(exc) or exc.__class__.__name__
         self.logger.warning("Telegram runtime failure for account %s: %s", self.config.account_id, message)
-        self._record_auth_state("error", last_error=message)
-        self.store.add_operation_event(
-            OperationEventRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.config.account_id,
-                operation=operation,
-                status="failed",
-                error_code="telegram_runtime_failed",
-                message=message,
-                occurred_at=utc_now_iso(),
-                raw_json=json.dumps({"error_type": exc.__class__.__name__}, ensure_ascii=False),
+        try:
+            self._record_auth_state("error", last_error=message)
+        except Exception:
+            self.logger.exception(
+                "Failed to persist Telegram runtime auth failure for account %s",
+                self.config.account_id,
             )
-        )
+        try:
+            self.store.add_operation_event(
+                OperationEventRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.config.account_id,
+                    operation=operation,
+                    status="failed",
+                    error_code="telegram_runtime_failed",
+                    message=message,
+                    occurred_at=utc_now_iso(),
+                    raw_json=json.dumps({"error_type": exc.__class__.__name__}, ensure_ascii=False),
+                )
+            )
+        except Exception:
+            self.logger.exception(
+                "Failed to persist Telegram runtime operation failure for account %s",
+                self.config.account_id,
+            )
 
 
 class TelegramRuntimeManager:
@@ -349,12 +367,19 @@ class TelegramRuntimeManager:
         self._loop = None
         self._loop_thread_id = None
 
-    def call(self, account_id: str, operation: str, **kwargs: Any) -> dict[str, Any]:
+    def call(
+        self,
+        account_id: str,
+        operation: str,
+        *,
+        cancel_event: threading.Event | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         loop = self._require_loop()
         if threading.get_ident() == self._loop_thread_id:
             raise RuntimeError("Use execute() when calling TelegramRuntimeManager from its event loop")
         future = asyncio.run_coroutine_threadsafe(self.execute(account_id, operation, **kwargs), loop)
-        return self._wait_for_future(future)
+        return self._wait_for_future(future, operation=operation, cancel_event=cancel_event)
 
     def notify(self, account_id: str, operation: str, **kwargs: Any) -> None:
         loop = self._require_loop()
@@ -447,9 +472,29 @@ class TelegramRuntimeManager:
             raise RuntimeError("Telegram runtime manager is not running")
         return self._loop
 
-    def _wait_for_future(self, future: Any) -> Any:
+    def _wait_for_future(
+        self,
+        future: Any,
+        *,
+        operation: str = "operation",
+        cancel_event: threading.Event | None = None,
+    ) -> Any:
+        deadline = time.monotonic() + self.call_timeout
         try:
-            return future.result(timeout=self.call_timeout)
+            while True:
+                if future.done():
+                    return future.result()
+                if cancel_event is not None and cancel_event.is_set():
+                    raise RuntimeError(f"Telegram runtime {operation} canceled while waiting")
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(
+                        f"Telegram runtime {operation} timed out after {self.call_timeout:g} seconds"
+                    )
+                try:
+                    return future.result(timeout=min(0.1, remaining))
+                except FutureTimeoutError:
+                    continue
         except BaseException:
             future.cancel()
             raise

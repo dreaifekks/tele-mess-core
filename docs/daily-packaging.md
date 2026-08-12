@@ -306,6 +306,13 @@ Repeating an equivalent request returns its active
 or completed job by default; use API `force: true` or CLI `--force` for an
 intentional rerun.
 
+Telegram account runtime failures are recorded on a best-effort basis so a
+temporary SQLite or filesystem write failure cannot terminate the reconnect
+loop while it is trying to report that same failure. Delivery calls that reach
+the runtime bridge timeout are stored with an explicit operation and timeout
+message rather than an empty error. Service shutdown also cancels a bridge call
+that is waiting for Telegram so the outbox remains retryable for the next run.
+
 Summary records store Markdown plus metadata and stage output references. Their
 queryable `record_type` distinguishes compatibility records such as `tag_group`,
 `important_origin`, and `final` from the new run-level `important_daily` and

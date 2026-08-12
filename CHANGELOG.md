@@ -7,6 +7,11 @@ validation rules.
 
 ## Unreleased
 
+- Keep each Telegram account reconnect loop alive when persisting its failure
+  state also fails, such as while the host filesystem is full.
+- Record explicit Telegram runtime timeout errors in the delivery outbox and
+  let service shutdown cancel an in-flight bridge call promptly.
+
 ## 0.3.4 - 2026-08-08
 
 - Added server-side filename, normalized media-type, and exact extension filters

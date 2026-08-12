@@ -505,6 +505,7 @@ class DailyJobWorker:
                 result = self.telegram_runtime.call(
                     delivery.account_id,
                     "deliver_chunk",
+                    cancel_event=self._stop_event,
                     delivery=delivery,
                     content=str(item["content"]),
                 )

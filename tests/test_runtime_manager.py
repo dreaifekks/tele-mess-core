@@ -1,7 +1,10 @@
 from __future__ import annotations
 
 import asyncio
+from concurrent.futures import Future
+import sqlite3
 import tempfile
+import threading
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +154,64 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(statuses["alt"]["supervisor_running"])
         finally:
             await manager.stop()
+
+    async def test_runtime_reconnects_when_failure_persistence_also_fails(self) -> None:
+        clients: list[FakeClient] = []
+
+        def factory(config: TelegramAccountConfig) -> FakeClient:
+            client = FakeClient(authorized=False)
+            if not clients:
+                client.disconnected.set_result(None)
+            clients.append(client)
+            return client
+
+        original_upsert = self.store.upsert_account_auth
+
+        def fail_error_auth(record: AccountAuthRecord) -> dict[str, object]:
+            if record.auth_state == "error":
+                raise sqlite3.OperationalError("database or disk is full")
+            return original_upsert(record)
+
+        manager = TelegramRuntimeManager(self.config, self.store, client_factory=factory)
+        with (
+            patch("tele_mess_core.telegram.manager.CONNECTION_RETRY_INITIAL_SECONDS", 0.001),
+            patch.object(self.store, "upsert_account_auth", side_effect=fail_error_auth),
+            patch.object(
+                self.store,
+                "add_operation_event",
+                side_effect=sqlite3.OperationalError("database or disk is full"),
+            ),
+        ):
+            await manager.start()
+            try:
+                async def wait_until_reconnected() -> None:
+                    while len(clients) < 2 or not manager.statuses()[0]["supervisor_running"]:
+                        await asyncio.sleep(0.001)
+
+                await asyncio.wait_for(wait_until_reconnected(), timeout=1)
+                self.assertGreaterEqual(len(clients), 2)
+                self.assertTrue(manager.statuses()[0]["supervisor_running"])
+            finally:
+                await manager.stop()
+
+    def test_thread_bridge_timeout_and_cancel_errors_are_nonempty(self) -> None:
+        manager = TelegramRuntimeManager(self.config, self.store, call_timeout=0.001)
+        timed_out: Future[object] = Future()
+
+        with self.assertRaisesRegex(TimeoutError, "deliver_chunk timed out after"):
+            manager._wait_for_future(timed_out, operation="deliver_chunk")
+        self.assertTrue(timed_out.cancelled())
+
+        canceled: Future[object] = Future()
+        cancel_event = threading.Event()
+        cancel_event.set()
+        with self.assertRaisesRegex(RuntimeError, "deliver_chunk canceled while waiting"):
+            manager._wait_for_future(
+                canceled,
+                operation="deliver_chunk",
+                cancel_event=cancel_event,
+            )
+        self.assertTrue(canceled.cancelled())
 
     async def test_threaded_register_and_unregister_updates_runtime(self) -> None:
         manager = TelegramRuntimeManager(
