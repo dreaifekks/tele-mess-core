@@ -14,6 +14,7 @@ from unittest.mock import patch
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.cli import main
+from tele_mess_core.codex_limits import CodexRateLimitStatus
 from tele_mess_core.config import (
     AppConfig,
     DailyAiConfig,
@@ -26,6 +27,7 @@ from tele_mess_core.config import (
     TelegramConfig,
 )
 from tele_mess_core.daily import (
+    AiProviderError,
     AiProviderResult,
     AiProviderRuntimeState,
     _codex_provider_error,
@@ -1085,6 +1087,138 @@ daily:
         self.assertEqual(counter_path.read_text(encoding="utf-8").splitlines(), ["attempt"])
         self.assertEqual(fallback.call_count, 2)
 
+    def test_codex_limit_preflight_activates_fallback_without_starting_codex(self) -> None:
+        key_path = self.root / "fallback-key"
+        key_path.write_text("local-secret", encoding="utf-8")
+        config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="codex-cli",
+                    command=["codex", "exec", "-"],
+                    fallback=DailyAiFallbackConfig(
+                        enabled=True,
+                        base_url="https://fallback.example/v1",
+                        api_key_file=key_path,
+                    ),
+                ),
+            ),
+        )
+        state = AiProviderRuntimeState()
+
+        def fake_fallback(
+            _config: AppConfig,
+            _prompt: str,
+            output_path: Path,
+            _images: list[str],
+            **kwargs: object,
+        ) -> AiProviderResult:
+            runtime_state = kwargs["provider_state"]
+            assert isinstance(runtime_state, AiProviderRuntimeState)
+            runtime_state.register("openai-compatible:deepseek-v4-flash")
+            output_path.write_text("fallback output", encoding="utf-8")
+            return AiProviderResult(
+                content="fallback output",
+                provider="openai-compatible:deepseek-v4-flash",
+            )
+
+        with (
+            patch(
+                "tele_mess_core.daily._read_codex_limit_status",
+                return_value=CodexRateLimitStatus(True, "codex:rate_limit_reached"),
+            ) as probe,
+            patch("tele_mess_core.daily._run_codex_provider") as codex,
+            patch(
+                "tele_mess_core.daily._run_openai_fallback_provider",
+                side_effect=fake_fallback,
+            ) as fallback,
+        ):
+            first = _run_summary_provider(
+                config,
+                "first task",
+                self.root / "preflight-first.md",
+                [],
+                provider_state=state,
+            )
+            second = _run_summary_provider(
+                config,
+                "second task",
+                self.root / "preflight-second.md",
+                [],
+                provider_state=state,
+            )
+
+        self.assertEqual(first.content, "fallback output")
+        self.assertEqual(second.content, "fallback output")
+        self.assertTrue(state.fallback_active)
+        self.assertIn("rate_limit_reached", str(state.fallback_reason))
+        probe.assert_called_once()
+        codex.assert_not_called()
+        self.assertEqual(fallback.call_count, 2)
+
+    def test_generic_codex_failure_uses_fresh_limit_snapshot_as_confirmation(self) -> None:
+        key_path = self.root / "fallback-key"
+        key_path.write_text("local-secret", encoding="utf-8")
+        config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=DailyAiConfig(
+                    provider="codex-cli",
+                    command=["codex", "exec", "-"],
+                    fallback=DailyAiFallbackConfig(
+                        enabled=True,
+                        base_url="https://fallback.example/v1",
+                        api_key_file=key_path,
+                    ),
+                ),
+            ),
+        )
+        state = AiProviderRuntimeState()
+        generic_error = AiProviderError(
+            "Codex CLI failed with exit code 1",
+            kind="codex_failed",
+            provider="codex-cli",
+        )
+
+        with (
+            patch(
+                "tele_mess_core.daily._read_codex_limit_status",
+                side_effect=[
+                    CodexRateLimitStatus(False),
+                    CodexRateLimitStatus(True, "codex:secondary_window_reached"),
+                ],
+            ) as probe,
+            patch("tele_mess_core.daily._run_codex_provider", side_effect=generic_error),
+            patch(
+                "tele_mess_core.daily._run_openai_fallback_provider",
+                return_value=AiProviderResult(
+                    content="confirmed fallback",
+                    provider="openai-compatible:deepseek-v4-flash",
+                ),
+            ) as fallback,
+        ):
+            result = _run_summary_provider(
+                config,
+                "task",
+                self.root / "confirmed.md",
+                [],
+                provider_state=state,
+            )
+
+        self.assertEqual(result.content, "confirmed fallback")
+        self.assertTrue(state.fallback_active)
+        self.assertIn("secondary_window_reached", str(state.fallback_reason))
+        self.assertEqual(probe.call_count, 2)
+        fallback.assert_called_once()
+
     def test_codex_errors_are_classified_without_persisting_prompt_or_key(self) -> None:
         usage = _codex_provider_error(
             "private Telegram body\nERROR: You've hit your usage limit and try again at 11:33 PM.",
@@ -1093,6 +1227,18 @@ daily:
         self.assertEqual(usage.kind, "codex_usage_limit")
         self.assertTrue(usage.retryable)
         self.assertNotIn("Telegram", str(usage))
+
+        for detail in (
+            "You've hit your usage limit for GPT-5.6 Sol. Switch to another model now.",
+            "You've hit your usage limit.",
+            "You’ve hit your usage limit.",
+            '{"code":"usage_limit_exceeded"}',
+            '{"rateLimitReachedType":"workspace_owner_credits_depleted"}',
+        ):
+            with self.subTest(detail=detail):
+                variant = _codex_provider_error(detail, returncode=1)
+                self.assertEqual(variant.kind, "codex_usage_limit")
+                self.assertTrue(variant.retryable)
 
         generic = _codex_provider_error(
             "prompt /home/user/private/image.png sk-private\nERROR: arbitrary upstream failure",

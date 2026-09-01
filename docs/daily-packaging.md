@@ -194,9 +194,21 @@ commands should include the isolation flags and placeholders explicitly.
 the Codex/fallback subprocess current directory. It does not change the config,
 database, session, or output path roots.
 
-An optional fallback is activated only after the Codex CLI returns a confirmed
-usage-limit error. Once activated, the rest of that summary run goes directly
-to the fallback instead of repeatedly starting Codex:
+An optional fallback is activated when a direct Codex command has a definitive
+usage-limit signal. Before the first AI stage, `tele-mess-core` makes a
+read-only `account/rateLimits/read` request through `codex app-server`; it does
+not start a thread/turn, invoke a model, or consume a reset credit. A reached
+limit switches the whole run to the fallback before starting Codex. If the
+probe is unavailable or inconclusive, Codex still runs normally. After an
+otherwise generic Codex failure, a fresh reached-limit snapshot can confirm the
+fallback transition without relying only on human-readable CLI wording.
+
+The probe is supported only for recognized direct `codex` executables. Custom
+wrappers continue to rely on their exit output. No fixed percentage below 100
+is treated as exhausted, unrelated limit buckets are ignored, and available
+credits or an already-passed reset timestamp prevent a percentage-only switch.
+Once activated, the rest of that summary run goes directly to the fallback
+instead of repeatedly starting Codex:
 
 ```yaml
 daily:

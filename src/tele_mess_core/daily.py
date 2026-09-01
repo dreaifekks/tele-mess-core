@@ -20,6 +20,11 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from tele_mess_core.archive import ArchiveStore
+from tele_mess_core.codex_limits import (
+    CodexRateLimitStatus,
+    codex_app_server_command,
+    read_codex_rate_limit_status,
+)
 from tele_mess_core.config import AppConfig, DailyDeliveryConfig, app_workspace_dir
 from tele_mess_core.models import (
     DailyPackageRunRecord,
@@ -61,6 +66,7 @@ class AiProviderError(RuntimeError):
 class AiProviderRuntimeState:
     fallback_active: bool = False
     fallback_reason: str | None = None
+    codex_limit_preflight_checked: bool = False
     providers_used: list[str] = field(default_factory=list)
 
     def register(self, provider: str) -> None:
@@ -2720,6 +2726,18 @@ def _run_summary_provider(
         output_path.write_text(text, encoding="utf-8")
         provider_state.register("disabled")
         return AiProviderResult(content=text, provider="disabled", generated_by_ai=False)
+    fallback = config.daily.ai.fallback
+    if (
+        fallback.enabled
+        and not provider_state.fallback_active
+        and not provider_state.codex_limit_preflight_checked
+    ):
+        provider_state.codex_limit_preflight_checked = True
+        status = _read_codex_limit_status(config, cancel_check=cancel_check)
+        if status is not None and status.reached:
+            provider_state.activate_fallback(
+                reason=f"codex_usage_limit_preflight:{status.reason or 'reached'}"
+            )
     if provider_state.fallback_active:
         return _run_openai_fallback_provider(
             config,
@@ -2745,10 +2763,18 @@ def _run_summary_provider(
             provider_state=provider_state,
         )
     except AiProviderError as exc:
-        fallback = config.daily.ai.fallback
-        if exc.kind != "codex_usage_limit" or not fallback.enabled:
+        if not fallback.enabled:
             raise
-        provider_state.activate_fallback(reason=exc.kind)
+        fallback_reason: str | None = None
+        if exc.kind == "codex_usage_limit":
+            fallback_reason = exc.kind
+        elif exc.kind == "codex_failed":
+            status = _read_codex_limit_status(config, cancel_check=cancel_check)
+            if status is not None and status.reached:
+                fallback_reason = f"codex_usage_limit_confirmed:{status.reason or 'reached'}"
+        if fallback_reason is None:
+            raise
+        provider_state.activate_fallback(reason=fallback_reason)
         return _run_openai_fallback_provider(
             config,
             prompt,
@@ -2842,10 +2868,19 @@ def _run_codex_provider(
 
 def _codex_provider_error(detail: str, *, returncode: int) -> AiProviderError:
     lines = [line.strip() for line in detail.splitlines() if line.strip()]
-    tail = "\n".join(lines[-12:]).lower()
-    if "you've hit your usage limit" in tail and (
-        "try again at" in tail or "codex/settings/usage" in tail
-    ):
+    tail = "\n".join(lines[-64:])[-16_384:].replace("’", "'").lower()
+    usage_limit_markers = (
+        "you've hit your usage limit",
+        "you have hit your usage limit",
+        "you've reached your weekly limit",
+        "usage_limit_reached",
+        "usage_limit_exceeded",
+        "workspace_owner_credits_depleted",
+        "workspace_member_credits_depleted",
+        "workspace_owner_usage_limit_reached",
+        "workspace_member_usage_limit_reached",
+    )
+    if any(marker in tail for marker in usage_limit_markers):
         return AiProviderError(
             "Codex usage limit reached",
             kind="codex_usage_limit",
@@ -2856,6 +2891,21 @@ def _codex_provider_error(detail: str, *, returncode: int) -> AiProviderError:
         f"Codex CLI failed with exit code {returncode}",
         kind="codex_failed",
         provider="codex-cli",
+    )
+
+
+def _read_codex_limit_status(
+    config: AppConfig,
+    *,
+    cancel_check: Callable[[], None] | None,
+) -> CodexRateLimitStatus | None:
+    command = codex_app_server_command(config.daily.ai.command)
+    if command is None:
+        return None
+    return read_codex_rate_limit_status(
+        command,
+        timeout_seconds=min(10.0, max(1.0, float(config.daily.ai.timeout_seconds))),
+        cancel_check=cancel_check,
     )
 
 

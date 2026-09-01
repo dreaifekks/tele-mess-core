@@ -454,10 +454,13 @@ turning an already completed summary into a failed run.
 The default AI provider is a configurable, locally invoked `codex exec` command
 template using `--output-last-message`. Templates can use `{output}`, `{images}`,
 and `{task}`. An optional `daily.ai.fallback` can switch the remainder of a run
-to an OpenAI-compatible Responses endpoint only when Codex reports a usage
-limit. The API key is read from an ignored local file; transient fallback
-failures can be durably retried once after a configured delay. Set
-`daily.ai.provider: disabled` whenever analysis must not call an AI provider.
+to an OpenAI-compatible Responses endpoint when Codex reports a usage limit or
+a read-only `codex app-server` snapshot definitively confirms one. The probe
+does not start a model turn or consume a reset credit, and an unavailable or
+inconclusive probe never blocks the normal Codex attempt. The API key is read
+from an ignored local file; transient fallback failures can be durably retried
+once after a configured delay. Set `daily.ai.provider: disabled` whenever
+analysis must not call an AI provider.
 
 ## Design Boundary
 
