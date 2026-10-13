@@ -26,6 +26,7 @@ from tele_mess_core.models import (
     OperationEventRecord,
     OriginRecord,
     ParticipantRecord,
+    SOURCE_TELEGRAM,
     UserRecord,
     utc_now_iso,
 )
@@ -42,6 +43,32 @@ from tele_mess_core.media import (
 
 SCHEMA_VERSION = 19
 LEGACY_SCHEMA_BASELINE = 12
+
+# Compact message projection shared by the read-only message queries; a topic's
+# origin_title is prefixed with its parent group title.
+_MESSAGE_VIEW_COLUMNS = """
+    m.rowid AS row_id, m.account_id, m.chat_id, m.message_id, m.topic_id,
+    m.sender_name, m.sender_username, m.sent_at, m.edited_at, m.deleted_at, m.text,
+    m.media_kind, m.reply_to_message_id, m.forward_from_name, m.permalink,
+    COALESCE(parent.title || ' / ' || o.title, o.title, c.title) AS origin_title
+"""
+_MESSAGE_VIEW_JOINS = """
+    LEFT JOIN chats c
+      ON c.source = m.source
+     AND c.account_id = m.account_id
+     AND c.chat_id = m.chat_id
+    LEFT JOIN origins o
+      ON o.source = m.source
+     AND o.account_id = m.account_id
+     AND o.origin_id = m.chat_id
+     AND o.topic_id = COALESCE(m.topic_id, 0)
+    LEFT JOIN origins parent
+      ON parent.source = o.source
+     AND parent.account_id = o.account_id
+     AND parent.origin_id = o.origin_id
+     AND parent.topic_id = 0
+     AND o.topic_id != 0
+"""
 
 
 class ArchiveStore:
@@ -2124,6 +2151,7 @@ class ArchiveStore:
         q: str | None = None,
         include_incomplete: bool = False,
         limit: int = 100,
+        offset: int = 0,
     ) -> list[dict[str, Any]]:
         if importance_min is not None and not 1 <= int(importance_min) <= 5:
             raise ValueError("importance_min must be between 1 and 5")
@@ -2195,8 +2223,9 @@ class ArchiveStore:
             params.append(tag)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY p.date DESC, p.occurred_at DESC, p.point_id DESC LIMIT ?"
+        sql += " ORDER BY p.date DESC, p.occurred_at DESC, p.point_id DESC LIMIT ? OFFSET ?"
         params.append(_bounded_limit(limit, max_limit=1000))
+        params.append(max(0, int(offset)))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [_daily_message_point_from_row(row) for row in rows]
@@ -2953,6 +2982,158 @@ class ArchiveStore:
             ).fetchall()
         return [_row_to_dict(row, json_fields={"reactions_json", "raw_json"}) for row in rows]
 
+    def query_messages(
+        self,
+        *,
+        fts_query: str | None = None,
+        text_terms: list[str] | None = None,
+        account_id: str | None = None,
+        origin_id: int | None = None,
+        topic_id: int | None = None,
+        sender: str | None = None,
+        sent_from: str | None = None,
+        sent_before: str | None = None,
+        include_deleted: bool = False,
+        descending: bool = True,
+        after: tuple[str, int] | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        """Return compact message rows ordered by (sent_at, rowid).
+
+        `after` is the (sent_at, row_id) of the last row of the previous page.
+        """
+        source_sql = "messages m"
+        clauses: list[str] = []
+        params: list[Any] = []
+        if fts_query:
+            # CROSS JOIN pins the full-text index as the outer loop.
+            source_sql = "message_fts f CROSS JOIN messages m ON m.rowid = f.rowid"
+            clauses.append("message_fts MATCH ?")
+            params.append(fts_query)
+        if text_terms and account_id is not None and origin_id is not None:
+            # A substring scan of one origin reads only that origin through the
+            # primary key.
+            clauses.extend(("m.source = ?", "m.account_id = ?", "m.chat_id = ?"))
+            params.extend((SOURCE_TELEGRAM, account_id, origin_id))
+        else:
+            # Every other query walks idx_messages_sent_at in order (or the
+            # full-text index) and stops at the limit; unary plus keeps the
+            # planner from skip-scanning the primary key and sorting instead.
+            for column, value in (("+m.account_id", account_id), ("+m.chat_id", origin_id)):
+                if value is not None:
+                    clauses.append(f"{column} = ?")
+                    params.append(value)
+        if topic_id is not None:
+            clauses.append("COALESCE(m.topic_id, 0) = ?")
+            params.append(topic_id)
+        if sent_from:
+            clauses.append("m.sent_at >= ?")
+            params.append(sent_from)
+        if sent_before:
+            clauses.append("m.sent_at < ?")
+            params.append(sent_before)
+        if not include_deleted:
+            # Unary plus keeps the planner off idx_messages_deleted.
+            clauses.append("+m.deleted_at IS NULL")
+        for term in text_terms or []:
+            clauses.append("m.text LIKE ? ESCAPE '\\'")
+            params.append(_like_pattern(term))
+        if sender:
+            clauses.append("(m.sender_name LIKE ? ESCAPE '\\' OR m.sender_username LIKE ? ESCAPE '\\')")
+            params.extend((_like_pattern(sender), _like_pattern(sender)))
+        if after is not None:
+            clauses.append(f"(m.sent_at, m.rowid) {'<' if descending else '>'} (?, ?)")
+            params.extend(after)
+        direction = "DESC" if descending else "ASC"
+        sql = f"""
+            SELECT {_MESSAGE_VIEW_COLUMNS}
+            FROM {source_sql}
+            {_MESSAGE_VIEW_JOINS}
+            {"WHERE " + " AND ".join(clauses) if clauses else ""}
+            ORDER BY m.sent_at {direction}, m.rowid {direction}
+            LIMIT ?
+        """
+        params.append(_bounded_limit(limit))
+        with self._lock:
+            rows = self._conn.execute(sql, tuple(params)).fetchall()
+        return [dict(row) for row in rows]
+
+    def list_message_context(
+        self,
+        account_id: str,
+        origin_id: int,
+        message_id: int,
+        *,
+        before: int = 10,
+        after: int = 10,
+        include_deleted: bool = False,
+    ) -> list[dict[str, Any]]:
+        """Return a message with its neighbours in the same origin and topic, oldest first."""
+        base_sql = f"""
+            SELECT {_MESSAGE_VIEW_COLUMNS}
+            FROM messages m
+            {_MESSAGE_VIEW_JOINS}
+            WHERE m.source = ? AND m.account_id = ? AND m.chat_id = ?
+        """
+        key = (SOURCE_TELEGRAM, account_id, origin_id)
+        deleted_sql = "" if include_deleted else " AND +m.deleted_at IS NULL"
+        with self._lock:
+            target = self._conn.execute(base_sql + " AND m.message_id = ?", (*key, message_id)).fetchone()
+            if target is None:
+                return []
+            topic = target["topic_id"] or 0
+            older = self._conn.execute(
+                base_sql
+                + " AND m.message_id < ? AND COALESCE(m.topic_id, 0) = ?"
+                + deleted_sql
+                + " ORDER BY m.message_id DESC LIMIT ?",
+                (*key, message_id, topic, max(0, before)),
+            ).fetchall()
+            newer = self._conn.execute(
+                base_sql
+                + " AND m.message_id > ? AND COALESCE(m.topic_id, 0) = ?"
+                + deleted_sql
+                + " ORDER BY m.message_id ASC LIMIT ?",
+                (*key, message_id, topic, max(0, after)),
+            ).fetchall()
+        return [dict(row) for row in (*reversed(older), target, *newer)]
+
+    def content_overview(self) -> dict[str, Any]:
+        """Return message, daily report, and message point ranges for read-only clients."""
+        with self._lock:
+            messages = self._conn.execute(
+                """
+                SELECT (SELECT MIN(sent_at) FROM messages) AS first_sent_at,
+                       (SELECT MAX(sent_at) FROM messages) AS last_sent_at
+                """
+            ).fetchone()
+            reports = self._conn.execute(
+                """
+                SELECT record_type, COUNT(*) AS count, MIN(date) AS date_from, MAX(date) AS date_to
+                FROM daily_summary_records
+                WHERE deleted_at IS NULL
+                GROUP BY record_type
+                ORDER BY record_type
+                """
+            ).fetchall()
+            points = self._conn.execute(
+                """
+                SELECT COUNT(*) AS count, MIN(p.date) AS date_from, MAX(p.date) AS date_to
+                FROM daily_message_points p
+                JOIN daily_summary_runs r ON r.run_id = p.run_id
+                WHERE r.status = 'completed'
+                  AND NOT EXISTS (
+                    SELECT 1 FROM daily_summary_jobs hidden_job
+                    WHERE hidden_job.summary_run_id = p.run_id AND hidden_job.status != 'completed'
+                  )
+                """
+            ).fetchone()
+        return {
+            "messages": dict(messages),
+            "daily_reports": [dict(row) for row in reports],
+            "message_points": dict(points),
+        }
+
     def _insert_event(
         self,
         source: str,
@@ -3354,6 +3535,11 @@ def _summary_record_type(record_type: str | None, content_json: str | None) -> s
 
 def _normalize_tag(tag: Any) -> str:
     return str(tag or "").strip().lower()
+
+
+def _like_pattern(term: str) -> str:
+    escaped = term.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+    return f"%{escaped}%"
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

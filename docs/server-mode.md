@@ -138,6 +138,10 @@ you can set `allow_unauthenticated_localhost: true` while keeping `host` on a
 loopback address. The server refuses to start unauthenticated on LAN, Tailscale,
 or wildcard bind addresses.
 
+`server.mcp_token` is optional. It is accepted only by the read-only MCP
+endpoint `POST /mcp`, so AI agents can query the archive without holding the
+management token. See [MCP server](mcp.md).
+
 Telegram chat/channel/private/topic sources are not configured in YAML. Use
 `/console` or the management API to discover origins and enable backup policies;
 the running ingestion process reads enabled policies from SQLite.

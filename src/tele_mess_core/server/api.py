@@ -30,6 +30,7 @@ from tele_mess_core.server.contracts import (
     API_CONTRACT_VERSION,
     API_MANIFEST_PATH,
     MARKDOWN_API_DOC_PATH,
+    MCP_PATH,
     OPENAPI_PATH,
     api_manifest,
     markdown_document,
@@ -38,6 +39,7 @@ from tele_mess_core.server.contracts import (
     validate_request_payload,
 )
 from tele_mess_core.server.console import console_html
+from tele_mess_core.server.mcp import MCP_PROTOCOL_VERSIONS, MCP_TOOLS, handle_mcp_request
 from tele_mess_core.telegram.runtime import TelegramOperationError
 
 if TYPE_CHECKING:
@@ -73,12 +75,14 @@ class SyncApiServer:
         allow_unauthenticated_localhost: bool = False,
         telegram_runtime: "TelegramRuntimeManager | None" = None,
         daily_worker: "DailyJobWorker | None" = None,
+        mcp_token: str = "",
     ):
         _validate_server_auth(host, token, allow_unauthenticated_localhost)
         self.store = store
         self.host = host
         self.port = port
         self.token = token
+        self.mcp_token = mcp_token
         self.config = config
         self.telegram_runtime = telegram_runtime
         self.daily_worker = daily_worker
@@ -136,6 +140,7 @@ class SyncApiServer:
     def _make_handler(self) -> type[BaseHTTPRequestHandler]:
         store = self.store
         token = self.token
+        mcp_token = self.mcp_token
         config = self.config
         telegram_runtime = self.telegram_runtime
         daily_worker = self.daily_worker
@@ -162,7 +167,12 @@ class SyncApiServer:
                 parsed = urlparse(self.path)
                 params = parse_qs(parsed.query)
                 endpoint = ENDPOINTS_BY_ROUTE.get((method, parsed.path))
-                if token and (endpoint is None or endpoint.auth) and not self._authorized(token):
+                accepted_tokens = (token, mcp_token) if mcp_token and parsed.path == MCP_PATH else (token,)
+                if (
+                    token
+                    and (endpoint is None or endpoint.auth)
+                    and not any(self._authorized(item) for item in accepted_tokens)
+                ):
                     self._json({"error": "unauthorized"}, status=HTTPStatus.UNAUTHORIZED)
                     return
                 if endpoint is None:
@@ -175,7 +185,9 @@ class SyncApiServer:
 
                 try:
                     validate_query_params(endpoint, params)
-                    if method == "GET":
+                    if parsed.path == MCP_PATH:
+                        self._handle_mcp()
+                    elif method == "GET":
                         self._handle_get(parsed.path, params)
                     elif method in {"POST", "PATCH", "DELETE"}:
                         self._handle_write(method, parsed.path, endpoint)
@@ -493,6 +505,16 @@ class SyncApiServer:
                 else:
                     self._json({"error": "not_found"}, status=HTTPStatus.NOT_FOUND)
 
+            def _handle_mcp(self) -> None:
+                status, payload = handle_mcp_request(store, self._read_body())
+                if payload is None:
+                    self.send_response(int(status))
+                    self._security_headers()
+                    self.send_header("Content-Length", "0")
+                    self.end_headers()
+                else:
+                    self._json(payload, status=status)
+
             def _authorized(self, expected: str) -> bool:
                 auth = self.headers.get("Authorization", "")
                 if hmac.compare_digest(auth, f"Bearer {expected}"):
@@ -500,7 +522,7 @@ class SyncApiServer:
                 supplied = self.headers.get("X-Api-Token", "")
                 return hmac.compare_digest(supplied, expected)
 
-            def _read_json(self) -> dict[str, Any]:
+            def _read_body(self) -> bytes:
                 raw_length = self.headers.get("Content-Length", "0") or "0"
                 try:
                     length = int(raw_length)
@@ -509,7 +531,7 @@ class SyncApiServer:
                 if length < 0:
                     raise ApiError(HTTPStatus.BAD_REQUEST, "invalid_content_length", "Content-Length must not be negative")
                 if length <= 0:
-                    return {}
+                    return b""
                 if length > MAX_JSON_BODY_BYTES:
                     raise ApiError(
                         HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
@@ -523,8 +545,13 @@ class SyncApiServer:
                         "unsupported_media_type",
                         "Content-Type must be application/json",
                     )
-                body = self.rfile.read(length).decode("utf-8")
-                data = json.loads(body)
+                return self.rfile.read(length)
+
+            def _read_json(self) -> dict[str, Any]:
+                body = self._read_body()
+                if not body:
+                    return {}
+                data = json.loads(body.decode("utf-8"))
                 if not isinstance(data, dict):
                     raise ValueError("JSON body must be an object")
                 return data
@@ -663,6 +690,12 @@ def _capabilities() -> dict[str, Any]:
             "manifest_url": API_MANIFEST_PATH,
             "openapi_url": OPENAPI_PATH,
             "markdown_url": MARKDOWN_API_DOC_PATH,
+        },
+        "mcp": {
+            "endpoint": MCP_PATH,
+            "transport": "streamable-http",
+            "protocol_versions": list(MCP_PROTOCOL_VERSIONS),
+            "tools": [tool.name for tool in MCP_TOOLS],
         },
     }
 

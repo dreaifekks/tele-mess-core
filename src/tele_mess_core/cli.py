@@ -308,6 +308,7 @@ def _serve_api(config: AppConfig, store: ArchiveStore) -> int:
         config,
         allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
         daily_worker=daily_worker,
+        mcp_token=config.server.mcp_token,
     )
     daily_worker.start()
     try:
@@ -440,6 +441,7 @@ async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool) -> Non
                 allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
                 telegram_runtime=runtime,
                 daily_worker=daily_worker,
+                mcp_token=config.server.mcp_token,
             )
             api.start_background()
             api_task = asyncio.create_task(api.wait_stopped(), name="sync-api-stopped")

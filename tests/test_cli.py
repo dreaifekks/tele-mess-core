@@ -170,6 +170,7 @@ class LocalLifecycleTest(unittest.IsolatedAsyncioTestCase):
                     host="127.0.0.1",
                     port=8765,
                     token="",
+                    mcp_token="",
                     allow_unauthenticated_localhost=True,
                 )
             )

@@ -173,6 +173,7 @@ policy are not acceptable.
 | [Local mode](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/local-mode.md) | Workspace discovery, macOS behavior, and local runtime boundaries |
 | [Server mode](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/server-mode.md) | Long-running Linux deployment, auth, and client sync |
 | [Daily packaging](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/daily-packaging.md) | Codex analysis, message points, durable jobs, and delivery |
+| [MCP server](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/mcp.md) | Read-only tools for AI agents, the MCP-only token, and client setup |
 | [API reference](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/api.md) | Generated sync and management endpoint documentation |
 | [OpenAPI](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/openapi.json) | Machine-readable API contract |
 | [Product direction](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/product-direction.md) | Product boundaries and current priorities |
@@ -190,6 +191,8 @@ policy are not acceptable.
 - Token-protected management API for account state, origins, backup policies,
   topics, participant metadata, and capture cursors.
 - Built-in web console for the same management surface at `GET /console`.
+- Read-only MCP endpoint at `POST /mcp` that lets AI agents search and read
+  messages, daily reports, and message points.
 - Policy-aware ingestion with bounded history backfill and reconnect catch-up.
 - Live origin discovery and participant refresh endpoints for authenticated
   Telegram sessions.
@@ -366,6 +369,24 @@ X-Api-Token: <token>
 The server requires a token by default. An empty token is accepted only when
 `server.allow_unauthenticated_localhost: true` is explicitly configured and the
 server is bound to a loopback address.
+
+## MCP Server
+
+`POST /mcp` serves a read-only Model Context Protocol endpoint (stateless
+Streamable HTTP) so agents such as Claude Code and Codex can use the archive as
+an information source. Seven tools cover an archive overview, chat lookup, raw
+message search and reading, daily reports, and message points.
+
+Set the optional `server.mcp_token` and hand that to agents instead of the
+management token: it is accepted only by `/mcp`.
+
+```bash
+claude mcp add --transport http tele-mess-core http://127.0.0.1:8765/mcp \
+  --header "Authorization: Bearer ${TELE_MESS_MCP_TOKEN}"
+```
+
+See [docs/mcp.md](https://github.com/dreaifekks/tele-mess-core/blob/master/docs/mcp.md)
+for the tool list, search behavior, and Codex and generic client configuration.
 
 ## Media Backup Semantics
 

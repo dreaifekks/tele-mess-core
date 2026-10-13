@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
-- Contract version: `2026-08-08.2`
-- Contract hash: `f3cf0bee1672e797`
+- Contract version: `2026-10-13.1`
+- Contract hash: `3814bb6329927931`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
@@ -14,6 +14,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - When changing an API handler, update the contract and regenerate docs in the same change.
 - Do not read or commit local secrets such as `config.yml`, Telegram `.session` files, SQLite archives, media files, tokens, phone numbers, login codes, or 2FA passwords unless the user explicitly asks and the data is needed.
 - Token-protected endpoints accept `Authorization: Bearer <token>` or `X-Api-Token: <token>`.
+- `POST /mcp` is the read-only MCP endpoint; it also accepts `server.mcp_token`, which no other endpoint accepts. Tools live in `server/mcp.py` and are documented in `docs/mcp.md`.
 
 ## Write Endpoints
 
@@ -44,6 +45,7 @@ This file is generated from `tele_mess_core.server.contracts` for quick agent lo
 - `DELETE /manage/daily-summary-records` body `DailySummaryRecordDeleteInput` - Soft-delete one or more stored daily summary records.
 - `POST /manage/discover-origins` body `DiscoveryInput` - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` body `ParticipantRefreshInput` - Refresh participants for a Telegram origin.
+- `POST /mcp` body `McpJsonRpcMessage` - Serve the read-only Model Context Protocol tools over stateless Streamable HTTP.
 
 ## Required Checks
 

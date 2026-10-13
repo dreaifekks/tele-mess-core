@@ -8,8 +8,9 @@ from typing import Any
 from tele_mess_core.media import MEDIA_TYPES
 
 
-API_CONTRACT_VERSION = "2026-08-08.2"
+API_CONTRACT_VERSION = "2026-10-13.1"
 API_MANIFEST_PATH = "/manage/api-manifest"
+MCP_PATH = "/mcp"
 OPENAPI_PATH = "/openapi.json"
 MARKDOWN_API_DOC_PATH = "/docs/api.md"
 
@@ -128,8 +129,32 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "management": {"type": "array", "items": {"type": "string"}},
             "auth_flow": {"type": "object"},
             "api_contract": {"type": "object"},
+            "mcp": {"type": "object"},
         },
         required=["mode", "sync", "management"],
+    ),
+    "McpJsonRpcMessage": _object(
+        {
+            "jsonrpc": {"type": "string", "enum": ["2.0"]},
+            "id": {"type": ["string", "integer"]},
+            "method": {"type": "string"},
+            "params": {"type": "object"},
+        },
+        required=["jsonrpc", "method"],
+        description="One JSON-RPC 2.0 request, or a notification when id is omitted.",
+    ),
+    "McpJsonRpcResponse": _object(
+        {
+            "jsonrpc": {"type": "string", "enum": ["2.0"]},
+            "id": {"type": ["string", "integer"]},
+            "result": {"type": "object"},
+            "error": _object(
+                {"code": {"type": "integer"}, "message": {"type": "string"}},
+                required=["code", "message"],
+            ),
+        },
+        required=["jsonrpc"],
+        description="JSON-RPC 2.0 response carrying either result or error.",
     ),
     "ApiManifest": _object(
         {
@@ -1266,6 +1291,18 @@ API_ENDPOINTS: tuple[ApiEndpoint, ...] = (
     ),
     ApiEndpoint("POST", "/manage/discover-origins", "management", "Discover Telegram dialogs and topics for an authenticated account.", body_schema="DiscoveryInput", response_schema="DiscoveryResultResponse"),
     ApiEndpoint("POST", "/manage/participants/refresh", "management", "Refresh participants for a Telegram origin.", body_schema="ParticipantRefreshInput", response_schema="ParticipantRefreshResultResponse"),
+    ApiEndpoint(
+        "POST",
+        MCP_PATH,
+        "mcp",
+        "Serve the read-only Model Context Protocol tools over stateless Streamable HTTP.",
+        body_schema="McpJsonRpcMessage",
+        response_schema="McpJsonRpcResponse",
+        notes=(
+            "Accepts server.token or the MCP-only server.mcp_token. Handles initialize, ping, tools/list, and "
+            "tools/call; notifications return 202 with no body. Responses are plain JSON without sessions or SSE."
+        ),
+    ),
 )
 
 
@@ -1321,6 +1358,11 @@ def validate_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -
             if item.enum and value not in item.enum:
                 allowed = ", ".join(item.enum)
                 raise ValueError(f"Query parameter {item.name} must be one of: {allowed}")
+
+
+def validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+    """Validate a value against an inline schema with the request-body rules."""
+    _validate_schema_value(value, schema, path)
 
 
 def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
@@ -1526,6 +1568,7 @@ def markdown_document() -> str:
         "",
         "Token-protected endpoints accept either `Authorization: Bearer <token>` or `X-Api-Token: <token>`.",
         "The built-in console and generated documentation endpoints are public on the local server.",
+        f"`POST {MCP_PATH}` also accepts the optional read-only `server.mcp_token`; no other endpoint does.",
         "",
         "## Endpoint Index",
         "",
@@ -1586,7 +1629,8 @@ def _schema_type(schema: dict[str, Any]) -> str:
         if isinstance(item, dict) and "$ref" in item:
             return f"array<{str(item['$ref']).removeprefix('#/components/schemas/')}>"
         return "array"
-    return str(schema.get("type", "object"))
+    schema_type = schema.get("type", "object")
+    return " | ".join(schema_type) if isinstance(schema_type, list) else str(schema_type)
 
 
 def agent_markdown_document() -> str:
@@ -1608,6 +1652,7 @@ def agent_markdown_document() -> str:
         "- When changing an API handler, update the contract and regenerate docs in the same change.",
         "- Do not read or commit local secrets such as `config.yml`, Telegram `.session` files, SQLite archives, media files, tokens, phone numbers, login codes, or 2FA passwords unless the user explicitly asks and the data is needed.",
         "- Token-protected endpoints accept `Authorization: Bearer <token>` or `X-Api-Token: <token>`.",
+        f"- `POST {MCP_PATH}` is the read-only MCP endpoint; it also accepts `server.mcp_token`, which no other endpoint accepts. Tools live in `server/mcp.py` and are documented in `docs/mcp.md`.",
         "",
         "## Write Endpoints",
         "",

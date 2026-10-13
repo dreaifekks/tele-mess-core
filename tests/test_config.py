@@ -90,6 +90,27 @@ server:
         self.assertEqual(account.account_id, "main")
         self.assertFalse(hasattr(account, "chats"))
         self.assertFalse(config.server.allow_unauthenticated_localhost)
+        self.assertEqual(config.server.mcp_token, "")
+
+    def test_mcp_token_is_parsed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            config_path = Path(tmp) / "config.yml"
+            config_path.write_text(
+                """
+telegram:
+  api_id: 1
+  api_hash: hash
+server:
+  token: secret
+  mcp_token: agent-secret
+""",
+                encoding="utf-8",
+            )
+
+            config = load_config(config_path)
+
+        self.assertEqual(config.server.token, "secret")
+        self.assertEqual(config.server.mcp_token, "agent-secret")
 
     def test_local_unauthenticated_server_opt_in_is_parsed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

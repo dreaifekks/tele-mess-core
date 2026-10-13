@@ -426,6 +426,9 @@
             },
             "type": "array"
           },
+          "mcp": {
+            "type": "object"
+          },
           "mode": {
             "type": "string"
           },
@@ -1676,6 +1679,73 @@
         ],
         "type": "object"
       },
+      "McpJsonRpcMessage": {
+        "description": "One JSON-RPC 2.0 request, or a notification when id is omitted.",
+        "properties": {
+          "id": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "jsonrpc": {
+            "enum": [
+              "2.0"
+            ],
+            "type": "string"
+          },
+          "method": {
+            "type": "string"
+          },
+          "params": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "jsonrpc",
+          "method"
+        ],
+        "type": "object"
+      },
+      "McpJsonRpcResponse": {
+        "description": "JSON-RPC 2.0 response carrying either result or error.",
+        "properties": {
+          "error": {
+            "properties": {
+              "code": {
+                "type": "integer"
+              },
+              "message": {
+                "type": "string"
+              }
+            },
+            "required": [
+              "code",
+              "message"
+            ],
+            "type": "object"
+          },
+          "id": {
+            "type": [
+              "string",
+              "integer"
+            ]
+          },
+          "jsonrpc": {
+            "enum": [
+              "2.0"
+            ],
+            "type": "string"
+          },
+          "result": {
+            "type": "object"
+          }
+        },
+        "required": [
+          "jsonrpc"
+        ],
+        "type": "object"
+      },
       "MediaFile": {
         "properties": {
           "access_url": {
@@ -2593,8 +2663,8 @@
   },
   "info": {
     "title": "tele-mess-core API",
-    "version": "2026-08-08.2",
-    "x-contract-hash": "f3cf0bee1672e797"
+    "version": "2026-10-13.1",
+    "x-contract-hash": "3814bb6329927931"
   },
   "openapi": "3.1.0",
   "paths": {
@@ -6315,6 +6385,76 @@
         "summary": "Refresh participants for a Telegram origin.",
         "tags": [
           "management"
+        ]
+      }
+    },
+    "/mcp": {
+      "post": {
+        "description": "Accepts server.token or the MCP-only server.mcp_token. Handles initialize, ping, tools/list, and tools/call; notifications return 202 with no body. Responses are plain JSON without sessions or SSE.",
+        "operationId": "post_mcp",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/McpJsonRpcMessage"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/McpJsonRpcResponse"
+                }
+              }
+            },
+            "description": "OK"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bad request"
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Unauthorized"
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Internal error"
+          }
+        },
+        "security": [
+          {
+            "BearerAuth": []
+          },
+          {
+            "ApiTokenAuth": []
+          }
+        ],
+        "summary": "Serve the read-only Model Context Protocol tools over stateless Streamable HTTP.",
+        "tags": [
+          "mcp"
         ]
       }
     },

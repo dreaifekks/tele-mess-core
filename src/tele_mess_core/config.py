@@ -50,6 +50,7 @@ class ServerConfig:
     host: str = "127.0.0.1"
     port: int = 8765
     token: str = ""
+    mcp_token: str = ""
     allow_unauthenticated_localhost: bool = False
 
 
@@ -160,6 +161,7 @@ def load_config(path: str | Path, *, workspace_dir: str | Path | None = None) ->
         host=str(server_raw.get("host", "127.0.0.1")),
         port=int(server_raw.get("port", 8765)),
         token=str(server_raw.get("token", "") or ""),
+        mcp_token=str(server_raw.get("mcp_token", "") or ""),
         allow_unauthenticated_localhost=_parse_bool(
             server_raw.get("allow_unauthenticated_localhost", False)
         ),

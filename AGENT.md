@@ -74,6 +74,11 @@ X-Api-Token: <server.token>
 Public local endpoints are limited to `/`, `/console`, `/openapi.json`, and
 `/docs/api.md`.
 
+`POST /mcp` is the read-only MCP endpoint for AI agents. It also accepts the
+optional `server.mcp_token`, which no other endpoint accepts. Its protocol
+handling and tool registry live in `src/tele_mess_core/server/mcp.py`; keep
+every tool read-only and update `docs/mcp.md` when tools change.
+
 Do not read, print, commit, or include local secrets unless the user explicitly
 asks and the data is required for the task:
 

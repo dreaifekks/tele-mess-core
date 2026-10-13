@@ -2,8 +2,8 @@
 
 This file is generated from `tele_mess_core.server.contracts`.
 
-- Contract version: `2026-08-08.2`
-- Contract hash: `f3cf0bee1672e797`
+- Contract version: `2026-10-13.1`
+- Contract hash: `3814bb6329927931`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -11,6 +11,7 @@ This file is generated from `tele_mess_core.server.contracts`.
 
 Token-protected endpoints accept either `Authorization: Bearer <token>` or `X-Api-Token: <token>`.
 The built-in console and generated documentation endpoints are public on the local server.
+`POST /mcp` also accepts the optional read-only `server.mcp_token`; no other endpoint does.
 
 ## Endpoint Index
 
@@ -73,6 +74,7 @@ The built-in console and generated documentation endpoints are public on the loc
 - `GET /manage/daily-message-points/item` (management, token) - Return one stored daily message point.
 - `POST /manage/discover-origins` (management, token) - Discover Telegram dialogs and topics for an authenticated account.
 - `POST /manage/participants/refresh` (management, token) - Refresh participants for a Telegram origin.
+- `POST /mcp` (mcp, token) - Serve the read-only Model Context Protocol tools over stateless Streamable HTTP.
 
 ## Endpoints
 
@@ -922,6 +924,18 @@ Request body: `ParticipantRefreshInput`
 
 Response: `ParticipantRefreshResultResponse`
 
+### POST /mcp
+
+Serve the read-only Model Context Protocol tools over stateless Streamable HTTP.
+
+- Tag: `mcp`
+- Auth: `required`
+- Success: `200`
+
+Request body: `McpJsonRpcMessage`
+
+Response: `McpJsonRpcResponse`
+
 ## Schemas
 
 ### Account
@@ -1081,6 +1095,7 @@ Response: `ParticipantRefreshResultResponse`
 | `management` | `array` | yes |
 | `auth_flow` | `object` | no |
 | `api_contract` | `object` | no |
+| `mcp` | `object` | no |
 
 ### CaptureCursor
 
@@ -1519,6 +1534,28 @@ Response: `ParticipantRefreshResultResponse`
 | `last_event_seq` | `integer` | yes |
 | `operation_error_count` | `integer` | no |
 | `server_time` | `string` | no |
+
+### McpJsonRpcMessage
+
+One JSON-RPC 2.0 request, or a notification when id is omitted.
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `jsonrpc` | `string` | yes |
+| `id` | `string | integer` | no |
+| `method` | `string` | yes |
+| `params` | `object` | no |
+
+### McpJsonRpcResponse
+
+JSON-RPC 2.0 response carrying either result or error.
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `jsonrpc` | `string` | yes |
+| `id` | `string | integer` | no |
+| `result` | `object` | no |
+| `error` | `object` | no |
 
 ### MediaFile
 

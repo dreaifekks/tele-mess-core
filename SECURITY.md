@@ -20,6 +20,9 @@ are not guaranteed to receive backports.
 - Management and sync requests require the configured bearer token by default.
   The console and static API documentation are public to the bound interface,
   but privileged calls made by the console still require that token.
+- The optional `server.mcp_token` is accepted only by the read-only MCP endpoint
+  `POST /mcp`. It cannot call sync or management endpoints, but it does read
+  archived message content, so protect it like any other credential.
 - The core does not encrypt SQLite archives, Telegram session files, downloaded
   media, logs, or generated packages at rest. Restrict workspace permissions,
   protect backups, and use OS or full-disk encryption where appropriate.
