@@ -132,7 +132,7 @@ class McpApiTest(unittest.TestCase):
             ("sum_daily", "important_daily", "2026-07-03", "重点日报", "# 重点日报\n" + "模型发布。" * 40),
             ("sum_origin_a", "important_origin", "2026-07-03", "研发群分析", "研发群的分析"),
             ("sum_origin_b", "important_origin", "2026-07-03", "论坛分析", "论坛的分析"),
-            ("sum_points", "point_daily", "2026-07-04", "消息点日报", "消息点汇总"),
+            ("sum_points", "point_daily", "2026-07-04", "消息点日报", "消息点汇总，覆盖率 100%"),
         ):
             self.store.upsert_daily_summary_record(
                 DailySummaryRecord(
@@ -171,7 +171,7 @@ class McpApiTest(unittest.TestCase):
                 )
                 for point_id, message_id, occurred_at, tags_json, content, score in (
                     ("point_model", 1, "2026-07-03T10:00:00+09:00", '["ai", "model"]', "新模型发布，评测领先", 5),
-                    ("point_chat", 3, "2026-07-03T09:00:00+09:00", '["ai"]', "Alice 每天使用 claude", 2),
+                    ("point_chat", 3, "2026-07-03T09:00:00+09:00", '["ai"]', "Alice 每天使用 claude，占比 50%", 2),
                 )
             ],
         )
@@ -610,6 +610,60 @@ class McpApiTest(unittest.TestCase):
         self.assertIn("was not found", self.call_error("read_messages", {"account_id": "main", "origin_id": GROUP, "around_message_id": 999}))
         self.assertIn("requires account_id and origin_id", self.call_error("read_messages", {"around_message_id": 2}))
 
+    def test_read_messages_context_around_deleted_message(self) -> None:
+        around_deleted = {"account_id": "main", "origin_id": GROUP, "around_message_id": 4}
+        error = self.call_error("read_messages", around_deleted)
+        self.assertIn("was deleted", error)
+        self.assertIn("include_deleted=true", error)
+        self.assertNotIn("not found", error)
+        self.assertNotIn("被删除", error)
+
+        included = self.call("read_messages", {**around_deleted, "include_deleted": True})
+        self.assertEqual([item["message_id"] for item in included["messages"]], [1, 2, 3, 4])
+        self.assertIn("deleted_at", included["messages"][3])
+        self.assertNotIn("truncated", included)
+
+    def test_read_messages_context_stays_within_size_budget(self) -> None:
+        def add(message_id: int, length: int) -> None:
+            sent_at = (self.now - timedelta(minutes=200 - message_id)).isoformat()
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=CHANNEL,
+                    message_id=message_id,
+                    sent_at=sent_at,
+                    ingested_at=sent_at,
+                    text="长" * length,
+                ),
+                event_type="new",
+            )
+
+        for message_id in range(100, 110):
+            add(message_id, 4000)
+        centred = {"account_id": "main", "origin_id": CHANNEL, "around_message_id": 105, "limit": 2}
+        result = self.call_raw("read_messages", {**centred, "context_messages": 20})
+        self.assertLess(len(result["content"][0]["text"]), 30000)
+        trimmed = json.loads(result["content"][0]["text"])
+        self.assertEqual([item["message_id"] for item in trimmed["messages"]], [103, 104, 105, 106, 107])
+        self.assertTrue(trimmed["truncated"])
+        self.assertIn("context_messages", trimmed["note"])
+
+        near_edge = self.call("read_messages", {**centred, "around_message_id": 109, "context_messages": 20})
+        self.assertEqual([item["message_id"] for item in near_edge["messages"]], [105, 106, 107, 108, 109])
+        self.assertTrue(near_edge["truncated"])
+
+        fits = self.call("read_messages", {**centred, "context_messages": 2})
+        self.assertEqual([item["message_id"] for item in fits["messages"]], [103, 104, 105, 106, 107])
+        self.assertNotIn("truncated", fits)
+        self.assertNotIn("note", fits)
+
+        add(110, 30000)
+        oversized = self.call("read_messages", {**centred, "around_message_id": 110, "context_messages": 3})
+        self.assertEqual([item["message_id"] for item in oversized["messages"]], [110])
+        self.assertEqual(len(oversized["messages"][0]["text"]), 30000)
+        self.assertTrue(oversized["truncated"])
+
     def test_daily_reports(self) -> None:
         listed = self.call("list_daily_reports")
         self.assertEqual({item["summary_id"] for item in listed["reports"]}, {"sum_daily", "sum_origin_a", "sum_origin_b", "sum_points"})
@@ -632,6 +686,9 @@ class McpApiTest(unittest.TestCase):
         self.assertEqual([r["summary_id"] for r in self.call("list_daily_reports", {"date_from": "2026-07-04T12:00:00+09:00"})["reports"]], ["sum_points"])
         self.assertEqual(len(self.call("list_daily_reports", {"date_to": "2026-07-03"})["reports"]), 3)
         self.assertEqual([r["summary_id"] for r in self.call("list_daily_reports", {"query": "论坛"})["reports"]], ["sum_origin_b"])
+        for query, expected in (("100%", ["sum_points"]), ("%", ["sum_points"]), ("_", []), ("0_", []), ("%点", [])):
+            found = self.call("list_daily_reports", {"query": query})["reports"]
+            self.assertEqual([item["summary_id"] for item in found], expected, query)
         limited = self.call("list_daily_reports", {"limit": 1})
         self.assertEqual(len(limited["reports"]), 1)
         self.assertTrue(limited["has_more"])
@@ -691,6 +748,11 @@ class McpApiTest(unittest.TestCase):
             return [item["point_id"] for item in self.call("search_points", arguments)["points"]]
 
         self.assertEqual(ids({"query": "评测"}), ["point_model"])
+        self.assertEqual(ids({"query": "50%"}), ["point_chat"])
+        self.assertEqual(ids({"query": "%"}), ["point_chat"])
+        self.assertEqual(ids({"query": "_"}), [])
+        self.assertEqual(ids({"query": "claude_"}), [])
+        self.assertEqual(ids({"query": "%型"}), [])
         self.assertEqual(ids({"tags": ["AI", "model"]}), ["point_model"])
         self.assertEqual(ids({"importance_min": 4}), ["point_model"])
         self.assertEqual(ids({"date": "2026-07-03", "account_id": "main", "origin_id": GROUP, "origin_important": True}), ["point_model", "point_chat"])

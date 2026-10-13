@@ -278,11 +278,21 @@ def _read_messages(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any]:
             after=context,
             include_deleted=include_deleted,
         )
-        if not rows:
+        message_id = args["around_message_id"]
+        target = next((index for index, row in enumerate(rows) if row["message_id"] == message_id), None)
+        if target is None:
+            raise ValueError(f"Message {message_id} was not found in origin {origin_id} of account {account_id}")
+        if rows[target]["deleted_at"] and not include_deleted:
             raise ValueError(
-                f"Message {args['around_message_id']} was not found in origin {origin_id} of account {account_id}"
+                f"Message {message_id} was deleted on Telegram; pass include_deleted=true to read it and its context"
             )
-        return {"messages": [_message_item(row, tz) for row in rows]}
+        items = [_message_item(row, tz) for row in rows]
+        page = _fit_context(items, target)
+        result: dict[str, Any] = {"messages": page}
+        if len(page) < len(items):
+            result["truncated"] = True
+            result["note"] = "The context was cut to fit the response size limit; pass a smaller context_messages."
+        return result
 
     if "hours" in args and "date_from" in args:
         raise ValueError("Pass either hours or date_from, not both")
@@ -494,6 +504,21 @@ def _fit_page(items: list[dict[str, Any]], limit: int) -> list[dict[str, Any]]:
     return page
 
 
+def _fit_context(items: list[dict[str, Any]], target: int) -> list[dict[str, Any]]:
+    """Trim context to the response size budget from the ends farthest from the target, which is kept."""
+    sizes = [len(json.dumps(item, ensure_ascii=False)) for item in items]
+    start, end = 0, len(items)
+    size = sum(sizes)
+    while size > MAX_PAGE_CHARS and end - start > 1:
+        if target - start >= end - 1 - target:
+            size -= sizes[start]
+            start += 1
+        else:
+            end -= 1
+            size -= sizes[end]
+    return items[start:end]
+
+
 def _message_item(row: dict[str, Any], tz: ZoneInfo) -> dict[str, Any]:
     return _compact(
         {
@@ -652,8 +677,9 @@ MCP_TOOLS: tuple[McpTool, ...] = (
         f"{DEFAULT_READ_HOURS} hours are read. Leave out origin_id to read across every chat, e.g. to see what "
         "was discussed recently, or pass account_id + origin_id (and topic_id) for one chat. (2) Context: pass "
         "account_id + origin_id + around_message_id to get that message with context_messages before and "
-        "after it in the same chat and topic. " + _MESSAGE_SHAPE + " When has_more is true, repeat the call "
-        "with cursor set to next_cursor; a page can end before limit when the messages are long.",
+        "after it in the same chat and topic; limit does not apply in this mode. " + _MESSAGE_SHAPE + " When "
+        "has_more is true, repeat the call with cursor set to next_cursor; a page can end before limit when "
+        "the messages are long.",
         _schema(
             {
                 "hours": {"type": "number", "description": "Read the last N hours up to now."},

@@ -15,6 +15,9 @@ validation rules.
   backed by the full-text index.
 - Added the optional `server.mcp_token`, which is accepted only by `/mcp` so
   agents never hold the management token.
+- Changed the `q` filter of `GET /manage/daily-summary-records` and
+  `GET /manage/daily-message-points` to match `%` and `_` literally instead of
+  treating them as wildcards.
 - Keep each Telegram account reconnect loop alive when persisting its failure
   state also fails, such as while the host filesystem is full.
 - Record explicit Telegram runtime timeout errors in the delivery outbox and

@@ -1728,7 +1728,8 @@
           "id": {
             "type": [
               "string",
-              "integer"
+              "integer",
+              "null"
             ]
           },
           "jsonrpc": {
@@ -2664,7 +2665,7 @@
   "info": {
     "title": "tele-mess-core API",
     "version": "2026-10-13.1",
-    "x-contract-hash": "3814bb6329927931"
+    "x-contract-hash": "80a9e50f0f946f3b"
   },
   "openapi": "3.1.0",
   "paths": {

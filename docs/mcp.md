@@ -85,7 +85,8 @@ returned by `tools/list`.
   ASCII keywords match as whole words over the entire archive, with no default
   time window. It keeps a short word from matching inside longer ones, but it
   misses words glued to Chinese text and is rejected for non-ASCII keywords.
-- **Deleted messages** are left out unless `include_deleted` is set.
+- **Deleted messages** are left out unless `include_deleted` is set; asking
+  for context around a deleted message without it is an error that says so.
 - **Dates.** Plain `YYYY-MM-DD` dates and date-times without an offset are read
   in the daily schedule timezone (reported by `overview`). Returned message
   timestamps use that timezone too.
@@ -97,7 +98,8 @@ returned by `tools/list`.
   `next_offset` for `search_points` and `read_daily_report`, or a note to narrow
   the filters for the list tools. A page of messages or points also ends early
   once it reaches about 24,000 characters, so one tool result stays within what
-  MCP clients accept.
+  MCP clients accept. Context around a message is cut from its outer ends under
+  the same budget and marked `truncated`; `limit` does not apply there.
 - **Compact output.** Tool results are a single JSON text block. Empty fields
   are omitted, and raw Telegram JSON, reactions, and ingestion bookkeeping are
   never included.

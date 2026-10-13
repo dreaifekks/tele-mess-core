@@ -2206,8 +2206,11 @@ class ArchiveStore:
             clauses.append("p.origin_important = ?")
             params.append(int(origin_important))
         if q:
-            clauses.append("(p.content LIKE ? OR p.origin_title LIKE ? OR p.importance_reason LIKE ?)")
-            pattern = f"%{q}%"
+            clauses.append(
+                "(p.content LIKE ? ESCAPE '\\' OR p.origin_title LIKE ? ESCAPE '\\' "
+                "OR p.importance_reason LIKE ? ESCAPE '\\')"
+            )
+            pattern = _like_pattern(q)
             params.extend((pattern, pattern, pattern))
         if not include_incomplete:
             clauses.append("r.status = 'completed'")
@@ -2597,8 +2600,8 @@ class ArchiveStore:
             clauses.append("important = ?")
             params.append(int(important))
         if q:
-            clauses.append("(title LIKE ? OR content_md LIKE ?)")
-            params.extend((f"%{q}%", f"%{q}%"))
+            clauses.append("(title LIKE ? ESCAPE '\\' OR content_md LIKE ? ESCAPE '\\')")
+            params.extend((_like_pattern(q), _like_pattern(q)))
         if deleted is not None:
             clauses.append("deleted_at IS NOT NULL" if deleted else "deleted_at IS NULL")
         elif not include_deleted:
@@ -3068,7 +3071,11 @@ class ArchiveStore:
         after: int = 10,
         include_deleted: bool = False,
     ) -> list[dict[str, Any]]:
-        """Return a message with its neighbours in the same origin and topic, oldest first."""
+        """Return a message with its neighbours in the same origin and topic, oldest first.
+
+        `include_deleted` filters the neighbours only; the message itself is
+        returned even when deleted so callers can tell deleted from missing.
+        """
         base_sql = f"""
             SELECT {_MESSAGE_VIEW_COLUMNS}
             FROM messages m

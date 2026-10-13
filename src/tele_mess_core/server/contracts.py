@@ -146,7 +146,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "McpJsonRpcResponse": _object(
         {
             "jsonrpc": {"type": "string", "enum": ["2.0"]},
-            "id": {"type": ["string", "integer"]},
+            "id": {"type": ["string", "integer", "null"]},
             "result": {"type": "object"},
             "error": _object(
                 {"code": {"type": "integer"}, "message": {"type": "string"}},

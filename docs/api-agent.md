@@ -3,7 +3,7 @@
 This file is generated from `tele_mess_core.server.contracts` for quick agent lookup.
 
 - Contract version: `2026-10-13.1`
-- Contract hash: `3814bb6329927931`
+- Contract hash: `80a9e50f0f946f3b`
 - Full reference: `docs/api.md`
 - OpenAPI snapshot: `docs/openapi.json`
 - Runtime manifest: `/manage/api-manifest`
