@@ -448,35 +448,57 @@ class McpApiTest(unittest.TestCase):
         self.assertEqual([item["message_id"] for item in included], [4])
         self.assertIn("deleted_at", included[0])
 
-    def test_search_messages_uses_fts_for_ascii_queries(self) -> None:
-        words = self.call("search_messages", {"query": "CLAUDE"})
+    def test_search_messages_matches_ascii_substrings_by_default(self) -> None:
+        found = self.call("search_messages", {"query": "CLAUDE"})
+        self.assertEqual(found["match"], "substring")
+        self.assertEqual([item["message_id"] for item in found["messages"]], [3, 2])
+        self.assertEqual(found["messages"][0]["permalink"], "https://t.me/c/1001/3")
+        self.assertIn("90 days", found["note"])
+        self.assertTrue(found["searched"]["date_from"].endswith("+09:00"))
+
+        self.assertEqual([m["message_id"] for m in self.call("search_messages", {"query": "claude gpt-5"})["messages"]], [3])
+        self.assertEqual(self.call("search_messages", {"query": "100%"})["messages"], [])
+        for query in ('"claude" AND (', "NEAR(claude", "claude*", "text:claude", '"', "-claude", "claude OR", "a^2 {b}", "++ --"):
+            result = self.call("search_messages", {"query": query})
+            self.assertEqual(result["match"], "substring", query)
+            self.assertEqual(result["messages"], [], query)
+
+    def test_search_messages_whole_word_uses_fts(self) -> None:
+        words = self.call("search_messages", {"query": "CLAUDE", "whole_word": True})
         self.assertEqual(words["match"], "word")
         self.assertEqual(words["searched"], {"date_from": "archive start", "date_to": "now"})
         self.assertEqual([item["message_id"] for item in words["messages"]], [3])
-        self.assertEqual(words["messages"][0]["permalink"], "https://t.me/c/1001/3")
-        self.assertIn("substring=true", words["note"])
+        self.assertNotIn("note", words)
 
-        self.assertEqual([m["message_id"] for m in self.call("search_messages", {"query": "claude gpt-5"})["messages"]], [3])
-        self.assertEqual([m["message_id"] for m in self.call("search_messages", {"query": "100%"})["messages"]], [10])
-        self.assertEqual(self.call("search_messages", {"query": "alice"})["messages"], [])
+        def ids(query: str, **arguments: Any) -> list[int]:
+            result = self.call("search_messages", {"query": query, "whole_word": True, **arguments})
+            return [item["message_id"] for item in result["messages"]]
 
-        substring = self.call("search_messages", {"query": "claude", "substring": True})
-        self.assertEqual(substring["match"], "substring")
-        self.assertEqual([item["message_id"] for item in substring["messages"]], [3, 2])
+        self.assertEqual(ids("claude gpt-5"), [3])
+        self.assertEqual(ids("claude missing"), [])
+        self.assertEqual(ids("100%"), [10])
+        self.assertEqual(ids("alice"), [])
+        self.assertEqual(ids("claude", sender="alice"), [3])
+        self.assertEqual(ids("claude", date_to=(self.now - timedelta(minutes=90)).isoformat()), [])
+        self.assertEqual(ids("100", account_id="main", origin_id=GROUP), [])
+        self.assertEqual(ids("100", account_id="main", origin_id=CHANNEL), [10])
+        for query in ("claude*", "-claude", '"claude"', "claude {daily}", "(claude)", "claude:daily"):
+            self.assertEqual(ids(query), [3], query)
+        for query in ("NEAR(claude", "text:claude", "claude OR", "claude AND daily", "a^2 {b}"):
+            self.assertEqual(ids(query), [], query)
 
-        for query in ('"claude" AND (', "NEAR(claude", "claude*", "text:claude", '"', "-claude", "claude OR", "a^2 {b}", "++ --"):
-            result = self.call("search_messages", {"query": query})
-            self.assertIsInstance(result["messages"], list, query)
-        self.assertEqual(self.call("search_messages", {"query": "++ --"})["match"], "substring")
+        for query in ("模型", "claude 模型", "++ --", '"', '"claude" AND ('):
+            self.assertIn("whole_word needs keywords", self.call_error("search_messages", {"query": query, "whole_word": True}))
 
     def test_search_messages_escapes_like_wildcards(self) -> None:
-        everything = {"date_from": "2020-01-01", "substring": True}
+        everything = {"date_from": "2020-01-01"}
         self.assertEqual([m["message_id"] for m in self.call("search_messages", {"query": "0%", **everything})["messages"]], [10])
-        self.assertEqual(self.call("search_messages", {"query": "%", "date_from": "2020-01-01"})["messages"][0]["message_id"], 10)
+        self.assertEqual([m["message_id"] for m in self.call("search_messages", {"query": "%", **everything})["messages"]], [10])
         self.assertEqual(self.call("search_messages", {"query": "_", **everything})["messages"], [])
+        self.assertEqual(self.call("search_messages", {"query": "\\", **everything})["messages"], [])
 
     def test_search_messages_filters_and_pages(self) -> None:
-        by_sender = self.call("search_messages", {"query": "claude", "substring": True, "sender": "ALICE"})
+        by_sender = self.call("search_messages", {"query": "claude", "sender": "ALICE"})
         self.assertEqual([item["message_id"] for item in by_sender["messages"]], [3])
         by_name = self.call("search_messages", {"query": "模型", "sender": "张"})
         self.assertEqual([item["message_id"] for item in by_name["messages"]], [1])
@@ -489,14 +511,14 @@ class McpApiTest(unittest.TestCase):
         self.assertEqual(self.call("search_messages", {"query": "讨论", "account_id": "other"})["messages"], [])
         bounded = self.call(
             "search_messages",
-            {"query": "claude", "substring": True, "date_to": (self.now - timedelta(minutes=90)).isoformat()},
+            {"query": "claude", "date_to": (self.now - timedelta(minutes=90)).isoformat()},
         )
         self.assertEqual([item["message_id"] for item in bounded["messages"]], [2])
 
-        first = self.call("search_messages", {"query": "claude", "substring": True, "limit": 1})
+        first = self.call("search_messages", {"query": "claude", "limit": 1})
         self.assertEqual([item["message_id"] for item in first["messages"]], [3])
         self.assertTrue(first["has_more"])
-        second = self.call("search_messages", {"query": "claude", "substring": True, "limit": 1, "cursor": first["next_cursor"]})
+        second = self.call("search_messages", {"query": "claude", "limit": 1, "cursor": first["next_cursor"]})
         self.assertEqual([item["message_id"] for item in second["messages"]], [2])
         self.assertFalse(second["has_more"])
         self.assertNotIn("next_cursor", second)

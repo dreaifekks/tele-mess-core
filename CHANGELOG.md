@@ -10,8 +10,9 @@ validation rules.
 - Added a read-only MCP endpoint at `POST /mcp` (stateless Streamable HTTP,
   no new dependencies) with seven tools for AI agents: `overview`,
   `list_sources`, `search_messages`, `read_messages`, `list_daily_reports`,
-  `read_daily_report`, and `search_points`. Message search matches Chinese
-  keywords as substrings and ASCII keywords through the full-text index.
+  `read_daily_report`, and `search_points`. Message search matches keywords
+  as substrings so Chinese text is searchable, with an opt-in whole-word mode
+  backed by the full-text index.
 - Added the optional `server.mcp_token`, which is accepted only by `/mcp` so
   agents never hold the management token.
 - Keep each Telegram account reconnect loop alive when persisting its failure

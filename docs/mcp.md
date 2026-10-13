@@ -73,16 +73,18 @@ returned by `tools/list`.
 
 ### Behavior worth knowing
 
-- **Chinese search.** `search_messages` splits the query on whitespace and
-  requires every keyword. A query containing non-ASCII characters is matched as
-  substrings (`LIKE`), because the full-text index treats a run of Chinese
-  characters as one token. Substring search reads the archive in time order, so
-  without `date_from` or a chat filter it covers only the last 90 days; the
-  result states the range that was searched and how to widen it.
-- **ASCII search.** An ASCII-only query uses the full-text index: whole-word,
-  case-insensitive, over the entire archive. A Latin word written without spaces
-  next to Chinese text (`用claude写`) is part of a larger token and is only found
-  with `substring: true`.
+- **Search is substring matching.** `search_messages` splits the query on
+  whitespace and requires every keyword as a substring (`LIKE`; ASCII letters
+  match case-insensitively). The full-text index treats a run of Chinese
+  characters, including a Latin word written inside it such as `用claude写`, as
+  one token, so substring matching is the default for every query. It reads the
+  archive in time order, so without `date_from` or a chat filter it covers only
+  the last 90 days; the result states the range that was searched and how to
+  widen it.
+- **Whole-word search.** `whole_word: true` uses the full-text index instead:
+  ASCII keywords match as whole words over the entire archive, with no default
+  time window. It keeps a short word from matching inside longer ones, but it
+  misses words glued to Chinese text and is rejected for non-ASCII keywords.
 - **Deleted messages** are left out unless `include_deleted` is set.
 - **Dates.** Plain `YYYY-MM-DD` dates and date-times without an offset are read
   in the daily schedule timezone (reported by `overview`). Returned message

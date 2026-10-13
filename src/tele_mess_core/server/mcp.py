@@ -223,23 +223,24 @@ def _search_messages(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any
     account_id, origin_id, topic_id = _origin_scope(args)
     sent_from = _utc_bound(args.get("date_from"), tz)
     sent_before = _utc_bound(args.get("date_to"), tz, end=True)
-    notes: list[str] = []
-    word_match = not args.get("substring") and all(term.isascii() and _FTS_WORD.search(term) for term in terms)
-    if word_match:
-        notes.append(
-            "ASCII keywords matched as whole words; pass substring=true to also find a word written "
-            "without spaces next to Chinese text."
-        )
+    whole_word = args.get("whole_word", False)
+    note = None
+    if whole_word:
+        if not all(term.isascii() and _FTS_WORD.search(term) for term in terms):
+            raise ValueError(
+                "whole_word needs keywords made of ASCII letters or digits: the full-text index does not "
+                "split Chinese text into words. Drop whole_word to match substrings."
+            )
     elif sent_from is None and origin_id is None:
         sent_from = _utc_iso(datetime.now(timezone.utc) - timedelta(days=DEFAULT_SEARCH_DAYS))
-        notes.append(
+        note = (
             f"No date_from was given, so only the last {DEFAULT_SEARCH_DAYS} days were searched; "
             "pass date_from to search further back."
         )
     limit = _bounded(args, "limit", 30, 100)
     rows = store.query_messages(
-        fts_query="text : (" + " ".join(_fts_phrase(term) for term in terms) + ")" if word_match else None,
-        text_terms=None if word_match else terms,
+        fts_query="text : (" + " ".join(_fts_phrase(term) for term in terms) + ")" if whole_word else None,
+        text_terms=None if whole_word else terms,
         account_id=account_id,
         origin_id=origin_id,
         topic_id=topic_id,
@@ -251,13 +252,13 @@ def _search_messages(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any
         limit=limit + 1,
     )
     return {
-        "match": "word" if word_match else "substring",
+        "match": "word" if whole_word else "substring",
         "searched": {
             "date_from": _local_iso(sent_from, tz) or "archive start",
             "date_to": _local_iso(sent_before, tz) or "now",
         },
         **_message_page(rows, limit, tz),
-        **({"note": " ".join(notes)} if notes else {}),
+        **({"note": note} if note else {}),
     }
 
 
@@ -605,11 +606,12 @@ MCP_TOOLS: tuple[McpTool, ...] = (
     ),
     McpTool(
         "search_messages",
-        "Search raw message text by keyword, newest first. Split the query on whitespace into keywords; a "
-        "message must contain all of them. Keywords with non-ASCII characters (Chinese etc.) match as "
-        f"substrings and, unless date_from or origin_id is given, only the last {DEFAULT_SEARCH_DAYS} days are "
-        "searched. ASCII-only queries match whole words (case-insensitive) across the whole archive. The "
-        "result states the match mode and the time range actually searched. " + _MESSAGE_SHAPE + " When "
+        "Search raw message text by keyword, newest first. The query is split on whitespace into keywords; "
+        "a message must contain all of them as substrings (ASCII letters match case-insensitively), so "
+        "Chinese works without word boundaries. Unless date_from or origin_id is given, only the last "
+        f"{DEFAULT_SEARCH_DAYS} days are searched; the result states the time range actually searched. "
+        + _MESSAGE_SHAPE
+        + " When "
         "has_more is true, repeat the call with cursor set to next_cursor. Use read_messages with "
         "around_message_id to see the conversation around a hit.",
         _schema(
@@ -627,12 +629,13 @@ MCP_TOOLS: tuple[McpTool, ...] = (
                     "type": "string",
                     "description": "Latest send time; a plain date includes that whole day. " + _DATE_NOTE,
                 },
-                "substring": {
+                "whole_word": {
                     "type": "boolean",
                     "default": False,
-                    "description": "Match ASCII keywords as substrings instead of whole words. Needed to find "
-                    "a Latin word written without spaces next to Chinese text (e.g. 用claude写); applies the "
-                    f"{DEFAULT_SEARCH_DAYS}-day default window.",
+                    "description": "Match ASCII keywords as whole words through the full-text index, over the "
+                    "entire archive with no default time window. Use it to keep a short word like 'ai' from "
+                    "matching inside longer words; it misses a word written without spaces next to Chinese "
+                    "text (e.g. 用claude写) and is an error for non-ASCII keywords.",
                 },
                 "include_deleted": _INCLUDE_DELETED,
                 "limit": {"type": "integer", "default": 30, "minimum": 1, "maximum": 100},
