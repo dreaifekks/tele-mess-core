@@ -7,6 +7,8 @@ validation rules.
 
 ## Unreleased
 
+## 0.3.5 - 2026-10-13
+
 - Added a read-only MCP endpoint at `POST /mcp` (stateless Streamable HTTP,
   no new dependencies) with seven tools for AI agents: `overview`,
   `list_sources`, `search_messages`, `read_messages`, `list_daily_reports`,
