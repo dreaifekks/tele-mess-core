@@ -70,6 +70,12 @@ class TelegramAccountRuntime:
         self._ingest_retry_delay = INGEST_RETRY_INITIAL_SECONDS
         self._diagnostic_lock = threading.Lock()
         self._diagnostic_threads: set[threading.Thread] = set()
+        self._auth_state_epoch = 0
+
+    def _next_auth_state_epoch(self) -> int:
+        with self._diagnostic_lock:
+            self._auth_state_epoch += 1
+            return self._auth_state_epoch
 
     async def start(self) -> None:
         if self._supervisor_task and not self._supervisor_task.done():
@@ -151,16 +157,19 @@ class TelegramAccountRuntime:
         if client is None or not self._ready.is_set():
             return self._offline_result(operation, **kwargs)
         if operation == "auth_status":
+            self._next_auth_state_epoch()
             result = await TelegramAuthService(self.config, self.store).status(client=client)
             if result.get("authorized"):
                 self._schedule_ingestion(client)
             return result
         if operation == "request_code":
+            self._next_auth_state_epoch()
             return await TelegramAuthService(self.config, self.store).request_code(
                 str(kwargs["phone"]),
                 client=client,
             )
         if operation == "submit_code":
+            self._next_auth_state_epoch()
             result = await TelegramAuthService(self.config, self.store).submit_code(
                 str(kwargs["phone"]),
                 str(kwargs["code"]),
@@ -244,19 +253,25 @@ class TelegramAccountRuntime:
         if operation == "auth_status":
             service = TelegramAuthService(self.config, self.store)
             result = service.status_error_result(exc, persist=False)
-            self._schedule_offline_diagnostic(lambda: service.status_error_result(exc, persist=True))
+            self._schedule_offline_diagnostic(
+                lambda: service.status_error_result(exc, persist=True, persist_auth_state=False)
+            )
             return result
         if operation == "request_code":
             phone = str(kwargs["phone"])
             service = TelegramAuthService(self.config, self.store)
             result = service.request_code_error_result(phone, exc, persist=False)
-            self._schedule_offline_diagnostic(lambda: service.request_code_error_result(phone, exc, persist=True))
+            self._schedule_offline_diagnostic(
+                lambda: service.request_code_error_result(phone, exc, persist=True, persist_auth_state=False)
+            )
             return result
         if operation == "submit_code":
             phone = str(kwargs["phone"])
             service = TelegramAuthService(self.config, self.store)
             result = service.submit_code_error_result(phone, exc, persist=False)
-            self._schedule_offline_diagnostic(lambda: service.submit_code_error_result(phone, exc, persist=True))
+            self._schedule_offline_diagnostic(
+                lambda: service.submit_code_error_result(phone, exc, persist=True, persist_auth_state=False)
+            )
             return result
         if operation == "discover_origins":
             service = TelegramDiscoveryService(self.config, self.store)
@@ -347,7 +362,12 @@ class TelegramAccountRuntime:
                         timeout=self._management_timeout_seconds,
                         label="is_user_authorized",
                     )
-                    self._record_auth_state("authorized" if authorized else "needs_login")
+                    auth_epoch = self._next_auth_state_epoch()
+                    self._schedule_offline_diagnostic(
+                        lambda auth_state="authorized" if authorized else "needs_login", ep=auth_epoch: (
+                            self._record_auth_state(auth_state, epoch=ep)
+                        )
+                    )
                     if authorized:
                         self._schedule_ingestion(client)
                     await self._wait_until_disconnected(client)
@@ -361,7 +381,10 @@ class TelegramAccountRuntime:
                 except Exception as exc:
                     self._last_connect_error = exc
                     await self._notify_attempt()
-                    self._record_runtime_failure(exc)
+                    fail_epoch = self._next_auth_state_epoch()
+                    self._schedule_offline_diagnostic(
+                        lambda err=exc, ep=fail_epoch: self._record_runtime_failure(err, epoch=ep)
+                    )
                     if self._stopping.is_set():
                         break
                     await self._wait_retry_delay(delay)
@@ -371,7 +394,14 @@ class TelegramAccountRuntime:
                     try:
                         await self._stop_ingestion()
                     except Exception as exc:
-                        self._record_runtime_failure(exc, operation="ingest_stop")
+                        stop_epoch = self._next_auth_state_epoch()
+                        self._schedule_offline_diagnostic(
+                            lambda err=exc, ep=stop_epoch: self._record_runtime_failure(
+                                err,
+                                operation="ingest_stop",
+                                epoch=ep,
+                            )
+                        )
                     if client is not None:
                         try:
                             await asyncio.wait_for(client.disconnect(), timeout=2.0)
@@ -531,7 +561,15 @@ class TelegramAccountRuntime:
             if inspect.isawaitable(result):
                 await result
 
-    def _record_auth_state(self, state: str, last_error: str | None = None) -> None:
+    def _record_auth_state(
+        self,
+        state: str,
+        last_error: str | None = None,
+        *,
+        epoch: int | None = None,
+    ) -> None:
+        if epoch is not None and self._auth_state_epoch != epoch:
+            return
         self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
@@ -544,11 +582,17 @@ class TelegramAccountRuntime:
             )
         )
 
-    def _record_runtime_failure(self, exc: Exception, operation: str = "account_runtime") -> None:
+    def _record_runtime_failure(
+        self,
+        exc: Exception,
+        operation: str = "account_runtime",
+        *,
+        epoch: int | None = None,
+    ) -> None:
         message = str(exc) or exc.__class__.__name__
         self.logger.warning("Telegram runtime failure for account %s: %s", self.config.account_id, message)
         try:
-            self._record_auth_state("error", last_error=message)
+            self._record_auth_state("error", last_error=message, epoch=epoch)
         except Exception:
             self.logger.exception(
                 "Failed to persist Telegram runtime auth failure for account %s",

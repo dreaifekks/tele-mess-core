@@ -495,6 +495,54 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.stop()
 
+    async def test_late_offline_diagnostic_does_not_overwrite_recovered_auth_state(self) -> None:
+        import threading
+
+        online = {"value": False}
+        diag_entered = threading.Event()
+        release_diag = threading.Event()
+        original_add_event = self.store.add_operation_event
+
+        def gated_add_event(record: object) -> None:
+            if getattr(record, "operation", None) == "auth_status":
+                diag_entered.set()
+                release_diag.wait(timeout=3.0)
+            original_add_event(record)  # type: ignore[arg-type]
+
+        class ToggleClient(FakeClient):
+            async def connect(self) -> None:
+                if not online["value"]:
+                    raise ConnectionError("offline")
+                await super().connect()
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: ToggleClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=0.05,
+        )
+        with patch.object(self.store, "add_operation_event", side_effect=gated_add_event):
+            await manager.start()
+            try:
+                offline_result = await manager.execute("main", "auth_status")
+                self.assertEqual(offline_result["auth_state"], "auth_failed")
+                self.assertTrue(diag_entered.wait(2.0))
+
+                # Network returns and request_code writes code_sent while old offline diagnostic is still paused.
+                online["value"] = True
+                sent = await manager.execute("main", "request_code", phone="+1000")
+                self.assertEqual(sent["auth_state"], "code_sent")
+
+                # Release the paused offline diagnostic and verify code_sent is NOT overwritten.
+                release_diag.set()
+            finally:
+                release_diag.set()
+                await manager.stop()
+
+        accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+        self.assertEqual(accounts["main"]["auth_state"], "code_sent")
+
 
 class ConfiguredAccountSyncTest(unittest.TestCase):
     def test_bootstrap_preserves_observed_auth_state(self) -> None:

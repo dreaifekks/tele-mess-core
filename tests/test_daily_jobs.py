@@ -1547,6 +1547,58 @@ class DailyJobWorkerTest(unittest.TestCase):
         rows = self.store.list_delivery_outbox(job_id="job_legacy_split")
         self.assertEqual(rows[0]["status"], "sent")
 
+    def test_standalone_cli_releases_lock_while_waiting_on_future_retry_at(self) -> None:
+        import time
+        from datetime import datetime, timedelta, timezone
+        from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyJobCliInterrupted, DailyWorkerLock
+        from tele_mess_core.models import DailySummaryJobRecord
+
+        future_retry_at = (datetime.now(timezone.utc) + timedelta(minutes=20)).isoformat()
+        self.store.insert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_delayed_retry",
+                status="queued",
+                retry_at=future_retry_at,
+                retry_count=1,
+                started_at=utc_now_iso(),
+            )
+        )
+        stop_event = threading.Event()
+        errors: list[BaseException] = []
+
+        def run_cli() -> None:
+            try:
+                run_daily_summary_job_from_cli(
+                    self.store,
+                    self.config,
+                    "job_delayed_retry",
+                    timeout=5.0,
+                    poll_interval=0.05,
+                    stop_event=stop_event,
+                )
+            except DailyJobCliInterrupted:
+                pass
+            except BaseException as exc:
+                errors.append(exc)
+
+        cli_thread = threading.Thread(target=run_cli, daemon=True)
+        cli_thread.start()
+        service_lock = DailyWorkerLock(self.root / DAILY_WORKER_LOCK_FILENAME, owner="core:test", mode="service")
+        try:
+            acquired = False
+            deadline = time.monotonic() + 2.0
+            while time.monotonic() < deadline:
+                if service_lock.try_acquire():
+                    acquired = True
+                    break
+                time.sleep(0.02)
+            self.assertTrue(acquired, "CLI held .daily-worker.lock while waiting on future retry_at")
+        finally:
+            stop_event.set()
+            cli_thread.join(timeout=2.0)
+            service_lock.release()
+        self.assertEqual(errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

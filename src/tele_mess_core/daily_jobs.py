@@ -429,6 +429,11 @@ def run_daily_summary_job_from_cli(
                 _raise_if_interrupted()
                 if ran is not None and ran["status"] in TERMINAL_JOB_STATUSES:
                     return ran
+                # Nothing is runnable right now (e.g. waiting on retry_at backoff) and
+                # any scoped delivery runtime is already closed; release the lock so a
+                # starting core service is not blocked while this CLI waits.
+                lock.release()
+                lock_held = False
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for daily summary job {job_id}")

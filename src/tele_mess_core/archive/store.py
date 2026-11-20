@@ -255,11 +255,16 @@ class ArchiveStore:
         """Whether every table, index, and trigger of the snapshot exists; an older
         release recreated them on each open, so an interrupted open can leave one missing."""
         existing = {str(row[0]) for row in self._conn.execute("SELECT name FROM sqlite_master")}
-        return (
+        if not (
             _schema_object_names() <= existing
             and self._has_column("delivery_outbox", "claim_token")
             and self._has_column("delivery_outbox", "send_random_id")
-        )
+        ):
+            return False
+        missing_random = self._conn.execute(
+            "SELECT 1 FROM delivery_outbox WHERE send_random_id IS NULL LIMIT 1"
+        ).fetchone()
+        return missing_random is None
 
     def _rebuild_message_fts(self) -> None:
         self._conn.execute("INSERT INTO message_fts(message_fts) VALUES('rebuild')")
@@ -4002,16 +4007,25 @@ class ArchiveStore:
                 """
             )
         self._ensure_column("daily_summary_records", "deleted_at", "TEXT")
-        if (
-            self._has_table("delivery_outbox")
-            and self._has_column("delivery_outbox", "content_kind")
-            and (
+        if self._has_table("delivery_outbox") and self._has_column("delivery_outbox", "content_kind"):
+            needs_outbox_repair = (
                 not self._has_column("delivery_outbox", "claim_token")
                 or not self._has_column("delivery_outbox", "send_random_id")
+                or self._conn.execute(
+                    "SELECT 1 FROM delivery_outbox WHERE send_random_id IS NULL LIMIT 1"
+                ).fetchone()
+                is not None
             )
-        ):
-            _migration_20(self._conn)
-            self._conn.commit()
+            if needs_outbox_repair:
+                if self._conn.in_transaction:
+                    self._conn.commit()
+                self._conn.execute("BEGIN IMMEDIATE")
+                try:
+                    _migration_20(self._conn)
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         if self._has_table(table) and not self._has_column(table, column):

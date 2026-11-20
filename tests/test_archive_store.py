@@ -2668,9 +2668,22 @@ class ArchiveMigrationTest(unittest.TestCase):
                 INSERT INTO delivery_outbox(
                   outbox_id, summary_run_id, account_id, origin_id, content_kind,
                   chunk_index, chunk_count, content, status, attempts, created_at, updated_at
-                ) VALUES (
+                ) VALUES
+                (
                   'out_partial_1', 'sum_partial', 'main', -9001, 'point_summary',
                   1, 1, 'hello', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_partial_sending', 'sum_partial_s', 'main', -9001, 'point_summary',
+                  1, 2, 'in flight', 'sending', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_partial_sending_2', 'sum_partial_s', 'main', -9001, 'point_summary',
+                  2, 2, 'trailing', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_partial_retry', 'sum_partial_r', 'main', -9001, 'point_summary',
+                  1, 1, 'attempted retry', 'retry', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
                 );
                 """
             )
@@ -2679,11 +2692,23 @@ class ArchiveMigrationTest(unittest.TestCase):
 
             reopened = ArchiveStore(db_path)
             try:
+                # Inject an interruption mid-repair; transaction must roll back and next initialize must finish it.
+                with patch(
+                    "tele_mess_core.archive.migrations.outbox_send_random_id",
+                    side_effect=RuntimeError("interrupted backfill"),
+                ):
+                    with self.assertRaisesRegex(RuntimeError, "interrupted backfill"):
+                        reopened.initialize()
+
                 reopened.initialize()
-                rows = reopened.list_delivery_outbox(summary_run_id="sum_partial")
-                self.assertEqual(len(rows), 1)
-                self.assertEqual(rows[0]["claim_token"], 0)
-                self.assertIsNotNone(rows[0]["send_random_id"])
+                by_id = {row["outbox_id"]: row for row in reopened.list_delivery_outbox()}
+                self.assertEqual(by_id["out_partial_1"]["status"], "pending")
+                self.assertEqual(by_id["out_partial_1"]["claim_token"], 0)
+                self.assertIsNotNone(by_id["out_partial_1"]["send_random_id"])
+                self.assertEqual(by_id["out_partial_sending"]["status"], "failed")
+                self.assertEqual(by_id["out_partial_sending_2"]["status"], "failed")
+                self.assertEqual(by_id["out_partial_retry"]["status"], "failed")
+                self.assertTrue(all(row["send_random_id"] is not None for row in by_id.values()))
             finally:
                 reopened.close()
 

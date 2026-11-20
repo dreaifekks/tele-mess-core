@@ -315,6 +315,7 @@ def _migration_20(connection: sqlite3.Connection) -> None:
     if table is None:
         return
     columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(delivery_outbox)").fetchall()}
+    had_claim_token = "claim_token" in columns
     if "content_kind" not in columns:
         connection.execute(
             """
@@ -377,28 +378,27 @@ def _migration_20(connection: sqlite3.Connection) -> None:
         )
         connection.execute("DROP TABLE delivery_outbox")
         connection.execute("ALTER TABLE delivery_outbox_v20 RENAME TO delivery_outbox")
-        connection.execute(
-            """
-            UPDATE delivery_outbox
-            SET status = 'failed',
-                last_error = COALESCE(last_error, 'blocked by migrated_in_flight_sending_uncertain'),
-                next_attempt_at = NULL
-            WHERE status IN ('pending', 'retry')
-              AND EXISTS (
-                SELECT 1 FROM delivery_outbox earlier
-                WHERE earlier.summary_run_id = delivery_outbox.summary_run_id
-                  AND earlier.account_id = delivery_outbox.account_id
-                  AND earlier.origin_id = delivery_outbox.origin_id
-                  AND earlier.topic_id = delivery_outbox.topic_id
-                  AND earlier.content_kind = delivery_outbox.content_kind
-                  AND earlier.chunk_index < delivery_outbox.chunk_index
-                  AND earlier.status = 'failed'
-              )
-            """
-        )
+        _fail_trailing_outbox_after_failed(connection)
     else:
         _ensure_column(connection, "delivery_outbox", "claim_token", "INTEGER NOT NULL DEFAULT 0")
         _ensure_column(connection, "delivery_outbox", "send_random_id", "INTEGER")
+        if not had_claim_token:
+            connection.execute("UPDATE delivery_outbox SET claim_token = attempts WHERE claim_token < attempts")
+        isolated = connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET status = 'failed',
+                last_error = CASE
+                  WHEN status = 'sending' THEN COALESCE(last_error, 'migrated_in_flight_sending_uncertain')
+                  ELSE COALESCE(last_error, 'migrated_attempted_delivery_uncertain')
+                END,
+                next_attempt_at = NULL
+            WHERE send_random_id IS NULL
+              AND (status = 'sending' OR (status = 'retry' AND attempts > 0))
+            """
+        )
+        if isolated.rowcount > 0:
+            _fail_trailing_outbox_after_failed(connection)
 
     missing_random = connection.execute(
         "SELECT outbox_id FROM delivery_outbox WHERE send_random_id IS NULL"
@@ -445,6 +445,28 @@ def _migration_20(connection: sqlite3.Connection) -> None:
         BEGIN
           SELECT RAISE(ABORT, 'invalid delivery outbox state');
         END
+        """
+    )
+
+
+def _fail_trailing_outbox_after_failed(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        UPDATE delivery_outbox
+        SET status = 'failed',
+            last_error = COALESCE(last_error, 'blocked by migrated_in_flight_sending_uncertain'),
+            next_attempt_at = NULL
+        WHERE status IN ('pending', 'retry')
+          AND EXISTS (
+            SELECT 1 FROM delivery_outbox earlier
+            WHERE earlier.summary_run_id = delivery_outbox.summary_run_id
+              AND earlier.account_id = delivery_outbox.account_id
+              AND earlier.origin_id = delivery_outbox.origin_id
+              AND earlier.topic_id = delivery_outbox.topic_id
+              AND earlier.content_kind = delivery_outbox.content_kind
+              AND earlier.chunk_index < delivery_outbox.chunk_index
+              AND earlier.status = 'failed'
+          )
         """
     )
 
