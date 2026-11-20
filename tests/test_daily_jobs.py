@@ -342,6 +342,31 @@ class DailyJobWorkerTest(unittest.TestCase):
         assert rebuilt is not None
         self.assertEqual(rebuilt["status"], "completed")
 
+    def test_requested_package_that_is_still_running_is_not_rebuilt(self) -> None:
+        package_run_id = "pkg_other_job_running"
+        self.store.upsert_daily_package_run(
+            DailyPackageRunRecord(
+                run_id=package_run_id,
+                status="running",
+                date="2026-07-03",
+                timezone="UTC",
+                scope_json='{"account_id": "main", "origin_id": -1001}',
+                output_dir=str(self.config.daily.output_dir / "2026-07-03" / package_run_id),
+                progress_label="packaging",
+            )
+        )
+        worker = DailyJobWorker(self.store, self.config, worker_id="summary-only")
+        worker.enqueue(package_run_id=package_run_id)
+
+        finished = worker.run_once()
+
+        assert finished is not None
+        self.assertEqual(finished["status"], "failed")
+        package = self.store.get_daily_package_run(package_run_id)
+        assert package is not None
+        self.assertEqual(package["status"], "running")
+        self.assertEqual(package["message_count"], 0)
+
     def test_worker_interruption_with_cancel_request_finishes_canceled(self) -> None:
         worker = DailyJobWorker(self.store, self.config, worker_id="stopping")
         job = worker.enqueue(

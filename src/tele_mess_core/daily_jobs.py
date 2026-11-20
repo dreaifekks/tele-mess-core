@@ -335,8 +335,11 @@ class DailyJobWorker:
         try:
             check_cancel()
             package = self.store.get_daily_package_run(str(package_run_id)) if package_run_id else None
-            if package is None or package.get("status") == "running":
-                planned_package_id = str(package_run_id or job.get("package_run_id") or f"pkg_{uuid.uuid4().hex[:12]}")
+            # Only a package this job planned itself is rebuilt after an interruption;
+            # a requested package that is still running belongs to someone else.
+            own_package_id = None if request.get("package_run_id") else package_run_id
+            if package is None or (own_package_id and package.get("status") == "running"):
+                planned_package_id = str(own_package_id or f"pkg_{uuid.uuid4().hex[:12]}")
                 write_job(
                     "running",
                     {"stage": "package", "phase": "queued", "current": 0, "total": 0, "label": "package queued"},
