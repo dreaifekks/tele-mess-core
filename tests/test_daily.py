@@ -446,12 +446,6 @@ class DailyPackagingTest(unittest.TestCase):
                 {"enabled": True, "account_id": "shared-id", "origin_id": -9001},
             )
 
-        self.store.set_daily_summary_delivery(
-            DailySummaryDeliveryRecord(enabled=True, account_id="shared-id", origin_id=-9001)
-        )
-        with self.assertRaisesRegex(ValueError, "Unknown account_id: shared-id"):
-            resolve_daily_summary_delivery(self.store, self.config)
-
     def test_daily_delivery_keeps_yaml_account_compatibility(self) -> None:
         self.config.telegram.accounts.append(
             TelegramAccountConfig(

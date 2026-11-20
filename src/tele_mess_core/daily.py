@@ -955,15 +955,12 @@ def daily_summary_delivery_state(store: ArchiveStore, config: AppConfig) -> dict
 
 def resolve_daily_summary_delivery(store: ArchiveStore, config: AppConfig) -> DailyDeliveryConfig:
     state = daily_summary_delivery_state(store, config)
-    delivery = DailyDeliveryConfig(
+    return DailyDeliveryConfig(
         enabled=bool(state.get("enabled")),
         account_id=str(state.get("account_id") or ""),
         origin_id=int(state["origin_id"]) if state.get("origin_id") is not None else None,
         topic_id=int(state.get("topic_id") or 0),
     )
-    if delivery.enabled:
-        resolve_account_config(config, store, delivery.account_id)
-    return delivery
 
 
 def update_daily_summary_delivery(

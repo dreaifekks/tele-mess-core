@@ -32,7 +32,8 @@ validation rules.
   API, and daily delivery. The runtime no longer starts a Telegram client for a
   management account of another source, and enabling delivery to an account
   managed in SQLite now fails at configuration time when no configured account
-  can lend it API credentials.
+  can lend it API credentials. A delivery account removed later only fails the
+  delivery; daily jobs are still queued and analyzed.
 - Importing the HTTP API, MCP endpoint, daily worker, or CLI no longer loads
   Telethon; only the Telegram runtime and services do. A missing Telethon in
   origin discovery now raises instead of being reported as a partial topic

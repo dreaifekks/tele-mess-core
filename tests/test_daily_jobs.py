@@ -23,11 +23,12 @@ from tele_mess_core.config import (
     TelegramAccountConfig,
     TelegramConfig,
 )
-from tele_mess_core.daily_jobs import DailyJobWorker, DailyJobWorkerStopping
+from tele_mess_core.daily_jobs import DailyJobWorker, DailyJobWorkerStopping, enqueue_daily_summary_job
 from tele_mess_core.models import (
     AccountRecord,
     BackupPolicyRecord,
     DailyPackageRunRecord,
+    DailySummaryDeliveryRecord,
     MessageRecord,
     OriginRecord,
     SOURCE_TELEGRAM,
@@ -99,6 +100,15 @@ class DailyJobWorkerTest(unittest.TestCase):
     def tearDown(self) -> None:
         self.store.close()
         self.tmp.cleanup()
+
+    def test_job_is_queued_when_the_delivery_account_was_removed(self) -> None:
+        self.store.set_daily_summary_delivery(
+            DailySummaryDeliveryRecord(enabled=True, account_id="removed-account", origin_id=-9001, updated_at=utc_now_iso())
+        )
+
+        job = enqueue_daily_summary_job(self.store, self.config, run_date="2026-07-03", timezone_name="UTC")
+
+        self.assertEqual(job["status"], "queued")
 
     def test_enqueue_is_deduplicated_and_worker_completes_job(self) -> None:
         worker = DailyJobWorker(self.store, self.config, poll_interval=0.01)
