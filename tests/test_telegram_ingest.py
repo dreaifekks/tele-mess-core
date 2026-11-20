@@ -1305,6 +1305,142 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(download_calls, [])
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=-1099), [])
 
+    async def test_backfill_iterator_registers_messages_as_yielded_before_next_batch(self) -> None:
+        handlers: list[tuple[object, object]] = []
+        yielded_first = asyncio.Event()
+        release_second = asyncio.Event()
+        channel_id = -1001234567891
+
+        class PausingBatchIterator:
+            def __init__(self, first: FakeMessage, second: FakeMessage) -> None:
+                self._items = [first, second]
+                self._index = 0
+
+            def __aiter__(self):
+                return self
+
+            async def __anext__(self):
+                if self._index == 0:
+                    self._index += 1
+                    return self._items[0]
+                if self._index == 1:
+                    self._index += 1
+                    yielded_first.set()
+                    await release_second.wait()
+                    return self._items[1]
+                raise StopAsyncIteration
+
+        class PagedIterClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+            async def get_messages(self, chat_id: int, **kwargs):
+                return [FakeMessage(92, channel_id, text="keep 92")]
+
+            def iter_messages(self, chat_id: int, **kwargs):
+                return PausingBatchIterator(
+                    FakeMessage(91, channel_id, text="delete 91 between batches"),
+                    FakeMessage(92, channel_id, text="keep 92"),
+                )
+
+        self.service.register_handlers(PagedIterClient())
+        on_delete = handlers[2][1]
+        assert callable(on_delete)
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", channel_id, enabled=True))
+
+        task = asyncio.create_task(self.service.refresh_capture_targets())
+        await asyncio.wait_for(yielded_first.wait(), timeout=1.0)
+        await on_delete(SimpleNamespace(chat_id=channel_id, deleted_ids=[91]))
+        release_second.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        items = self.store.list_latest_messages()["items"]
+        self.assertEqual([item["message_id"] for item in items], [92])
+        self.assertEqual(self.service._inflight_fetches, {})
+
+    async def test_duplicate_inflight_cleanup_uses_identity_and_preserves_other_task(self) -> None:
+        handlers: list[tuple[object, object]] = []
+
+        class HandlerClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+        self.service.register_handlers(HandlerClient())
+        on_delete = handlers[2][1]
+        assert callable(on_delete)
+
+        channel_id = -1001234567892
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", channel_id, enabled=True))
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class PausingRealtimeMessage(FakeMessage):
+            async def get_sender(self):
+                entered.set()
+                await release.wait()
+                return await super().get_sender()
+
+        live_msg = PausingRealtimeMessage(95, channel_id, text="live 95")
+        live_task = asyncio.create_task(self.service._store_message(live_msg, event_type="new"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+
+        # Duplicate backfill skips while policy is temporarily disabled and cleans up its own state twice.
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", channel_id, enabled=False))
+        dup_msg = FakeMessage(95, channel_id, text="dup 95")
+        dup_state = self.service._register_inflight_fetch(channel_id, 95)
+        await self.service._store_backfill_page([(dup_msg, dup_state)], type("FakeService", (), {}))
+
+        # Re-enable policy and deliver delete for 95; live task must still be fenced.
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", channel_id, enabled=True))
+        await on_delete(SimpleNamespace(chat_id=channel_id, deleted_ids=[95]))
+        release.set()
+        self.assertFalse(await live_task)
+        self.assertEqual(self.store.list_latest_messages()["items"], [])
+        self.assertEqual(self.service._inflight_fetches, {})
+
+    async def test_media_download_retry_stops_when_policy_disabled_mid_attempt(self) -> None:
+        chat_id = -1098
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        attempts: list[int] = []
+        service = TelegramArchiveService(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=Path(self.tmp.name),
+            ),
+            self.store,
+            media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0),
+        )
+
+        class DisableOnFirstFailureMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                attempts.append(len(attempts) + 1)
+                if len(attempts) == 1:
+                    self.store_ref.set_backup_policy(
+                        BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=False)
+                    )
+                    raise RuntimeError("transient media failure")
+                path = Path(file) / "should-not-retry.bin"
+                path.write_bytes(b"data")
+                return str(path)
+
+        msg = DisableOnFirstFailureMessage(96, chat_id, text="with media", media=MessageMediaDocument())
+        msg.store_ref = self.store
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        self.assertEqual(attempts, [1])
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=96), [])
+
 
 if __name__ == "__main__":
     unittest.main()

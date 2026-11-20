@@ -31,6 +31,11 @@ class CaptureTarget:
     topic_id: int = 0
 
 
+@dataclass(eq=False, slots=True)
+class _InflightFetchState:
+    deleted: bool = False
+
+
 class TelegramArchiveService:
     def __init__(
         self,
@@ -52,7 +57,7 @@ class TelegramArchiveService:
         self._retry_task: asyncio.Task[None] | None = None
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
-        self._inflight_fetches: dict[tuple[int, int], list[dict[str, bool]]] = {}
+        self._inflight_fetches: dict[tuple[int, int], dict[int, _InflightFetchState]] = {}
 
     async def run(self) -> None:
         from telethon import TelegramClient
@@ -129,13 +134,13 @@ class TelegramArchiveService:
                     raw_payload=raw,
                 )
                 for deleted_id, resolved_chat_id in resolved_chat_ids.items():
-                    for state in self._inflight_fetches.get((resolved_chat_id, deleted_id), ()):
-                        state["deleted"] = True
+                    for state in self._inflight_fetches.get((resolved_chat_id, deleted_id), {}).values():
+                        state.deleted = True
                 return
             target_chat_id = int(chat_id)
             for deleted_id in deleted_ids:
-                for state in self._inflight_fetches.get((target_chat_id, deleted_id), ()):
-                    state["deleted"] = True
+                for state in self._inflight_fetches.get((target_chat_id, deleted_id), {}).values():
+                    state.deleted = True
             self.store.mark_deleted(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -258,28 +263,52 @@ class TelegramArchiveService:
             targets.append(CaptureTarget(origin_id, topic_id))
         return _dedupe_capture_targets(targets)
 
-    def _register_inflight_fetch(self, chat_id: int, message_id: int) -> dict[str, bool]:
-        state = {"deleted": False}
-        self._inflight_fetches.setdefault((chat_id, message_id), []).append(state)
+    def _register_inflight_fetch(self, chat_id: int, message_id: int) -> _InflightFetchState:
+        state = _InflightFetchState()
+        self._inflight_fetches.setdefault((chat_id, message_id), {})[id(state)] = state
         return state
 
-    def _unregister_inflight_fetch(self, chat_id: int, message_id: int, state: dict[str, bool]) -> None:
+    def _unregister_inflight_fetch(
+        self,
+        chat_id: int,
+        message_id: int,
+        state: _InflightFetchState,
+    ) -> None:
         fetch_key = (chat_id, message_id)
         bucket = self._inflight_fetches.get(fetch_key)
         if bucket is not None:
-            try:
-                bucket.remove(state)
-            except ValueError:
-                pass
+            bucket.pop(id(state), None)
             if not bucket:
                 self._inflight_fetches.pop(fetch_key, None)
+
+    def _unregister_backfill_entries(
+        self,
+        entries: list[tuple[Any, _InflightFetchState | None]],
+    ) -> None:
+        for message, state in entries:
+            if state is not None:
+                self._unregister_inflight_fetch(int(message.chat_id), int(message.id), state)
+
+    def _should_download_media_for(
+        self,
+        chat_id: int,
+        topic_id: int,
+        *,
+        is_sticker_like: bool,
+    ) -> bool:
+        policy = self._policy_for(chat_id, topic_id)
+        if not policy.get("enabled", False):
+            return False
+        if is_sticker_like:
+            return bool(policy.get("download_stickers", False))
+        return bool(policy.get("download_media", False))
 
     async def _store_message(
         self,
         message: Any,
         event_type: str,
         *,
-        fetch_state: dict[str, bool] | None = None,
+        fetch_state: _InflightFetchState | None = None,
     ) -> bool:
         chat_id = int(message.chat_id)
         message_id = int(message.id)
@@ -290,7 +319,7 @@ class TelegramArchiveService:
         built_record: MessageRecord | None = None
         is_sticker_like = _message_media_is_sticker_like(message)
         try:
-            if active_state["deleted"]:
+            if active_state.deleted:
                 return False
             policy = self._policy_for(chat_id, topic_id)
             if not policy.get("enabled", False):
@@ -308,7 +337,7 @@ class TelegramArchiveService:
             except Exception as exc:
                 self.logger.debug("Failed to fetch chat for %s: %s", getattr(message, "id", "?"), exc)
 
-            if active_state["deleted"]:
+            if active_state.deleted:
                 return False
 
             def _build_record(effective: dict[str, Any]) -> MessageRecord:
@@ -376,13 +405,13 @@ class TelegramArchiveService:
         finally:
             self._unregister_inflight_fetch(chat_id, message_id, active_state)
 
-        download_policy = self._policy_for(chat_id, topic_id)
-        download_media = bool(download_policy.get("enabled")) and bool(download_policy.get("download_media", False))
-        download_stickers = bool(download_policy.get("enabled")) and bool(download_policy.get("download_stickers", False))
-        should_download_media = download_stickers if is_sticker_like else download_media
-        if should_download_media and _message_media_downloadable(
+        if self._should_download_media_for(
+            chat_id,
+            topic_id,
+            is_sticker_like=is_sticker_like,
+        ) and _message_media_downloadable(
             message,
-            include_stickers=download_stickers,
+            include_stickers=is_sticker_like,
         ):
             existing_media = (
                 self.store.list_media_files(
@@ -394,18 +423,34 @@ class TelegramArchiveService:
                 else []
             )
             if not existing_media:
-                await self._download_message_media(message, built_record)
+                await self._download_message_media(
+                    message,
+                    built_record,
+                    is_sticker_like=is_sticker_like,
+                )
         self._update_capture_cursor(chat_id, topic_id, message_id, built_record.sent_at)
         return True
 
 
-    async def _download_message_media(self, message: Any, record: MessageRecord) -> None:
+    async def _download_message_media(
+        self,
+        message: Any,
+        record: MessageRecord,
+        *,
+        is_sticker_like: bool = False,
+    ) -> None:
         target_dir = self.store.database_path.parent / "media" / self.account_id / str(record.chat_id)
         target_dir.mkdir(parents=True, exist_ok=True)
         downloaded = None
         attempts = max(1, self.media_download.retries + 1)
         success_attempt = 0
         for attempt in range(1, attempts + 1):
+            if not self._should_download_media_for(
+                record.chat_id,
+                record.topic_id,
+                is_sticker_like=is_sticker_like,
+            ):
+                return
             try:
                 downloaded = await message.download_media(file=str(target_dir))
                 success_attempt = attempt
@@ -442,6 +487,13 @@ class TelegramArchiveService:
             )
             return
         path = Path(downloaded)
+        if not self._should_download_media_for(
+            record.chat_id,
+            record.topic_id,
+            is_sticker_like=is_sticker_like,
+        ):
+            path.unlink(missing_ok=True)
+            return
         file_size = path.stat().st_size if path.exists() else None
         self.store.upsert_media_file(
             MediaFileRecord(
@@ -542,9 +594,13 @@ class TelegramArchiveService:
                 )
 
                 if is_initial_backfill and self.backfill.initial_limit > 0:
-                    messages = await self._initial_history_messages(target, backfill_head_message_id)
+                    entries = await self._initial_history_messages(
+                        target,
+                        backfill_head_message_id,
+                        MessageService,
+                    )
                     page_high, page_count, page_last_message_at = await self._store_backfill_page(
-                        messages,
+                        entries,
                         MessageService,
                     )
                     count += page_count
@@ -560,17 +616,18 @@ class TelegramArchiveService:
                     page_size = self.backfill.catch_up_limit
                     limit_arg = page_size if page_size > 0 else 1000
                     while history_scanned_through_id < backfill_head_message_id:
-                        messages = await self._history_page(
+                        entries = await self._history_page(
                             target,
                             min_id=history_scanned_through_id,
                             max_id=backfill_head_message_id + 1,
                             limit=limit_arg,
+                            message_service_type=MessageService,
                         )
-                        if not messages:
+                        if not entries:
                             history_scanned_through_id = backfill_head_message_id
                             break
                         page_high, page_count, page_last_message_at = await self._store_backfill_page(
-                            messages,
+                            entries,
                             MessageService,
                         )
                         if page_high <= history_scanned_through_id:
@@ -596,7 +653,7 @@ class TelegramArchiveService:
                                 "page_size": limit_arg,
                             },
                         )
-                        if len(messages) < limit_arg:
+                        if len(entries) < limit_arg:
                             history_scanned_through_id = backfill_head_message_id
                             break
 
@@ -683,7 +740,8 @@ class TelegramArchiveService:
         self,
         target: CaptureTarget,
         head_message_id: int,
-    ) -> list[Any]:
+        message_service_type: type[Any],
+    ) -> list[tuple[Any, _InflightFetchState | None]]:
         limit = self.backfill.initial_limit
         limit_arg = None if limit <= 0 else limit
         kwargs: dict[str, Any] = {
@@ -692,18 +750,33 @@ class TelegramArchiveService:
         }
         if target.topic_id:
             kwargs["reply_to"] = target.topic_id
-        get_messages = getattr(self.client, "get_messages", None)
-        if callable(get_messages):
-            result = await get_messages(target.chat_id, **kwargs)
-            messages = _coerce_messages(result)
-        else:
-            messages = []
-            async for message in self.client.iter_messages(target.chat_id, **kwargs):
-                messages.append(message)
-        return sorted(
-            (message for message in messages if int(message.id) <= head_message_id),
-            key=lambda message: int(message.id),
-        )
+        collected: list[tuple[Any, _InflightFetchState | None]] = []
+        try:
+            iter_messages = getattr(self.client, "iter_messages", None)
+            if callable(iter_messages):
+                async for message in iter_messages(target.chat_id, **kwargs):
+                    if int(message.id) <= head_message_id:
+                        state = (
+                            None
+                            if isinstance(message, message_service_type)
+                            else self._register_inflight_fetch(int(message.chat_id), int(message.id))
+                        )
+                        collected.append((message, state))
+            else:
+                result = await self.client.get_messages(target.chat_id, **kwargs)
+                for message in _coerce_messages(result):
+                    if int(message.id) <= head_message_id:
+                        state = (
+                            None
+                            if isinstance(message, message_service_type)
+                            else self._register_inflight_fetch(int(message.chat_id), int(message.id))
+                        )
+                        collected.append((message, state))
+        except BaseException:
+            self._unregister_backfill_entries(collected)
+            raise
+        collected.sort(key=lambda item: int(item[0].id))
+        return collected
 
     async def _history_page(
         self,
@@ -712,7 +785,8 @@ class TelegramArchiveService:
         min_id: int,
         max_id: int,
         limit: int | None,
-    ) -> list[Any]:
+        message_service_type: type[Any],
+    ) -> list[tuple[Any, _InflightFetchState | None]]:
         kwargs: dict[str, Any] = {
             "min_id": min_id,
             "max_id": max_id,
@@ -721,31 +795,34 @@ class TelegramArchiveService:
         }
         if target.topic_id:
             kwargs["reply_to"] = target.topic_id
-        messages: list[Any] = []
-        async for message in self.client.iter_messages(target.chat_id, **kwargs):
-            if min_id < int(message.id) < max_id:
-                messages.append(message)
-        return messages
+        collected: list[tuple[Any, _InflightFetchState | None]] = []
+        try:
+            async for message in self.client.iter_messages(target.chat_id, **kwargs):
+                if min_id < int(message.id) < max_id:
+                    state = (
+                        None
+                        if isinstance(message, message_service_type)
+                        else self._register_inflight_fetch(int(message.chat_id), int(message.id))
+                    )
+                    collected.append((message, state))
+        except BaseException:
+            self._unregister_backfill_entries(collected)
+            raise
+        return collected
 
     async def _store_backfill_page(
         self,
-        messages: list[Any],
+        entries: list[tuple[Any, _InflightFetchState | None]],
         message_service_type: type[Any],
     ) -> tuple[int, int, str | None]:
         page_high = 0
         stored_count = 0
         last_message_at: str | None = None
-        registered: list[tuple[Any, int, int, dict[str, bool]]] = []
-        for message in messages:
-            page_high = max(page_high, int(message.id))
-            if isinstance(message, message_service_type):
-                continue
-            chat_id = int(message.chat_id)
-            message_id = int(message.id)
-            fetch_state = self._register_inflight_fetch(chat_id, message_id)
-            registered.append((message, chat_id, message_id, fetch_state))
         try:
-            for message, _chat_id, _message_id, fetch_state in registered:
+            for message, fetch_state in entries:
+                page_high = max(page_high, int(message.id))
+                if isinstance(message, message_service_type):
+                    continue
                 stored = await self._store_message(
                     message,
                     event_type="backfill",
@@ -755,8 +832,7 @@ class TelegramArchiveService:
                     stored_count += 1
                     last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
         finally:
-            for _message, chat_id, message_id, fetch_state in registered:
-                self._unregister_inflight_fetch(chat_id, message_id, fetch_state)
+            self._unregister_backfill_entries(entries)
         return page_high, stored_count, last_message_at
 
     def _save_backfill_cursor(
