@@ -2270,7 +2270,8 @@ def read_run_content(store: ArchiveStore, run_type: str, run_id: str, content_fo
 def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[dict[str, Any]]:
     account_id = scope.get("account_id")
     scoped_account = str(account_id) if account_id else None
-    all_origins = store.list_origins(account_id=scoped_account, include_archived=True)
+    all_origins = list(store.list_origins(account_id=scoped_account, include_archived=True))
+    known_origin_keys = {_origin_identity(origin) for origin in all_origins}
     parent_lookup = {
         _parent_lookup_key(origin): origin
         for origin in all_origins
@@ -2293,14 +2294,52 @@ def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[
         if policy.get("source") != SOURCE_TELEGRAM:
             continue
         tid = int(policy.get("topic_id") or 0)
-        if tid == 0 or policy.get("enabled"):
+        if tid == 0:
             continue
-        pkey = (
-            str(policy.get("source") or SOURCE_TELEGRAM),
-            str(policy.get("account_id") or ""),
-            int(policy.get("origin_id") or 0),
+        src = str(policy.get("source") or SOURCE_TELEGRAM)
+        acc = str(policy.get("account_id") or "")
+        oid = int(policy.get("origin_id") or 0)
+        pkey = (src, acc, oid)
+        effective_policy, policy_source = store.resolve_effective_backup_policy_with_source(
+            src,
+            acc,
+            oid,
+            topic_id=tid,
         )
+        # Every explicit topic policy (whether disabled or independently enabled) owns that topic_id
+        # and must be excluded from the parent forum's catch-all message bucket.
         excluded_topics_by_parent.setdefault(pkey, set()).add(tid)
+        identity = (src, acc, oid, tid)
+        if identity not in known_origin_keys and effective_policy.get("enabled"):
+            known_origin_keys.add(identity)
+            raw_policy = {
+                "enabled": bool(policy.get("enabled")),
+                "capture_text": bool(policy.get("capture_text", True)),
+                "capture_media_metadata": bool(policy.get("capture_media_metadata", True)),
+                "download_media": bool(policy.get("download_media", False)),
+                "download_stickers": bool(policy.get("download_stickers", False)),
+                "tags": policy.get("tags"),
+                "updated_at": policy.get("updated_at"),
+            }
+            all_origins.append(
+                {
+                    "source": src,
+                    "account_id": acc,
+                    "origin_id": oid,
+                    "topic_id": tid,
+                    "origin_type": "topic",
+                    "parent_origin_id": oid,
+                    "title": f"Topic {tid}",
+                    "username": None,
+                    "is_forum": False,
+                    "important": False,
+                    "archived_at": None,
+                    "last_message_at": None,
+                    "backup_policy": raw_policy,
+                    "effective_backup_policy": effective_policy,
+                    "policy_source": policy_source,
+                }
+            )
 
     selected: list[dict[str, Any]] = []
     required_tags = {normalize_tag(tag) for tag in parse_tags(scope.get("tags"))}
@@ -2332,7 +2371,15 @@ def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[
         parent_important = False
         if tid != 0:
             parent = parent_lookup.get(_parent_lookup_key(origin))
-            parent_policy = (parent or {}).get("effective_backup_policy") or {}
+            if parent is not None:
+                parent_policy = parent.get("effective_backup_policy") or {}
+            else:
+                parent_policy = store.resolve_effective_backup_policy(
+                    str(origin.get("source") or SOURCE_TELEGRAM),
+                    str(origin.get("account_id") or ""),
+                    int(origin["origin_id"]),
+                    topic_id=0,
+                )
             parent_tags = parse_tags(parent_policy.get("tags"))
             parent_important = bool((parent or {}).get("important"))
             local_normalized = _normalized_tag_set(local_tags)

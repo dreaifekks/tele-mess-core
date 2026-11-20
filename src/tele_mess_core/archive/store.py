@@ -838,7 +838,7 @@ class ArchiveStore:
             items.append(data)
         return items
 
-    def resolve_effective_backup_policy_with_source(
+    def _resolve_effective_backup_policy_unlocked(
         self,
         source: str,
         account_id: str,
@@ -847,43 +847,42 @@ class ArchiveStore:
     ) -> tuple[dict[str, Any], str]:
         tid = int(topic_id or 0)
         oid = int(origin_id)
-        with self._lock:
-            if tid:
-                origin_rows = self._conn.execute(
-                    """
-                    SELECT topic_id, archived_at
-                    FROM origins
-                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
-                    """,
-                    (source, account_id, oid, tid),
-                ).fetchall()
-                policy_rows = self._conn.execute(
-                    """
-                    SELECT topic_id, enabled, capture_text, capture_media_metadata,
-                           download_media, download_stickers, tags, updated_at
-                    FROM backup_policies
-                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
-                    """,
-                    (source, account_id, oid, tid),
-                ).fetchall()
-            else:
-                origin_rows = self._conn.execute(
-                    """
-                    SELECT topic_id, archived_at
-                    FROM origins
-                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
-                    """,
-                    (source, account_id, oid),
-                ).fetchall()
-                policy_rows = self._conn.execute(
-                    """
-                    SELECT topic_id, enabled, capture_text, capture_media_metadata,
-                           download_media, download_stickers, tags, updated_at
-                    FROM backup_policies
-                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
-                    """,
-                    (source, account_id, oid),
-                ).fetchall()
+        if tid:
+            origin_rows = self._conn.execute(
+                """
+                SELECT topic_id, archived_at
+                FROM origins
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
+                """,
+                (source, account_id, oid, tid),
+            ).fetchall()
+            policy_rows = self._conn.execute(
+                """
+                SELECT topic_id, enabled, capture_text, capture_media_metadata,
+                       download_media, download_stickers, tags, updated_at
+                FROM backup_policies
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
+                """,
+                (source, account_id, oid, tid),
+            ).fetchall()
+        else:
+            origin_rows = self._conn.execute(
+                """
+                SELECT topic_id, archived_at
+                FROM origins
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
+                """,
+                (source, account_id, oid),
+            ).fetchall()
+            policy_rows = self._conn.execute(
+                """
+                SELECT topic_id, enabled, capture_text, capture_media_metadata,
+                       download_media, download_stickers, tags, updated_at
+                FROM backup_policies
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
+                """,
+                (source, account_id, oid),
+            ).fetchall()
         archived_by_topic = {int(row["topic_id"]): row["archived_at"] is not None for row in origin_rows}
         policy_by_topic: dict[int, dict[str, Any]] = {}
         for row in policy_rows:
@@ -904,6 +903,21 @@ class ArchiveStore:
             self_archived=archived_by_topic.get(tid, False),
             parent_archived=archived_by_topic.get(0, False) if tid else False,
         )
+
+    def resolve_effective_backup_policy_with_source(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+    ) -> tuple[dict[str, Any], str]:
+        with self._lock:
+            return self._resolve_effective_backup_policy_unlocked(
+                source,
+                account_id,
+                origin_id,
+                topic_id=topic_id,
+            )
 
     def resolve_effective_backup_policy(
         self,
@@ -1286,111 +1300,7 @@ class ArchiveStore:
         payload = _message_payload(message)
         now = message.ingested_at or utc_now_iso()
         with self._lock:
-            cur = self._conn.execute(
-                """
-                INSERT INTO messages(
-                  source, account_id, chat_id, message_id, topic_id, sender_id, sender_name, sender_username,
-                  sent_at, edited_at, ingested_at, deleted_at, text, has_media, media_kind,
-                  grouped_id, reply_to_message_id, forward_from_id, forward_from_name, permalink,
-                  reactions_json, raw_json, version
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
-                ON CONFLICT(source, account_id, chat_id, message_id) DO UPDATE SET
-                  topic_id = excluded.topic_id,
-                  sender_id = excluded.sender_id,
-                  sender_name = excluded.sender_name,
-                  sender_username = excluded.sender_username,
-                  sent_at = excluded.sent_at,
-                  edited_at = CASE
-                    WHEN excluded.edited_at IS NULL THEN messages.edited_at
-                    WHEN messages.edited_at IS NULL OR excluded.edited_at >= messages.edited_at
-                    THEN excluded.edited_at
-                    ELSE messages.edited_at
-                  END,
-                  ingested_at = CASE
-                    WHEN excluded.ingested_at >= messages.ingested_at THEN excluded.ingested_at
-                    ELSE messages.ingested_at
-                  END,
-                  deleted_at = CASE
-                    WHEN excluded.deleted_at IS NULL THEN messages.deleted_at
-                    WHEN messages.deleted_at IS NULL OR excluded.deleted_at >= messages.deleted_at
-                    THEN excluded.deleted_at
-                    ELSE messages.deleted_at
-                  END,
-                  text = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.text ELSE messages.text
-                  END,
-                  has_media = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.has_media ELSE messages.has_media
-                  END,
-                  media_kind = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.media_kind ELSE messages.media_kind
-                  END,
-                  grouped_id = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.grouped_id ELSE messages.grouped_id
-                  END,
-                  reply_to_message_id = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.reply_to_message_id ELSE messages.reply_to_message_id
-                  END,
-                  forward_from_id = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.forward_from_id ELSE messages.forward_from_id
-                  END,
-                  forward_from_name = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.forward_from_name ELSE messages.forward_from_name
-                  END,
-                  permalink = COALESCE(excluded.permalink, messages.permalink),
-                  reactions_json = CASE
-                    WHEN ? = 'backfill'
-                    THEN COALESCE(messages.reactions_json, excluded.reactions_json)
-                    ELSE COALESCE(excluded.reactions_json, messages.reactions_json)
-                  END,
-                  raw_json = CASE
-                    WHEN messages.edited_at IS NULL
-                      OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
-                    THEN excluded.raw_json ELSE messages.raw_json
-                  END,
-                  version = messages.version + 1
-                """,
-                (
-                    message.source,
-                    message.account_id,
-                    message.chat_id,
-                    message.message_id,
-                    message.topic_id,
-                    message.sender_id,
-                    message.sender_name,
-                    message.sender_username,
-                    message.sent_at,
-                    message.edited_at,
-                    now,
-                    message.deleted_at,
-                    message.text,
-                    int(message.has_media),
-                    message.media_kind,
-                    message.grouped_id,
-                    message.reply_to_message_id,
-                    message.forward_from_id,
-                    message.forward_from_name,
-                    message.permalink,
-                    message.reactions_json,
-                    message.raw_json,
-                    event_type,
-                ),
-            )
+            self._upsert_message_row_unlocked(message, event_type, now)
             event_seq = self._insert_event(
                 source=message.source,
                 account_id=message.account_id,
@@ -1402,6 +1312,145 @@ class ArchiveStore:
             )
             self._conn.commit()
             return event_seq
+
+    def upsert_message_if_policy_enabled(self, message: MessageRecord, event_type: str) -> int | None:
+        """Atomically re-verify effective backup policy and insert/update the message in one write transaction."""
+        payload = _message_payload(message)
+        now = message.ingested_at or utc_now_iso()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                effective_policy, _source = self._resolve_effective_backup_policy_unlocked(
+                    message.source,
+                    message.account_id,
+                    message.chat_id,
+                    topic_id=int(message.topic_id or 0),
+                )
+                if not effective_policy.get("enabled"):
+                    self._conn.rollback()
+                    return None
+                self._upsert_message_row_unlocked(message, event_type, now)
+                event_seq = self._insert_event(
+                    source=message.source,
+                    account_id=message.account_id,
+                    event_type=event_type,
+                    chat_id=message.chat_id,
+                    message_id=message.message_id,
+                    event_at=now,
+                    payload=payload,
+                )
+                self._conn.commit()
+                return event_seq
+            except Exception:
+                self._conn.rollback()
+                raise
+
+    def _upsert_message_row_unlocked(self, message: MessageRecord, event_type: str, now: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO messages(
+              source, account_id, chat_id, message_id, topic_id, sender_id, sender_name, sender_username,
+              sent_at, edited_at, ingested_at, deleted_at, text, has_media, media_kind,
+              grouped_id, reply_to_message_id, forward_from_id, forward_from_name, permalink,
+              reactions_json, raw_json, version
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+            ON CONFLICT(source, account_id, chat_id, message_id) DO UPDATE SET
+              topic_id = excluded.topic_id,
+              sender_id = excluded.sender_id,
+              sender_name = excluded.sender_name,
+              sender_username = excluded.sender_username,
+              sent_at = excluded.sent_at,
+              edited_at = CASE
+                WHEN excluded.edited_at IS NULL THEN messages.edited_at
+                WHEN messages.edited_at IS NULL OR excluded.edited_at >= messages.edited_at
+                THEN excluded.edited_at
+                ELSE messages.edited_at
+              END,
+              ingested_at = CASE
+                WHEN excluded.ingested_at >= messages.ingested_at THEN excluded.ingested_at
+                ELSE messages.ingested_at
+              END,
+              deleted_at = CASE
+                WHEN excluded.deleted_at IS NULL THEN messages.deleted_at
+                WHEN messages.deleted_at IS NULL OR excluded.deleted_at >= messages.deleted_at
+                THEN excluded.deleted_at
+                ELSE messages.deleted_at
+              END,
+              text = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.text ELSE messages.text
+              END,
+              has_media = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.has_media ELSE messages.has_media
+              END,
+              media_kind = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.media_kind ELSE messages.media_kind
+              END,
+              grouped_id = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.grouped_id ELSE messages.grouped_id
+              END,
+              reply_to_message_id = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.reply_to_message_id ELSE messages.reply_to_message_id
+              END,
+              forward_from_id = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.forward_from_id ELSE messages.forward_from_id
+              END,
+              forward_from_name = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.forward_from_name ELSE messages.forward_from_name
+              END,
+              permalink = COALESCE(excluded.permalink, messages.permalink),
+              reactions_json = CASE
+                WHEN ? = 'backfill'
+                THEN COALESCE(messages.reactions_json, excluded.reactions_json)
+                ELSE COALESCE(excluded.reactions_json, messages.reactions_json)
+              END,
+              raw_json = CASE
+                WHEN messages.edited_at IS NULL
+                  OR (excluded.edited_at IS NOT NULL AND excluded.edited_at >= messages.edited_at)
+                THEN excluded.raw_json ELSE messages.raw_json
+              END,
+              version = messages.version + 1
+            """,
+            (
+                message.source,
+                message.account_id,
+                message.chat_id,
+                message.message_id,
+                message.topic_id,
+                message.sender_id,
+                message.sender_name,
+                message.sender_username,
+                message.sent_at,
+                message.edited_at,
+                now,
+                message.deleted_at,
+                message.text,
+                int(message.has_media),
+                message.media_kind,
+                message.grouped_id,
+                message.reply_to_message_id,
+                message.forward_from_id,
+                message.forward_from_name,
+                message.permalink,
+                message.reactions_json,
+                message.raw_json,
+                event_type,
+            ),
+        )
 
     def mark_deleted(
         self,
@@ -1415,30 +1464,94 @@ class ArchiveStore:
         at = event_at or utc_now_iso()
         seqs: list[int] = []
         with self._lock:
-            for message_id in message_ids:
-                cur = self._conn.execute(
-                    """
-                    UPDATE messages
-                    SET deleted_at = ?, ingested_at = ?, version = version + 1
-                    WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
-                    """,
-                    (at, at, source, account_id, chat_id, message_id),
-                )
-                if cur.rowcount == 0:
-                    continue
-                seqs.append(
-                    self._insert_event(
-                        source=source,
-                        account_id=account_id,
-                        event_type="delete",
-                        chat_id=chat_id,
-                        message_id=message_id,
-                        event_at=at,
-                        payload=raw_payload or {"message_id": message_id},
+            try:
+                for message_id in message_ids:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE messages
+                        SET deleted_at = ?, ingested_at = ?, version = version + 1
+                        WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                        """,
+                        (at, at, source, account_id, chat_id, message_id),
                     )
-                )
-            if seqs:
-                self._conn.commit()
+                    if cur.rowcount == 0:
+                        continue
+                    seqs.append(
+                        self._insert_event(
+                            source=source,
+                            account_id=account_id,
+                            event_type="delete",
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            event_at=at,
+                            payload=raw_payload or {"message_id": message_id},
+                        )
+                    )
+                if seqs:
+                    self._conn.commit()
+                elif self._conn.in_transaction:
+                    self._conn.rollback()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+        return seqs
+
+    def mark_deleted_without_chat(
+        self,
+        source: str,
+        account_id: str,
+        message_ids: list[int],
+        event_at: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> list[int]:
+        """Mark deleted non-channel messages (DM / basic group UpdateDeleteMessages with chat_id=None) when unique."""
+        at = event_at or utc_now_iso()
+        seqs: list[int] = []
+        with self._lock:
+            try:
+                for message_id in message_ids:
+                    matches = self._conn.execute(
+                        """
+                        SELECT chat_id
+                        FROM messages
+                        WHERE source = ? AND account_id = ? AND message_id = ? AND chat_id > -1000000000000
+                        LIMIT 2
+                        """,
+                        (source, account_id, message_id),
+                    ).fetchall()
+                    if len(matches) != 1:
+                        continue
+                    chat_id = int(matches[0]["chat_id"])
+                    cur = self._conn.execute(
+                        """
+                        UPDATE messages
+                        SET deleted_at = ?, ingested_at = ?, version = version + 1
+                        WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                        """,
+                        (at, at, source, account_id, chat_id, message_id),
+                    )
+                    if cur.rowcount == 0:
+                        continue
+                    seqs.append(
+                        self._insert_event(
+                            source=source,
+                            account_id=account_id,
+                            event_type="delete",
+                            chat_id=chat_id,
+                            message_id=message_id,
+                            event_at=at,
+                            payload=raw_payload or {"message_id": message_id},
+                        )
+                    )
+                if seqs:
+                    self._conn.commit()
+                elif self._conn.in_transaction:
+                    self._conn.rollback()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
         return seqs
 
     def update_reactions(
@@ -1454,27 +1567,34 @@ class ArchiveStore:
         at = event_at or utc_now_iso()
         reactions_json = json.dumps(reactions, ensure_ascii=False, default=str)
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE messages
-                SET reactions_json = ?, ingested_at = ?, version = version + 1
-                WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
-                """,
-                (reactions_json, at, source, account_id, chat_id, message_id),
-            )
-            if cur.rowcount == 0:
-                return None
-            seq = self._insert_event(
-                source=source,
-                account_id=account_id,
-                event_type="reaction",
-                chat_id=chat_id,
-                message_id=message_id,
-                event_at=at,
-                payload=raw_payload or {"reactions": reactions},
-            )
-            self._conn.commit()
-            return seq
+            try:
+                cur = self._conn.execute(
+                    """
+                    UPDATE messages
+                    SET reactions_json = ?, ingested_at = ?, version = version + 1
+                    WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                    """,
+                    (reactions_json, at, source, account_id, chat_id, message_id),
+                )
+                if cur.rowcount == 0:
+                    if self._conn.in_transaction:
+                        self._conn.rollback()
+                    return None
+                seq = self._insert_event(
+                    source=source,
+                    account_id=account_id,
+                    event_type="reaction",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    event_at=at,
+                    payload=raw_payload or {"reactions": reactions},
+                )
+                self._conn.commit()
+                return seq
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
 
     def upsert_media_file(self, media_file: MediaFileRecord) -> None:

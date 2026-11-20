@@ -233,6 +233,13 @@ class ArchiveStoreTest(unittest.TestCase):
     def test_delete_skips_unarchived_message_without_creating_tombstone(self) -> None:
         seqs = self.store.mark_deleted(SOURCE_TELEGRAM, -1002, [99], event_at=utc_now_iso())
         self.assertEqual(seqs, [])
+        self.assertFalse(self.store._conn.in_transaction)
+        other = sqlite3.connect(str(self.store.database_path), isolation_level=None, timeout=0.1)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+        finally:
+            other.close()
         self.assertEqual(self.store.list_messages_after(after_event_seq=0)["items"], [])
         self.assertEqual(self.store.list_events(after=0)["items"], [])
 
@@ -535,6 +542,13 @@ class ArchiveStoreTest(unittest.TestCase):
             event_at=utc_now_iso(),
         )
         self.assertIsNone(seq)
+        self.assertFalse(self.store._conn.in_transaction)
+        other = sqlite3.connect(str(self.store.database_path), isolation_level=None, timeout=0.1)
+        try:
+            other.execute("BEGIN IMMEDIATE")
+            other.execute("ROLLBACK")
+        finally:
+            other.close()
         self.assertEqual(self.store.list_messages_after(after_event_seq=0)["items"], [])
         self.assertEqual(self.store.list_events(after=0)["items"], [])
 
@@ -616,6 +630,47 @@ class ArchiveStoreTest(unittest.TestCase):
         )
         self.assertEqual(archived_source, "archived")
         self.assertFalse(archived_child["enabled"])
+
+    def test_mark_deleted_without_chat_matches_unique_non_channel_message_only(self) -> None:
+        now = utc_now_iso()
+        for chat_id, message_id, text in (
+            (555001, 10, "dm message"),
+            (-777001, 11, "basic group message"),
+            (-1000000000999, 12, "channel message"),
+            (555001, 13, "ambiguous dm"),
+            (-777001, 13, "ambiguous group"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    sent_at=now,
+                    ingested_at=now,
+                    text=text,
+                ),
+                event_type="new",
+            )
+
+        seqs = self.store.mark_deleted_without_chat(
+            SOURCE_TELEGRAM,
+            "main",
+            [10, 11, 12, 13, 999],
+            event_at=now,
+        )
+        self.assertEqual(len(seqs), 2)
+        self.assertFalse(self.store._conn.in_transaction)
+        by_key = {
+            (item["chat_id"], item["message_id"]): item
+            for item in self.store.list_latest_messages(limit=20)["items"]
+        }
+        self.assertIsNotNone(by_key[(555001, 10)]["deleted_at"])
+        self.assertIsNotNone(by_key[(-777001, 11)]["deleted_at"])
+        self.assertIsNone(by_key[(-1000000000999, 12)]["deleted_at"])
+        self.assertIsNone(by_key[(555001, 13)]["deleted_at"])
+        self.assertIsNone(by_key[(-777001, 13)]["deleted_at"])
+        self.assertEqual(len(by_key), 5)
 
     def test_same_chat_message_can_exist_in_multiple_accounts(self) -> None:
         now = utc_now_iso()

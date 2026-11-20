@@ -3,7 +3,7 @@
 This file is generated from `tele_mess_core.server.contracts`.
 
 - Contract version: `2026-11-20.1`
-- Contract hash: `d1af9f6c886d7e86`
+- Contract hash: `f16be4b2ff70d8ad`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1710,8 +1710,8 @@ JSON-RPC 2.0 response carrying either result or error.
 | `discovered_at` | `string` | no |
 | `updated_at` | `string` | no |
 | `parent_title` | `string` | no |
-| `backup_policy` | `BackupPolicy` | no |
-| `effective_backup_policy` | `BackupPolicy` | no |
+| `backup_policy` | `OriginBackupPolicy` | no |
+| `effective_backup_policy` | `OriginBackupPolicy` | no |
 | `policy_source` | `string` | no |
 | `raw_json` | `object` | no |
 
@@ -1730,6 +1730,18 @@ JSON-RPC 2.0 response carrying either result or error.
 | Field | Type | Required |
 | --- | --- | --- |
 | `item` | `object` | yes |
+
+### OriginBackupPolicy
+
+| Field | Type | Required |
+| --- | --- | --- |
+| `enabled` | `boolean` | yes |
+| `capture_text` | `boolean` | yes |
+| `capture_media_metadata` | `boolean` | yes |
+| `download_media` | `boolean` | yes |
+| `download_stickers` | `boolean` | yes |
+| `tags` | `string` | no |
+| `updated_at` | `string` | no |
 
 ### OriginDeleteResponse
 

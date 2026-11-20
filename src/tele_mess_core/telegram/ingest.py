@@ -52,6 +52,7 @@ class TelegramArchiveService:
         self._retry_task: asyncio.Task[None] | None = None
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
+        self._inflight_fetches: dict[tuple[int, int], list[dict[str, bool]]] = {}
 
     async def run(self) -> None:
         from telethon import TelegramClient
@@ -108,45 +109,57 @@ class TelegramArchiveService:
 
         @client.on(events.MessageDeleted())
         async def on_delete(event: Any) -> None:
-            chat_id = getattr(event, "chat_id", None)
-            if chat_id is None:
-                return
-            deleted_ids = [int(mid) for mid in event.deleted_ids]
+            deleted_ids = [int(mid) for mid in getattr(event, "deleted_ids", None) or []]
             if not deleted_ids:
                 return
+            chat_id = getattr(event, "chat_id", None)
             at = utc_now_iso()
-            raw = {"deleted_ids": list(event.deleted_ids)}
-            for candidate_chat_id in _candidate_chat_ids(int(chat_id)):
-                if self.store.mark_deleted(
+            raw = {"deleted_ids": list(deleted_ids)}
+            if chat_id is None:
+                for deleted_id in deleted_ids:
+                    matches = [
+                        states
+                        for (cid, mid), states in self._inflight_fetches.items()
+                        if mid == deleted_id and cid > -1000000000000
+                    ]
+                    if len(matches) == 1:
+                        for state in matches[0]:
+                            state["deleted"] = True
+                self.store.mark_deleted_without_chat(
                     source=SOURCE_TELEGRAM,
                     account_id=self.account_id,
-                    chat_id=candidate_chat_id,
                     message_ids=deleted_ids,
                     event_at=at,
                     raw_payload=raw,
-                ):
-                    break
+                )
+                return
+            target_chat_id = int(chat_id)
+            for deleted_id in deleted_ids:
+                for state in self._inflight_fetches.get((target_chat_id, deleted_id), ()):
+                    state["deleted"] = True
+            self.store.mark_deleted(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                chat_id=target_chat_id,
+                message_ids=deleted_ids,
+                event_at=at,
+                raw_payload=raw,
+            )
 
         @client.on(events.Raw)
         async def on_raw(event: Any) -> None:
             if not isinstance(event, UpdateMessageReactions):
                 return
-            peer_id = utils.get_peer_id(event.peer)
-            reactions = _reaction_payload(event)
-            at = utc_now_iso()
-            raw = _safe_dict(event)
-            for candidate_chat_id in _candidate_chat_ids(peer_id):
-                seq = self.store.update_reactions(
-                    source=SOURCE_TELEGRAM,
-                    account_id=self.account_id,
-                    chat_id=candidate_chat_id,
-                    message_id=int(event.msg_id),
-                    reactions=reactions,
-                    event_at=at,
-                    raw_payload=raw,
-                )
-                if seq is not None:
-                    break
+            chat_id = int(utils.get_peer_id(event.peer))
+            self.store.update_reactions(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                chat_id=chat_id,
+                message_id=int(event.msg_id),
+                reactions=_reaction_payload(event),
+                event_at=utc_now_iso(),
+                raw_payload=_safe_dict(event),
+            )
 
         self._handlers_registered = True
 
@@ -248,6 +261,7 @@ class TelegramArchiveService:
 
     async def _store_message(self, message: Any, event_type: str) -> bool:
         chat_id = int(message.chat_id)
+        message_id = int(message.id)
         topic_id = _topic_id(message)
         policy = self._policy_for(chat_id, topic_id)
         if not policy.get("enabled", False):
@@ -272,52 +286,70 @@ class TelegramArchiveService:
             )
         )
 
-        sender = None
-        chat = None
+        fetch_key = (chat_id, message_id)
+        fetch_state = {"deleted": False}
+        self._inflight_fetches.setdefault(fetch_key, []).append(fetch_state)
         try:
-            sender = await message.get_sender()
-        except Exception as exc:
-            self.logger.debug("Failed to fetch sender for %s: %s", getattr(message, "id", "?"), exc)
-        try:
-            chat = await message.get_chat()
-        except Exception as exc:
-            self.logger.debug("Failed to fetch chat for %s: %s", getattr(message, "id", "?"), exc)
+            sender = None
+            chat = None
+            try:
+                sender = await message.get_sender()
+            except Exception as exc:
+                self.logger.debug("Failed to fetch sender for %s: %s", getattr(message, "id", "?"), exc)
+            try:
+                chat = await message.get_chat()
+            except Exception as exc:
+                self.logger.debug("Failed to fetch chat for %s: %s", getattr(message, "id", "?"), exc)
 
-        if chat:
-            self.store.upsert_chat(_chat_record(self.account_id, chat, chat_id=chat_id))
-        if sender:
-            self.store.upsert_user(_user_record(self.account_id, sender))
+            if fetch_state["deleted"]:
+                return False
 
-        record = MessageRecord(
-            source=SOURCE_TELEGRAM,
-            account_id=self.account_id,
-            chat_id=chat_id,
-            message_id=int(message.id),
-            topic_id=topic_id,
-            sender_id=getattr(sender, "id", None) if sender else getattr(message, "sender_id", None),
-            sender_name=_display_name(sender),
-            sender_username=getattr(sender, "username", None) if sender else None,
-            sent_at=sent_at,
-            edited_at=to_iso(getattr(message, "edit_date", None)),
-            ingested_at=utc_now_iso(),
-            text=message_text,
-            has_media=captures_media,
-            media_kind=type(message.media).__name__ if captures_media else None,
-            grouped_id=str(message.grouped_id)
-            if captures_media and getattr(message, "grouped_id", None)
-            else None,
-            reply_to_message_id=getattr(message, "reply_to_msg_id", None),
-            forward_from_id=_forward_from_id(message),
-            forward_from_name=_forward_from_name(message),
-            permalink=_permalink(chat, message, chat_id=int(message.chat_id)),
-            reactions_json=json.dumps(_message_reactions(message), ensure_ascii=False, default=str)
-            if getattr(message, "reactions", None)
-            else None,
-            raw_json=json.dumps(_safe_dict(message), ensure_ascii=False, default=str)
-            if capture_media_metadata and (not is_sticker_like or download_stickers)
-            else None,
-        )
-        self.store.upsert_message(record, event_type=event_type)
+            record = MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                chat_id=chat_id,
+                message_id=message_id,
+                topic_id=topic_id,
+                sender_id=getattr(sender, "id", None) if sender else getattr(message, "sender_id", None),
+                sender_name=_display_name(sender),
+                sender_username=getattr(sender, "username", None) if sender else None,
+                sent_at=sent_at,
+                edited_at=to_iso(getattr(message, "edit_date", None)),
+                ingested_at=utc_now_iso(),
+                text=message_text,
+                has_media=captures_media,
+                media_kind=type(message.media).__name__ if captures_media else None,
+                grouped_id=str(message.grouped_id)
+                if captures_media and getattr(message, "grouped_id", None)
+                else None,
+                reply_to_message_id=getattr(message, "reply_to_msg_id", None),
+                forward_from_id=_forward_from_id(message),
+                forward_from_name=_forward_from_name(message),
+                permalink=_permalink(chat, message, chat_id=int(message.chat_id)),
+                reactions_json=json.dumps(_message_reactions(message), ensure_ascii=False, default=str)
+                if getattr(message, "reactions", None)
+                else None,
+                raw_json=json.dumps(_safe_dict(message), ensure_ascii=False, default=str)
+                if capture_media_metadata and (not is_sticker_like or download_stickers)
+                else None,
+            )
+            seq = self.store.upsert_message_if_policy_enabled(record, event_type=event_type)
+            if seq is None:
+                return False
+            if chat:
+                self.store.upsert_chat(_chat_record(self.account_id, chat, chat_id=chat_id))
+            if sender:
+                self.store.upsert_user(_user_record(self.account_id, sender))
+        finally:
+            bucket = self._inflight_fetches.get(fetch_key)
+            if bucket is not None:
+                try:
+                    bucket.remove(fetch_state)
+                except ValueError:
+                    pass
+                if not bucket:
+                    self._inflight_fetches.pop(fetch_key, None)
+
         should_download_media = download_stickers if is_sticker_like else download_media
         if should_download_media and _message_media_downloadable(
             message,
@@ -334,7 +366,7 @@ class TelegramArchiveService:
             )
             if not existing_media:
                 await self._download_message_media(message, record)
-        self._update_capture_cursor(chat_id, topic_id, int(message.id), record.sent_at)
+        self._update_capture_cursor(chat_id, topic_id, message_id, record.sent_at)
         return True
 
 
@@ -814,13 +846,6 @@ def _topic_id(message: Any) -> int | None:
     if top_id:
         return int(top_id)
     return None
-
-
-def _candidate_chat_ids(peer_id: int) -> list[int]:
-    candidates = [int(peer_id)]
-    if peer_id > 0:
-        candidates.append(int(f"-100{peer_id}"))
-    return candidates
 
 
 def _dedupe_capture_targets(targets: list[CaptureTarget]) -> list[CaptureTarget]:

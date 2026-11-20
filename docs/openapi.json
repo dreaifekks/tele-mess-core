@@ -2167,7 +2167,7 @@
             "type": "string"
           },
           "backup_policy": {
-            "$ref": "#/components/schemas/BackupPolicy",
+            "$ref": "#/components/schemas/OriginBackupPolicy",
             "nullable": true
           },
           "discovered_at": {
@@ -2175,7 +2175,7 @@
             "type": "string"
           },
           "effective_backup_policy": {
-            "$ref": "#/components/schemas/BackupPolicy"
+            "$ref": "#/components/schemas/OriginBackupPolicy"
           },
           "important": {
             "type": "boolean"
@@ -2298,6 +2298,42 @@
         },
         "required": [
           "item"
+        ],
+        "type": "object"
+      },
+      "OriginBackupPolicy": {
+        "properties": {
+          "capture_media_metadata": {
+            "type": "boolean"
+          },
+          "capture_text": {
+            "type": "boolean"
+          },
+          "download_media": {
+            "type": "boolean"
+          },
+          "download_stickers": {
+            "description": "Download sticker and custom-emoji document files independently of download_media; their emoji text is always archived.",
+            "type": "boolean"
+          },
+          "enabled": {
+            "type": "boolean"
+          },
+          "tags": {
+            "nullable": true,
+            "type": "string"
+          },
+          "updated_at": {
+            "nullable": true,
+            "type": "string"
+          }
+        },
+        "required": [
+          "enabled",
+          "capture_text",
+          "capture_media_metadata",
+          "download_media",
+          "download_stickers"
         ],
         "type": "object"
       },
@@ -2725,7 +2761,7 @@
   "info": {
     "title": "tele-mess-core API",
     "version": "2026-11-20.1",
-    "x-contract-hash": "d1af9f6c886d7e86"
+    "x-contract-hash": "f16be4b2ff70d8ad"
   },
   "openapi": "3.1.0",
   "paths": {

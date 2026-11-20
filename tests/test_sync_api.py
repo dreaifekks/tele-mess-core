@@ -986,9 +986,13 @@ class SyncApiTest(unittest.TestCase):
             method="POST",
             payload={"account_id": "main", "origin_id": -1001, "enabled": True, "tags": "forum-tag"},
         )
+        origins_response = self.request_json("/manage/origins?account_id=main")
+        from tele_mess_core.server.contracts import SCHEMAS, validate_schema_value
+
+        validate_schema_value(origins_response, SCHEMAS["OriginListResponse"], "response")
         origins_after_parent = {
             (item["origin_id"], item["topic_id"]): item
-            for item in self.request_json("/manage/origins?account_id=main")["items"]
+            for item in origins_response["items"]
         }
         inherited_topic = origins_after_parent[(-1001, 123)]
         self.assertIsNone(inherited_topic["backup_policy"])

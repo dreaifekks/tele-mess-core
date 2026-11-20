@@ -1221,6 +1221,94 @@ class DailyPackagingTest(unittest.TestCase):
             [10],
         )
 
+    def test_daily_package_policy_only_topic_and_policy_only_parent_preserve_tag_isolation(self) -> None:
+        # Case A: parent has origins + web3 policy; topic 20 has ONLY enabled ai policy (no origins row).
+        self._origin(-4010, "Web3 Parent", "web3")
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -4010, topic_id=20, enabled=True, tags="ai")
+        )
+        for mid, tid, text in ((1, None, "parent msg"), (20, 20, "ai-only topic msg")):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-4010,
+                    topic_id=tid,
+                    message_id=mid,
+                    sent_at="2026-07-03T02:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=text,
+                ),
+                event_type="new",
+            )
+
+        web3_pkg = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tags": "web3"},
+        )
+        web3_payload = json.loads(Path(web3_pkg["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [m["message_id"] for o in web3_payload["point_origins"] for m in o["messages"]],
+            [1],
+        )
+
+        ai_pkg = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tags": "ai"},
+        )
+        ai_payload = json.loads(Path(ai_pkg["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [m["message_id"] for o in ai_payload["point_origins"] for m in o["messages"]],
+            [20],
+        )
+
+        # Case B: parent has ONLY backup_policy (no origins row); child topic 30 has origins row inheriting parent.
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -4011, enabled=True, tags="web3")
+        )
+        self.store.upsert_origin(
+            OriginRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                origin_id=-4011,
+                topic_id=30,
+                parent_origin_id=-4011,
+                origin_type="topic",
+                title="Inherited Without Parent Row",
+            )
+        )
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-4011,
+                topic_id=30,
+                message_id=30,
+                sent_at="2026-07-03T02:00:00+00:00",
+                ingested_at=utc_now_iso(),
+                text="inherited topic msg",
+            ),
+            event_type="new",
+        )
+        topic30_pkg = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "origin_id": -4011, "topic_id": 30, "tags": "web3"},
+        )
+        topic30_payload = json.loads(Path(topic30_pkg["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [m["message_id"] for o in topic30_payload["point_origins"] for m in o["messages"]],
+            [30],
+        )
+
     def test_cli_daily_package_and_summary_commands_run(self) -> None:
         self._origin(-3001, "CLI Daily", "cli,info")
         self.store.upsert_message(

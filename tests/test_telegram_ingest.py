@@ -1035,6 +1035,131 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(items[0]["deleted_at"])
         self.assertIsNotNone(items[0]["reactions_json"])
 
+    async def test_positive_peer_user_reaction_does_not_corrupt_channel_message(self) -> None:
+        from telethon.tl.types import MessageReactions, PeerUser, ReactionCount, ReactionEmoji, UpdateMessageReactions
+        from tele_mess_core.models import MessageRecord, utc_now_iso
+
+        handlers: list[tuple[object, object]] = []
+
+        class HandlerClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+        self.service.register_handlers(HandlerClient())
+        on_raw = handlers[3][1]
+        assert callable(on_raw)
+
+        # Channel -1001234567890 has archived message 88; DM PeerUser(1234567890) does not.
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                chat_id=-1001234567890,
+                message_id=88,
+                sent_at=now,
+                ingested_at=now,
+                text="channel message 88",
+            ),
+            event_type="new",
+        )
+        dm_reaction = UpdateMessageReactions(
+            peer=PeerUser(user_id=1234567890),
+            msg_id=88,
+            reactions=MessageReactions(results=[ReactionCount(reaction=ReactionEmoji(emoticon="🔥"), count=1)]),
+        )
+        await on_raw(dm_reaction)
+
+        items = self.store.list_latest_messages()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["chat_id"], -1001234567890)
+        self.assertIsNone(items[0]["reactions_json"])
+        self.assertFalse(self.store._conn.in_transaction)
+
+    async def test_inflight_store_message_aborts_on_concurrent_delete_or_archive_and_handles_chatless_delete(self) -> None:
+        from tele_mess_core.models import OriginRecord
+
+        handlers: list[tuple[object, object]] = []
+
+        class HandlerClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+        self.service.register_handlers(HandlerClient())
+        on_delete = handlers[2][1]
+        assert callable(on_delete)
+
+        self.store.upsert_origin(OriginRecord(SOURCE_TELEGRAM, "main", -2020, "group", title="Forum", is_forum=True))
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", -2020, "topic", topic_id=5, parent_origin_id=-2020, title="Topic 5")
+        )
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", -2020, enabled=True))
+
+        # 1) Concurrent delete while _store_message is paused in await get_sender().
+        entered_del = asyncio.Event()
+        release_del = asyncio.Event()
+
+        class PausingMessage(FakeMessage):
+            def __init__(self, *args, entered: asyncio.Event, release: asyncio.Event, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._entered = entered
+                self._release = release
+
+            async def get_sender(self):
+                self._entered.set()
+                await self._release.wait()
+                return await super().get_sender()
+
+        msg1 = PausingMessage(
+            101,
+            -2020,
+            text="deleted while in flight",
+            reply_to=SimpleNamespace(reply_to_top_id=5),
+            entered=entered_del,
+            release=release_del,
+        )
+        task1 = asyncio.create_task(self.service._store_message(msg1, event_type="backfill"))
+        await asyncio.wait_for(entered_del.wait(), timeout=1.0)
+        await on_delete(SimpleNamespace(chat_id=-2020, deleted_ids=[101]))
+        release_del.set()
+        self.assertFalse(await task1)
+        self.assertEqual(self.store.list_latest_messages()["items"], [])
+
+        # 2) Concurrent topic archive while _store_message is paused in await get_sender().
+        entered_arch = asyncio.Event()
+        release_arch = asyncio.Event()
+        msg2 = PausingMessage(
+            102,
+            -2020,
+            text="archived while in flight",
+            reply_to=SimpleNamespace(reply_to_top_id=5),
+            entered=entered_arch,
+            release=release_arch,
+        )
+        task2 = asyncio.create_task(self.service._store_message(msg2, event_type="backfill"))
+        await asyncio.wait_for(entered_arch.wait(), timeout=1.0)
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -2020, topic_id=5, archived=True)
+        release_arch.set()
+        self.assertFalse(await task2)
+        self.assertEqual(self.store.list_latest_messages()["items"], [])
+
+        # 3) Chatless delete (UpdateDeleteMessages with chat_id=None) marks DM & basic group messages.
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", 9001, enabled=True))
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", -500, enabled=True))
+        self.assertTrue(await self.service._store_message(FakeMessage(10, 9001, text="dm"), event_type="new"))
+        self.assertTrue(await self.service._store_message(FakeMessage(11, -500, text="group"), event_type="new"))
+        await on_delete(SimpleNamespace(chat_id=None, deleted_ids=[10, 11, 999]))
+        by_id = {item["message_id"]: item for item in self.store.list_latest_messages()["items"]}
+        self.assertEqual(set(by_id), {10, 11})
+        self.assertIsNotNone(by_id[10]["deleted_at"])
+        self.assertIsNotNone(by_id[11]["deleted_at"])
+
 
 if __name__ == "__main__":
     unittest.main()

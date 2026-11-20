@@ -180,8 +180,9 @@ def _list_sources(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any]:
             if parent is not None and parent["title"]:
                 title = f"{parent['title']} / {title or origin['topic_id']}"
         policy = origin.get("effective_backup_policy") or {}
-        tags = parse_tags(policy.get("tags"))
-        if enabled_only and not policy.get("enabled"):
+        enabled = bool(policy.get("enabled"))
+        tags = parse_tags(policy.get("tags")) if enabled else []
+        if enabled_only and not enabled:
             continue
         if args.get("important_only") and not origin["important"]:
             continue

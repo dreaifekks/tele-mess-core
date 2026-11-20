@@ -802,6 +802,8 @@ class McpApiTest(unittest.TestCase):
         self.assertNotIn("disabled-only", overview["tags"])
         disabled_entry = next(item for item in all_sources["sources"] if item.get("topic_id") == 8)
         self.assertFalse(disabled_entry["enabled"])
+        self.assertNotIn("tags", disabled_entry)
+        self.assertEqual(self.call("list_sources", {"enabled_only": False, "tag": "disabled-only"})["total"], 0)
 
 
 if __name__ == "__main__":

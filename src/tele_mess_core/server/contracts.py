@@ -266,8 +266,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "discovered_at": {"type": "string", "nullable": True},
             "updated_at": {"type": "string", "nullable": True},
             "parent_title": {"type": "string", "nullable": True},
-            "backup_policy": {"$ref": "#/components/schemas/BackupPolicy", "nullable": True},
-            "effective_backup_policy": {"$ref": "#/components/schemas/BackupPolicy"},
+            "backup_policy": {"$ref": "#/components/schemas/OriginBackupPolicy", "nullable": True},
+            "effective_backup_policy": {"$ref": "#/components/schemas/OriginBackupPolicy"},
             "policy_source": {"type": "string", "enum": ["self", "parent", "archived", "none"]},
             "raw_json": {"type": "object", "nullable": True},
         },
@@ -308,6 +308,24 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "archived": {"type": "boolean", "default": True},
         },
         required=["account_id", "origin_id"],
+    ),
+    "OriginBackupPolicy": _object(
+        {
+            "enabled": {"type": "boolean"},
+            "capture_text": {"type": "boolean"},
+            "capture_media_metadata": {"type": "boolean"},
+            "download_media": {"type": "boolean"},
+            "download_stickers": {
+                "type": "boolean",
+                "description": (
+                    "Download sticker and custom-emoji document files independently of download_media; "
+                    "their emoji text is always archived."
+                ),
+            },
+            "tags": {"type": "string", "nullable": True},
+            "updated_at": {"type": "string", "nullable": True},
+        },
+        required=["enabled", "capture_text", "capture_media_metadata", "download_media", "download_stickers"],
     ),
     "BackupPolicy": _object(
         {
