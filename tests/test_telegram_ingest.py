@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import errno
+import os
 import tempfile
 import unittest
 from datetime import datetime, timezone
@@ -2463,6 +2465,276 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         # Legacy flat files are completely untouched.
         self.assertEqual((target_dir / "report.bin").read_bytes(), b"legacy-report")
         self.assertEqual((target_dir / "report_m351_t1.bin").read_bytes(), b"legacy-m351")
+
+    async def test_transient_cleanup_failure_preserves_download_attempt_budget(self) -> None:
+        from unittest import mock
+
+        chat_id = -1084
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=2, retry_delay_seconds=0.01, stale_seconds=60.0),
+        )
+        msg = FakeMessage(360, chat_id, media=MessageMediaDocument())
+        service.client = FakeMediaClient(msg)
+
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        claimed1 = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed1 is not None
+        job_id = claimed1["job_id"]
+        orphan_dir = target_dir / f"{job_id}-t1"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        orphan_file = orphan_dir / "360.bin"
+        orphan_file.write_bytes(b"leftover")
+        self.assertEqual(
+            self.store.record_media_download_pending_path(
+                job_id,
+                expected_claim_token=1,
+                pending_file_path=str(orphan_file),
+            ),
+            "ok",
+        )
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        self.store._conn.commit()
+
+        # Fail ONLY the first unlink inside _execute_media_download_job on reclaim;
+        # the second unlink inside retry_media_download_job succeeds.
+        orig_unlink = Path.unlink
+        fail_once = {"remaining": 1}
+
+        def fail_first_unlink(path_self: Path, *args, **kwargs):
+            if path_self == orphan_file and fail_once["remaining"] > 0:
+                fail_once["remaining"] -= 1
+                raise PermissionError("transient lock")
+            return orig_unlink(path_self, *args, **kwargs)
+
+        claimed2 = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed2 is not None
+        self.assertEqual(claimed2["attempts"], 2)
+        with mock.patch.object(Path, "unlink", fail_first_unlink):
+            await service._execute_media_download_job(claimed2)
+
+        mid_job = self.store.get_media_download_job(job_id)
+        assert mid_job is not None
+        self.assertEqual(mid_job["status"], "retry")
+        self.assertEqual(mid_job["attempts"], 1)
+        self.assertIsNone(mid_job["pending_file_path"])
+        self.assertEqual(msg.download_attempts, 0)
+        self.assertFalse(orphan_file.exists())
+
+        # Once due, the preserved final attempt downloads and completes cleanly.
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET next_attempt_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        self.store._conn.commit()
+        await service.process_pending_media_downloads()
+
+        final_job = self.store.get_media_download_job(job_id)
+        assert final_job is not None
+        self.assertEqual(final_job["status"], "completed")
+        self.assertEqual(msg.download_attempts, 1)
+        self.assertEqual(len(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=360)), 1)
+
+    async def test_concurrent_cleanup_does_not_remove_active_publish_directory_between_mkdir_and_replace(self) -> None:
+        from unittest import mock
+
+        chat_id = -1085
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        worker1 = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.01, stale_seconds=60.0),
+        )
+        store2 = ArchiveStore(self.store.database_path)
+        try:
+            worker2 = TelegramArchiveService(
+                self.config,
+                store2,
+                media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.01, stale_seconds=60.0),
+            )
+            msg = FakeMessage(361, chat_id, media=MessageMediaDocument())
+            worker1.client = FakeMediaClient(msg)
+            self.assertTrue(await worker1._store_message(msg, event_type="new"))
+
+            orig_replace = os.replace
+            ran_concurrent_cleanup = {"count": 0}
+
+            def replace_with_concurrent_cleanup(src, dst):
+                dst_path = Path(dst)
+                self.assertTrue(dst_path.parent.is_dir())
+                ran_concurrent_cleanup["count"] += 1
+                worker2._cleanup_orphan_media_artifacts()
+                self.assertTrue(dst_path.parent.is_dir())
+                return orig_replace(src, dst)
+
+            with mock.patch("tele_mess_core.telegram.ingest.os.replace", side_effect=replace_with_concurrent_cleanup):
+                await worker1.process_pending_media_downloads()
+
+            self.assertEqual(ran_concurrent_cleanup["count"], 1)
+            files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=361)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(Path(files[0]["file_path"]).exists())
+            jobs = [
+                j
+                for j in self.store.list_media_download_jobs(account_id="main")
+                if j["chat_id"] == chat_id and j["message_id"] == 361
+            ]
+            self.assertEqual(jobs[0]["status"], "completed")
+        finally:
+            store2.close()
+
+    async def test_eacces_stat_and_unlink_preserves_pending_and_superseded_paths_for_retry(self) -> None:
+        from unittest import mock
+
+        chat_id = -1086
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.01, stale_seconds=60.0),
+        )
+
+        # Part A: Both unlink and stat raising EACCES must NOT clear pending_file_path.
+        msg_a = FakeMessage(370, chat_id, media=MessageMediaDocument())
+        self.assertTrue(await service._store_message(msg_a, event_type="new"))
+        claimed_a = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed_a is not None
+        job_a_id = claimed_a["job_id"]
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        orphan_a_dir = target_dir / f"{job_a_id}-t1"
+        orphan_a_dir.mkdir(parents=True, exist_ok=True)
+        orphan_a = orphan_a_dir / "370.bin"
+        orphan_a.write_bytes(b"eacces-orphan")
+        self.assertEqual(
+            self.store.record_media_download_pending_path(
+                job_a_id,
+                expected_claim_token=1,
+                pending_file_path=str(orphan_a),
+            ),
+            "ok",
+        )
+        self.store.fail_media_download_job(
+            job_a_id,
+            error="aborted",
+            error_code="aborted",
+            expected_claim_token=1,
+        )
+        # Re-attach orphan_a on the failed job to test cleanup_media_download_pending_path under EACCES on unlink+stat.
+        orphan_a_dir.mkdir(parents=True, exist_ok=True)
+        orphan_a.write_bytes(b"eacces-orphan")
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET pending_file_path = ? WHERE job_id = ?",
+            (str(orphan_a), job_a_id),
+        )
+        self.store._conn.commit()
+
+        orig_unlink = Path.unlink
+        orig_stat = Path.stat
+
+        def eacces_unlink(path_self: Path, *args, **kwargs):
+            if path_self == orphan_a:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_unlink(path_self, *args, **kwargs)
+
+        def eacces_stat(path_self: Path, *args, **kwargs):
+            if path_self == orphan_a:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_stat(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", eacces_unlink), mock.patch.object(Path, "stat", eacces_stat):
+            cleared, unlinked = self.store.cleanup_media_download_pending_path(
+                job_a_id,
+                expected_claim_token=1,
+                require_downloading=False,
+            )
+            self.assertFalse(cleared)
+            self.assertIsNone(unlinked)
+        job_a_after = self.store.get_media_download_job(job_a_id)
+        assert job_a_after is not None
+        self.assertEqual(job_a_after["pending_file_path"], str(orphan_a))
+        self.assertTrue(orphan_a.exists())
+
+        # Once EACCES clears, orphan cleanup removes orphan_a and clears pending_file_path.
+        self.assertFalse(service._cleanup_orphan_media_artifacts())
+        self.assertFalse(orphan_a.exists())
+        self.assertFalse(orphan_a_dir.exists())
+        job_a_cleaned = self.store.get_media_download_job(job_a_id)
+        assert job_a_cleaned is not None
+        self.assertIsNone(job_a_cleaned["pending_file_path"])
+
+        # Part B: Attachment replacement persists superseded path for retry when post-commit unlink fails with EACCES.
+        class PayloadMessage(FakeMessage):
+            def __init__(self, payload: bytes, edit_date: datetime | None = None) -> None:
+                super().__init__(371, chat_id, media=MessageMediaDocument())
+                self._payload = payload
+                self.edit_date = edit_date
+
+            async def download_media(self, file: str) -> str:
+                path = Path(file) / "photo.bin"
+                path.write_bytes(self._payload)
+                return str(path)
+
+        msg_v1 = PayloadMessage(b"v1-bytes")
+        service.client = FakeMediaClient(msg_v1)
+        self.assertTrue(await service._store_message(msg_v1, event_type="new"))
+        await service.process_pending_media_downloads()
+        v1_files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=371)
+        self.assertEqual(len(v1_files), 1)
+        v1_path = Path(v1_files[0]["file_path"])
+        self.assertTrue(v1_path.exists())
+
+        msg_v2 = PayloadMessage(b"v2-bytes", edit_date=datetime(2026, 3, 2, 12, 0, tzinfo=timezone.utc))
+        service.client = FakeMediaClient(msg_v2)
+        self.assertTrue(await service._store_message(msg_v2, event_type="edit"))
+
+        def eacces_v1_unlink(path_self: Path, *args, **kwargs):
+            if path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_unlink(path_self, *args, **kwargs)
+
+        def eacces_v1_stat(path_self: Path, *args, **kwargs):
+            if path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_stat(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", eacces_v1_unlink), mock.patch.object(Path, "stat", eacces_v1_stat):
+            await service.process_pending_media_downloads(max_jobs=1)
+
+        v2_files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=371)
+        self.assertEqual(len(v2_files), 1)
+        v2_path = Path(v2_files[0]["file_path"])
+        self.assertEqual(v2_path.read_bytes(), b"v2-bytes")
+        self.assertTrue(v1_path.exists())
+        job_b = next(
+            j
+            for j in self.store.list_media_download_jobs(account_id="main")
+            if j["chat_id"] == chat_id and j["message_id"] == 371
+        )
+        assert job_b is not None
+        self.assertEqual(job_b["status"], "completed")
+        self.assertEqual(job_b["pending_file_path"], str(v1_path))
+
+        # Later cleanup pass retries and deletes the superseded v1 file and its empty directory.
+        self.assertFalse(service._cleanup_orphan_media_artifacts())
+        self.assertFalse(v1_path.exists())
+        self.assertFalse(v1_path.parent.exists())
+        job_b_cleaned = self.store.get_media_download_job(job_b["job_id"])
+        assert job_b_cleaned is not None
+        self.assertIsNone(job_b_cleaned["pending_file_path"])
+        self.assertTrue(v2_path.exists())
 
 
 if __name__ == "__main__":

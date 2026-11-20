@@ -2587,12 +2587,18 @@ class ArchiveStore:
                         "downloaded_at": published.downloaded_at or now,
                     },
                 )
+                if (
+                    old_path is not None
+                    and old_path != published.file_path
+                    and not self._media_file_path_referenced_unlocked(old_path)
+                ):
+                    superseded_file_path = old_path
                 self._conn.execute(
                     """
                     UPDATE media_download_jobs
                     SET status = 'completed',
                         replace_existing = 0,
-                        pending_file_path = NULL,
+                        pending_file_path = ?,
                         next_attempt_at = NULL,
                         last_error = NULL,
                         error_code = NULL,
@@ -2600,14 +2606,8 @@ class ArchiveStore:
                         completed_at = ?
                     WHERE job_id = ? AND claim_token = ?
                     """,
-                    (now, now, job_id, int(expected_claim_token)),
+                    (superseded_file_path, now, now, job_id, int(expected_claim_token)),
                 )
-                if (
-                    old_path is not None
-                    and old_path != published.file_path
-                    and not self._media_file_path_referenced_unlocked(old_path)
-                ):
-                    superseded_file_path = old_path
                 self._conn.commit()
             except Exception:
                 if self._conn.in_transaction:
@@ -2619,7 +2619,11 @@ class ArchiveStore:
                         pass
                 raise
         if superseded_file_path is not None:
-            _unlink_file_confirmed(superseded_file_path)
+            self.cleanup_media_download_pending_path(
+                job_id,
+                expected_claim_token=expected_claim_token,
+                require_downloading=False,
+            )
         return "completed", published
 
     def retry_media_download_job(
@@ -5976,24 +5980,26 @@ def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:
 
 
 def _unlink_file_confirmed(file_path: str) -> bool:
-    """Remove file_path (and its empty job-claim publish directory, if any) and return True only when absent."""
+    """Remove file_path (and its empty job-claim publish directory, if any).
+
+    Returns True only when unlink succeeds or raises FileNotFoundError; any other
+    OSError (such as EACCES/EBUSY) returns False so callers keep the path for retry.
+    """
     path = Path(file_path)
     try:
         path.unlink()
-        removed = True
     except FileNotFoundError:
-        removed = True
+        pass
     except OSError:
-        removed = not path.exists()
-    if removed:
-        parent = path.parent
-        parent_name = parent.name
-        if parent_name.startswith("mdj_") and "-t" in parent_name:
-            try:
-                parent.rmdir()
-            except OSError:
-                pass
-    return removed
+        return False
+    parent = path.parent
+    parent_name = parent.name
+    if parent_name.startswith("mdj_") and "-t" in parent_name:
+        try:
+            parent.rmdir()
+        except OSError:
+            pass
+    return True
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

@@ -387,19 +387,10 @@ class TelegramArchiveService:
                         if should_remove:
                             try:
                                 shutil.rmtree(entry)
-                            except OSError:
-                                if entry.exists():
-                                    has_remaining = True
-                    elif entry.name.startswith("mdj_") and "-t" in entry.name:
-                        try:
-                            next(entry.iterdir())
-                        except StopIteration:
-                            try:
-                                entry.rmdir()
-                            except OSError:
+                            except FileNotFoundError:
                                 pass
-                        except OSError:
-                            pass
+                            except OSError:
+                                has_remaining = True
         for pending in self.store.list_media_jobs_with_pending_paths(
             account_id=self.account_id,
             source=SOURCE_TELEGRAM,
@@ -950,6 +941,20 @@ class TelegramArchiveService:
             if error.code == "flood_wait":
                 wait_seconds = max(1.0, float(error.retry_after or 30))
                 next_at = (datetime.now(dt_timezone.utc) + timedelta(seconds=wait_seconds)).isoformat()
+                self.store.retry_media_download_job(
+                    job_id,
+                    error=error.message,
+                    error_code=error.code,
+                    next_attempt_at=next_at,
+                    expected_claim_token=claim_token,
+                    preserve_attempt_budget=True,
+                )
+                return
+            if error.code == "media_cleanup_failed":
+                base_delay = max(0.01, float(self.media_download.retry_delay_seconds))
+                max_delay = max(base_delay, float(self.media_download.max_retry_delay_seconds))
+                backoff = min(base_delay * (2 ** max(0, attempts - 1)), max_delay)
+                next_at = (datetime.now(dt_timezone.utc) + timedelta(seconds=backoff)).isoformat()
                 self.store.retry_media_download_job(
                     job_id,
                     error=error.message,
