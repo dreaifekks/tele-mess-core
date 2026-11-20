@@ -189,15 +189,6 @@ class TelegramArchiveService:
         if not await client.is_user_authorized():
             raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
         now = utc_now_iso()
-        self.store.upsert_account(
-            AccountRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                display_name=self.account_id,
-                kind="telegram",
-                updated_at=now,
-            )
-        )
         self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
@@ -206,7 +197,14 @@ class TelegramArchiveService:
                 session_name=self.config.session_name,
                 session_dir=str(self.config.session_dir),
                 updated_at=now,
-            )
+            ),
+            account_record=AccountRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                display_name=self.account_id,
+                kind="telegram",
+                updated_at=now,
+            ),
         )
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):

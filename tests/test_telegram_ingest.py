@@ -4089,6 +4089,179 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                     await manager.stop()
             local_store.close()
 
+    async def test_delayed_auth_status_write_after_delete_cannot_resurrect_deleted_account(self) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.server.api import _auth_status, _create_management_account, _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "delayed_auth_write_vs_delete.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered_write = threading.Event()
+            release_write = threading.Event()
+            write_finished = threading.Event()
+            paused_once = {"done": False}
+            orig_upsert_auth = local_store.upsert_account_auth
+            write_results: list[bool] = []
+
+            def delayed_upsert_auth(auth, *args, **kwargs):
+                if auth.account_id == "dyn" and kwargs.get("owner_id") and not paused_once["done"]:
+                    paused_once["done"] = True
+                    entered_write.set()
+                    release_write.wait(timeout=5.0)
+                    wrote = orig_upsert_auth(auth, *args, **kwargs)
+                    write_results.append(wrote)
+                    write_finished.set()
+                    return wrote
+                return orig_upsert_auth(auth, *args, **kwargs)
+
+            class AuthOnlyClient:
+                def __init__(self) -> None:
+                    self._connected = False
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_me(self):
+                    return SimpleNamespace(id=77, first_name="Dyn", last_name=None, username="dyn", phone="+10000")
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: AuthOnlyClient(),
+                ingest=False,
+                management_timeout_seconds=0.15,
+            )
+            with mock.patch.object(local_store, "upsert_account_auth", side_effect=delayed_upsert_auth):
+                await manager.start()
+                try:
+                    # Start auth/status so its store-write thread blocks right before upsert_account_auth.
+                    auth_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _auth_status,
+                            {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                            manager,
+                        )
+                    )
+                    self.assertTrue(await asyncio.to_thread(entered_write.wait, 2.0))
+                    # Delete "dyn" while the stale auth write thread is still delayed (even if stop() timed out join).
+                    await asyncio.to_thread(
+                        _delete_management_account,
+                        local_store,
+                        {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                        manager,
+                    )
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                    # Release the delayed write: SQLite MUST atomically reject both account_auth and accounts!
+                    release_write.set()
+                    self.assertTrue(await asyncio.to_thread(write_finished.wait, 2.0))
+                    await asyncio.wait_for(auth_task, timeout=3.0)
+                    self.assertEqual(write_results, [False])
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+                    acc_rows = local_store._conn.execute(
+                        "SELECT * FROM accounts WHERE source = ? AND account_id = ?",
+                        (SOURCE_TELEGRAM, "dyn"),
+                    ).fetchall()
+                    auth_rows = local_store._conn.execute(
+                        "SELECT * FROM account_auth WHERE source = ? AND account_id = ?",
+                        (SOURCE_TELEGRAM, "dyn"),
+                    ).fetchall()
+                    self.assertEqual(acc_rows, [])
+                    self.assertEqual(auth_rows, [])
+
+                    # Owner-only writes (without expected_seq) from an old runtime are also rejected while deleted.
+                    self.assertFalse(
+                        orig_upsert_auth(
+                            AccountAuthRecord(
+                                source=SOURCE_TELEGRAM,
+                                account_id="dyn",
+                                auth_state="pending_code",
+                                session_name="dyn",
+                                session_dir=str(self.config.session_dir),
+                            ),
+                            owner_id="old-owner",
+                            owner_epoch=99,
+                            account_record=AccountRecord(SOURCE_TELEGRAM, "dyn", "dyn", "telegram"),
+                        )
+                    )
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                    # Explicit recreation clears the deletion tombstone and allows normal future runtime writes.
+                    created = await asyncio.to_thread(
+                        _create_management_account,
+                        app_config,
+                        local_store,
+                        {
+                            "source": SOURCE_TELEGRAM,
+                            "account_id": "dyn",
+                            "display_name": "Dynamic v2",
+                            "session_dir": str(self.config.session_dir),
+                        },
+                        manager,
+                    )
+                    self.assertEqual(created["account_id"], "dyn")
+                    self.assertTrue(
+                        orig_upsert_auth(
+                            AccountAuthRecord(
+                                source=SOURCE_TELEGRAM,
+                                account_id="dyn",
+                                auth_state="authorized",
+                                session_name="dyn",
+                                session_dir=str(self.config.session_dir),
+                            ),
+                            owner_id="new-owner",
+                            owner_epoch=1,
+                            account_record=AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic v2", "telegram"),
+                        )
+                    )
+                finally:
+                    release_write.set()
+                    await manager.stop()
+            local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

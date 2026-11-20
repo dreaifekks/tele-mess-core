@@ -305,6 +305,13 @@ class TelegramAuthService:
             updated_at=now,
             raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
         )
+        account_record = AccountRecord(
+            source=SOURCE_TELEGRAM,
+            account_id=self.account_id,
+            display_name=self.account_id,
+            kind="telegram",
+            updated_at=now,
+        )
         if probe is not None:
             expected_seq, owner_id, owner_epoch = probe
             wrote = self.store.upsert_account_auth(
@@ -313,6 +320,7 @@ class TelegramAuthService:
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
                 extra_meta=extra_meta,
+                account_record=account_record,
             )
         elif self._auth_owner_provider is not None:
             owner_id, owner_epoch = self._auth_owner_provider()
@@ -321,21 +329,15 @@ class TelegramAuthService:
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
                 extra_meta=extra_meta,
+                account_record=account_record,
             )
         else:
-            wrote = self.store.upsert_account_auth(auth_record, extra_meta=extra_meta)
-        if not wrote:
-            return False
-        self.store.upsert_account(
-            AccountRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                display_name=self.account_id,
-                kind="telegram",
-                updated_at=now,
+            wrote = self.store.upsert_account_auth(
+                auth_record,
+                extra_meta=extra_meta,
+                account_record=account_record,
             )
-        )
-        return True
+        return wrote
 
     def _record_operation(self, operation: str, status: str, error: Any | None = None) -> None:
         self.store.add_operation_event(

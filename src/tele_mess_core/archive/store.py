@@ -317,23 +317,53 @@ class ArchiveStore:
             (key, value),
         )
 
+    def _upsert_account_unlocked(self, account: AccountRecord, now: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO accounts(source, account_id, display_name, kind, updated_at, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id) DO UPDATE SET
+              display_name = excluded.display_name,
+              kind = excluded.kind,
+              updated_at = excluded.updated_at,
+              raw_json = excluded.raw_json
+            """,
+            (account.source, account.account_id, account.display_name, account.kind, now, account.raw_json),
+        )
+
     def upsert_account(self, account: AccountRecord) -> None:
         now = account.updated_at or utc_now_iso()
+        seq_key = f"auth_state_seq:{account.source}:{account.account_id}"
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO accounts(source, account_id, display_name, kind, updated_at, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id) DO UPDATE SET
-                  display_name = excluded.display_name,
-                  kind = excluded.kind,
-                  updated_at = excluded.updated_at,
-                  raw_json = excluded.raw_json
-                """,
-                (account.source, account.account_id, account.display_name, account.kind, now, account.raw_json),
-            )
-            self._conn.commit()
-
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (seq_key,),
+                ).fetchone()
+                existing_seq, existing_owner, _existing_epoch = _parse_auth_state_meta(
+                    row["value"] if row is not None else None
+                )
+                if existing_owner == "__deleted__":
+                    self._conn.execute(
+                        """
+                        INSERT INTO meta(key, value) VALUES (?, ?)
+                        ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                        """,
+                        (
+                            seq_key,
+                            json.dumps(
+                                {"seq": existing_seq + 1, "owner": "", "epoch": 0},
+                                separators=(",", ":"),
+                            ),
+                        ),
+                    )
+                self._upsert_account_unlocked(account, now)
+                self._conn.commit()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
     def get_auth_state_seq(self, source: str, account_id: str) -> int:
         seq_key = f"auth_state_seq:{source}:{account_id}"
@@ -348,6 +378,7 @@ class ArchiveStore:
         owner_id: str | None = None,
         owner_epoch: int | None = None,
         extra_meta: dict[str, str] | None = None,
+        account_record: AccountRecord | None = None,
     ) -> bool:
         now = auth.updated_at or utc_now_iso()
         seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
@@ -361,6 +392,9 @@ class ArchiveStore:
                 existing_seq, existing_owner, existing_epoch = _parse_auth_state_meta(
                     row["value"] if row is not None else None
                 )
+                if owner_id is not None and existing_owner == "__deleted__":
+                    self._conn.rollback()
+                    return False
                 if expected_seq is not None:
                     same_owner_newer = (
                         owner_id is not None
@@ -432,6 +466,8 @@ class ArchiveStore:
                         auth.raw_json,
                     ),
                 )
+                if account_record is not None:
+                    self._upsert_account_unlocked(account_record, account_record.updated_at or now)
                 self._conn.commit()
                 return True
             except Exception:
@@ -441,10 +477,31 @@ class ArchiveStore:
     def delete_management_account(self, source: str, account_id: str) -> int:
         deleted = 0
         deleted_job_ids: set[str] = set()
+        seq_key = f"auth_state_seq:{source}:{account_id}"
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 now = utc_now_iso()
+                seq_row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (seq_key,),
+                ).fetchone()
+                existing_seq, _existing_owner, _existing_epoch = _parse_auth_state_meta(
+                    seq_row["value"] if seq_row is not None else None
+                )
+                self._conn.execute(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (
+                        seq_key,
+                        json.dumps(
+                            {"seq": existing_seq + 1, "owner": "__deleted__", "epoch": 0},
+                            separators=(",", ":"),
+                        ),
+                    ),
+                )
                 deleted_job_ids = {
                     str(row["job_id"])
                     for row in self._conn.execute(
