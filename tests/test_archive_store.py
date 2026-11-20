@@ -306,6 +306,39 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(self.store.search_messages("historical")[0]["message_id"], 13)
 
+    def test_upgrade_that_failed_after_migrating_is_finished_on_next_open(self) -> None:
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1001,
+                message_id=15,
+                sent_at=now,
+                ingested_at=now,
+                text="interrupted upgrade payload",
+            ),
+            event_type="new",
+        )
+        with self.store._lock:
+            self.store._conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS messages_ai;
+                DROP TRIGGER IF EXISTS messages_ad;
+                DROP TRIGGER IF EXISTS messages_au;
+                DROP TABLE message_fts;
+                """
+            )
+            self.store.set_meta("schema_version", str(SCHEMA_VERSION - 1))
+            self.store._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+            self.store._conn.commit()
+
+        with patch.object(ArchiveStore, "_rebuild_message_fts", side_effect=sqlite3.OperationalError("disk is full")):
+            with self.assertRaises(sqlite3.OperationalError):
+                self.store.initialize()
+        self.store.initialize()
+
+        self.assertEqual(self.store.search_messages("interrupted")[0]["message_id"], 15)
+
     def test_upgrade_repairs_existing_empty_fts_index(self) -> None:
         now = utc_now_iso()
         self.store.upsert_message(

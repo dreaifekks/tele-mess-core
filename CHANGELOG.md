@@ -23,7 +23,8 @@ validation rules.
   runs DDL or recreates the full-text triggers, so messages written by a
   concurrent process are always indexed. `schema.sql` is now the complete
   current schema, and the full-text index is checked and rebuilt only during
-  upgrades.
+  upgrades. An upgrade that fails after its migrations is finished on the next
+  open instead of leaving the full-text index unrepaired.
 
 ## 0.3.5 - 2026-10-13
 

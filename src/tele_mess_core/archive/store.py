@@ -43,6 +43,7 @@ from tele_mess_core.media import (
 
 
 SCHEMA_VERSION = 19
+UPGRADE_PENDING_META = "upgrade_pending"
 LEGACY_SCHEMA_BASELINE = 12
 
 # Compact message projection shared by the read-only message queries; a topic's
@@ -144,7 +145,7 @@ class ArchiveStore:
             try:
                 existing_schema_version = self._validate_existing_schema_version()
                 self._conn.execute("PRAGMA journal_mode = WAL")
-                if existing_schema_version == SCHEMA_VERSION:
+                if existing_schema_version == SCHEMA_VERSION and self.get_meta(UPGRADE_PENDING_META) is None:
                     return
                 if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
                     self._conn.executescript(_schema_sql())
@@ -153,6 +154,7 @@ class ArchiveStore:
                 if self.get_meta("database_id") is None:
                     self.set_meta("database_id", str(uuid.uuid4()))
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
+                self._conn.execute("DELETE FROM meta WHERE key = ?", (UPGRADE_PENDING_META,))
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._conn.commit()
             except Exception:
@@ -166,6 +168,10 @@ class ArchiveStore:
             self._migrate_v1_to_v2()
         else:
             self._conn.executescript(tables_sql)
+        # Migrations commit one by one; the marker keeps the fast path closed
+        # until the triggers and the full-text index are rebuilt as well.
+        self.set_meta(UPGRADE_PENDING_META, "1")
+        self._conn.commit()
         rebuild_message_fts = not message_fts_existed or not self._message_fts_integrity_is_valid()
         self._ensure_current_schema()
         current_version = self.get_meta("schema_version")
@@ -180,7 +186,10 @@ class ArchiveStore:
             "DROP TRIGGER IF EXISTS messages_au;\n" + objects_sql
         )
         if rebuild_message_fts:
-            self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
+            self._rebuild_message_fts()
+
+    def _rebuild_message_fts(self) -> None:
+        self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
 
     def _validate_existing_schema_version(self) -> int:
         user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
