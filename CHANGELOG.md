@@ -32,7 +32,7 @@ validation rules.
   by another process while an upgrade replaces the full-text triggers are
   indexed. A current archive missing a table, index, or trigger of the schema,
   such as one left by an interrupted open of an earlier release, is repaired
-  on open.
+  on open, and one missing its `database_id` gets one.
 - Telegram accounts are resolved in one place for the runtime, the management
   API, and daily delivery. The runtime no longer starts a Telegram client for a
   management account of another source, and enabling delivery to an account

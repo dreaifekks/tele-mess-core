@@ -1552,6 +1552,30 @@ class ArchiveMigrationTest(unittest.TestCase):
             finally:
                 conn.close()
 
+    def test_current_database_missing_its_id_gets_one_without_schema_changes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "archive.db"
+            store = ArchiveStore(database_path)
+            store.initialize()
+            store.close()
+            conn = sqlite3.connect(database_path)
+            conn.execute("DELETE FROM meta WHERE key = 'database_id'")
+            conn.commit()
+            cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.close()
+
+            reopened = ArchiveStore(database_path)
+            reopened.initialize()
+            database_id = reopened.get_meta("database_id")
+            reopened.close()
+
+            self.assertIsNotNone(database_id)
+            conn = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(conn.execute("PRAGMA schema_version").fetchone()[0], cookie)
+            finally:
+                conn.close()
+
     def test_initialize_rejects_newer_database_before_schema_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "future.db"

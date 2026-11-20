@@ -152,6 +152,11 @@ class ArchiveStore:
                     and self.get_meta(UPGRADE_PENDING_META) is None
                     and self._has_schema_objects()
                 ):
+                    # An open of an earlier release interrupted after its last
+                    # migration can leave the archive without its ID.
+                    if self.get_meta("database_id") is None:
+                        self.set_meta("database_id", str(uuid.uuid4()))
+                        self._conn.commit()
                     return
                 if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
                     self._conn.executescript(_schema_sql())
