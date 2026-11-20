@@ -4262,6 +4262,274 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                     await manager.stop()
             local_store.close()
 
+    async def test_rejected_auth_status_write_does_not_schedule_ingestion_or_resurrect_deleted_account(
+        self,
+    ) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.server.api import _auth_status, _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rejected_auth_no_ingest.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="needs_login",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered_write = threading.Event()
+            release_write = threading.Event()
+            paused_once = {"done": False}
+            orig_upsert_auth = local_store.upsert_account_auth
+
+            def delayed_upsert_auth(auth, *args, **kwargs):
+                if (
+                    auth.account_id == "dyn"
+                    and auth.auth_state == "authorized"
+                    and kwargs.get("expected_seq") is not None
+                    and not paused_once["done"]
+                ):
+                    paused_once["done"] = True
+                    entered_write.set()
+                    release_write.wait(timeout=5.0)
+                return orig_upsert_auth(auth, *args, **kwargs)
+
+            class FlippingAuthClient:
+                def __init__(self) -> None:
+                    self._connected = False
+                    self.authorized = False
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return self.authorized
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            dyn_client = FlippingAuthClient()
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: dyn_client if cfg.account_id == "dyn" else FlippingAuthClient(),
+                ingest=True,
+                management_timeout_seconds=5.0,
+            )
+            with mock.patch.object(local_store, "upsert_account_auth", side_effect=delayed_upsert_auth):
+                await manager.start()
+                try:
+                    # Wait for supervisor's initial unauthorized check to settle, then flip client to authorized.
+                    await asyncio.sleep(0.08)
+                    old_runtime = manager._runtimes["dyn"]
+                    dyn_client.authorized = True
+                    auth_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _auth_status,
+                            {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                            manager,
+                        )
+                    )
+                    self.assertTrue(await asyncio.to_thread(entered_write.wait, 2.0))
+                    # Delete "dyn" while auth/status write is delayed; stop() finishes and DELETE commits.
+                    await asyncio.to_thread(
+                        _delete_management_account,
+                        local_store,
+                        {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                        manager,
+                    )
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                    # Release the delayed write: auth/status MUST return conflict (authorized=False)
+                    # and old runtime MUST NOT schedule ingestion or resurrect "dyn".
+                    release_write.set()
+                    status_result = await asyncio.wait_for(auth_task, timeout=3.0)
+                    self.assertFalse(status_result["authorized"])
+                    self.assertEqual(status_result["auth_state"], "conflict")
+                    self.assertEqual(status_result["error"]["code"], "auth_state_conflict")
+                    await asyncio.sleep(0.08)
+                    self.assertIsNone(old_runtime._ingest_task)
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                    # Even if a stale TelegramArchiveService from the old runtime calls activate(),
+                    # its generation/owner-fenced write is rejected and does NOT clear the deletion mark.
+                    stale_service = TelegramArchiveService(
+                        old_runtime.config,
+                        local_store,
+                        auth_owner_provider=old_runtime._next_auth_mutation_owner,
+                        account_generation=old_runtime._account_generation,
+                    )
+                    await stale_service.activate(dyn_client)
+                    self.assertIsNone(stale_service._media_worker_task)
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+                finally:
+                    release_write.set()
+                    await manager.stop()
+            local_store.close()
+
+    async def test_recreated_account_rejects_old_owner_only_and_old_generation_writes_preserving_new_session_name(
+        self,
+    ) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.server.api import _create_management_account
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "recreate_rejects_old_owner.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(accounts=[self.config]),
+            )
+            try:
+                _create_management_account(
+                    app_config,
+                    local_store,
+                    {
+                        "source": SOURCE_TELEGRAM,
+                        "account_id": "dyn",
+                        "session_name": "old",
+                        "session_dir": str(self.config.session_dir),
+                    },
+                    None,
+                )
+                gen_before_delete = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                # Old owner writes once before deletion.
+                self.assertTrue(
+                    local_store.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="code_sent",
+                            session_name="old",
+                            session_dir=str(self.config.session_dir),
+                        ),
+                        owner_id="old-owner",
+                        owner_epoch=1,
+                        expected_generation=gen_before_delete,
+                    )
+                )
+
+                # Delete and explicitly recreate with session_name="new".
+                local_store.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                _create_management_account(
+                    app_config,
+                    local_store,
+                    {
+                        "source": SOURCE_TELEGRAM,
+                        "account_id": "dyn",
+                        "session_name": "new",
+                        "session_dir": str(self.config.session_dir),
+                    },
+                    None,
+                )
+                gen_after_recreate = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                self.assertGreater(gen_after_recreate, gen_before_delete)
+
+                # Owner-only write (no expected_seq, no expected_generation) from revoked old-owner MUST be rejected.
+                self.assertFalse(
+                    local_store.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="authorized",
+                            session_name="old",
+                            session_dir=str(self.config.session_dir),
+                        ),
+                        owner_id="old-owner",
+                        owner_epoch=99,
+                        account_record=AccountRecord(SOURCE_TELEGRAM, "dyn", "old", "telegram"),
+                    )
+                )
+                # Old-generation write from a never-written pre-delete runtime MUST also be rejected.
+                self.assertFalse(
+                    local_store.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="authorized",
+                            session_name="old",
+                            session_dir=str(self.config.session_dir),
+                        ),
+                        owner_id="old-owner-unwritten",
+                        owner_epoch=1,
+                        expected_generation=gen_before_delete,
+                        account_record=AccountRecord(SOURCE_TELEGRAM, "dyn", "old", "telegram"),
+                    )
+                )
+                acct = local_store.get_management_account(SOURCE_TELEGRAM, "dyn")
+                assert acct is not None
+                self.assertEqual(acct["session_name"], "new")
+
+                # New runtime in the recreated generation writes cleanly.
+                self.assertTrue(
+                    local_store.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="authorized",
+                            session_name="new",
+                            session_dir=str(self.config.session_dir),
+                        ),
+                        owner_id="new-owner",
+                        owner_epoch=1,
+                        expected_generation=gen_after_recreate,
+                        account_record=AccountRecord(SOURCE_TELEGRAM, "dyn", "dyn", "telegram"),
+                    )
+                )
+                acct_after = local_store.get_management_account(SOURCE_TELEGRAM, "dyn")
+                assert acct_after is not None
+                self.assertEqual(acct_after["session_name"], "new")
+                self.assertEqual(acct_after["auth_state"], "authorized")
+            finally:
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

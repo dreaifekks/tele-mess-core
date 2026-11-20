@@ -19,6 +19,7 @@ class TelegramAuthService:
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
         auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
         auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
+        account_generation: int | None = None,
         store_write_runner: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ):
         self.config = config
@@ -27,6 +28,7 @@ class TelegramAuthService:
         self._error_persister = error_persister
         self._auth_probe_provider = auth_probe_provider
         self._auth_owner_provider = auth_owner_provider
+        self._account_generation = account_generation
         self._store_write_runner = store_write_runner
         self.logger = logging.getLogger(__name__)
 
@@ -40,7 +42,9 @@ class TelegramAuthService:
         try:
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
-            await self._run_write(lambda st=state, pr=probe: self._record_state(st, probe=pr))
+            wrote = await self._run_write(lambda st=state, pr=probe: self._record_state(st, probe=pr))
+            if not wrote:
+                return self._conflict_result("auth_status", phone="")
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
         except Exception as exc:
             return self._handle_rpc_error(
@@ -319,6 +323,7 @@ class TelegramAuthService:
                 expected_seq=expected_seq,
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
+                expected_generation=self._account_generation,
                 extra_meta=extra_meta,
                 account_record=account_record,
             )
@@ -328,12 +333,14 @@ class TelegramAuthService:
                 auth_record,
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
+                expected_generation=self._account_generation,
                 extra_meta=extra_meta,
                 account_record=account_record,
             )
         else:
             wrote = self.store.upsert_account_auth(
                 auth_record,
+                expected_generation=self._account_generation,
                 extra_meta=extra_meta,
                 account_record=account_record,
             )

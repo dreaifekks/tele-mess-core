@@ -78,6 +78,10 @@ class TelegramAccountRuntime:
         self._diagnostic_threads: set[threading.Thread] = set()
         self._runtime_owner_id = uuid.uuid4().hex
         self._auth_state_epoch = 0
+        try:
+            self._account_generation = self.store.get_account_generation(SOURCE_TELEGRAM, config.account_id)
+        except Exception:
+            self._account_generation = 0
 
     def _next_auth_state_epoch(self) -> int:
         with self._diagnostic_lock:
@@ -199,9 +203,10 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).status(client=client)
-            if result.get("authorized"):
+            if result.get("authorized") and not self._stopping.is_set():
                 self._schedule_ingestion(client)
             return result
         if operation == "request_code":
@@ -211,6 +216,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).request_code(
                 str(kwargs["phone"]),
@@ -223,6 +229,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).submit_code(
                 str(kwargs["phone"]),
@@ -230,7 +237,7 @@ class TelegramAccountRuntime:
                 kwargs.get("password"),
                 client=client,
             )
-            if result.get("authorized"):
+            if result.get("authorized") and not self._stopping.is_set():
                 self._schedule_ingestion(client)
             return result
         if operation == "discover_origins":
@@ -239,6 +246,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).discover_origins(
                 include_topics=bool(kwargs.get("include_topics", True)),
@@ -253,6 +261,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).refresh_participants(
                 int(kwargs["origin_id"]),
@@ -611,6 +620,8 @@ class TelegramAccountRuntime:
             self.store,
             self.app_config.telegram.backfill,
             self.app_config.telegram.media_download,
+            auth_owner_provider=self._next_auth_mutation_owner,
+            account_generation=self._account_generation,
         )
         register_handlers = getattr(service, "register_handlers", None)
         if callable(register_handlers):
@@ -619,7 +630,7 @@ class TelegramAccountRuntime:
         return service
 
     def _schedule_ingestion(self, client: Any) -> None:
-        if not self.ingest or self._ingest_task is not None:
+        if not self.ingest or self._stopping.is_set() or self.client is not client or self._ingest_task is not None:
             return
         retry_task = self._ingest_retry_task
         if retry_task is not None and not retry_task.done():
@@ -708,6 +719,8 @@ class TelegramAccountRuntime:
             expected_seq, owner_id, owner_epoch = probe
             if self._auth_state_epoch != owner_epoch:
                 return
+        if probe is None:
+            owner_id, owner_epoch = self._next_auth_mutation_owner()
         self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
@@ -721,6 +734,7 @@ class TelegramAccountRuntime:
             expected_seq=expected_seq,
             owner_id=owner_id,
             owner_epoch=owner_epoch,
+            expected_generation=self._account_generation,
         )
 
     def _record_runtime_failure(

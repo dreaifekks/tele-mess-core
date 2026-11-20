@@ -10,7 +10,7 @@ import shutil
 import threading
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import BackfillConfig, MediaDownloadConfig, TelegramAccountConfig
@@ -54,12 +54,17 @@ class TelegramArchiveService:
         store: ArchiveStore,
         backfill: BackfillConfig | None = None,
         media_download: MediaDownloadConfig | None = None,
+        *,
+        auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
+        account_generation: int | None = None,
     ):
         self.config = config
         self.backfill = backfill or BackfillConfig()
         self.media_download = media_download or MediaDownloadConfig()
         self.account_id = config.account_id
         self.store = store
+        self._auth_owner_provider = auth_owner_provider
+        self._account_generation = account_generation
         self.logger = logging.getLogger(__name__)
         self.client = None
         self._handlers_registered = False
@@ -189,7 +194,11 @@ class TelegramArchiveService:
         if not await client.is_user_authorized():
             raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
         now = utc_now_iso()
-        self.store.upsert_account_auth(
+        owner_id: str | None = None
+        owner_epoch: int | None = None
+        if self._auth_owner_provider is not None:
+            owner_id, owner_epoch = self._auth_owner_provider()
+        wrote = self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -198,6 +207,9 @@ class TelegramArchiveService:
                 session_dir=str(self.config.session_dir),
                 updated_at=now,
             ),
+            owner_id=owner_id,
+            owner_epoch=owner_epoch,
+            expected_generation=self._account_generation,
             account_record=AccountRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -206,6 +218,8 @@ class TelegramArchiveService:
                 updated_at=now,
             ),
         )
+        if not wrote:
+            return
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):
             await catch_up()

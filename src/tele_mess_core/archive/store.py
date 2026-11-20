@@ -341,8 +341,8 @@ class ArchiveStore:
                     "SELECT value FROM meta WHERE key = ?",
                     (seq_key,),
                 ).fetchone()
-                existing_seq, existing_owner, _existing_epoch = _parse_auth_state_meta(
-                    row["value"] if row is not None else None
+                existing_seq, existing_owner, _existing_epoch, existing_gen, existing_revoked, existing_active = (
+                    _parse_auth_state_meta(row["value"] if row is not None else None)
                 )
                 if existing_owner == "__deleted__":
                     self._conn.execute(
@@ -352,9 +352,13 @@ class ArchiveStore:
                         """,
                         (
                             seq_key,
-                            json.dumps(
-                                {"seq": existing_seq + 1, "owner": "", "epoch": 0},
-                                separators=(",", ":"),
+                            _encode_auth_state_meta(
+                                seq=existing_seq + 1,
+                                owner="",
+                                epoch=0,
+                                generation=existing_gen,
+                                revoked_owners=existing_revoked,
+                                active_owners=existing_active,
                             ),
                         ),
                     )
@@ -367,8 +371,13 @@ class ArchiveStore:
 
     def get_auth_state_seq(self, source: str, account_id: str) -> int:
         seq_key = f"auth_state_seq:{source}:{account_id}"
-        seq, _owner, _epoch = _parse_auth_state_meta(self.get_meta(seq_key))
+        seq, _owner, _epoch, _gen, _revoked, _active = _parse_auth_state_meta(self.get_meta(seq_key))
         return seq
+
+    def get_account_generation(self, source: str, account_id: str) -> int:
+        seq_key = f"auth_state_seq:{source}:{account_id}"
+        _seq, _owner, _epoch, gen, _revoked, _active = _parse_auth_state_meta(self.get_meta(seq_key))
+        return gen
 
     def upsert_account_auth(
         self,
@@ -377,6 +386,7 @@ class ArchiveStore:
         expected_seq: int | None = None,
         owner_id: str | None = None,
         owner_epoch: int | None = None,
+        expected_generation: int | None = None,
         extra_meta: dict[str, str] | None = None,
         account_record: AccountRecord | None = None,
     ) -> bool:
@@ -389,10 +399,15 @@ class ArchiveStore:
                     "SELECT value FROM meta WHERE key = ?",
                     (seq_key,),
                 ).fetchone()
-                existing_seq, existing_owner, existing_epoch = _parse_auth_state_meta(
-                    row["value"] if row is not None else None
+                existing_seq, existing_owner, existing_epoch, existing_gen, existing_revoked, existing_active = (
+                    _parse_auth_state_meta(row["value"] if row is not None else None)
                 )
-                if owner_id is not None and existing_owner == "__deleted__":
+                if owner_id is not None and (
+                    existing_owner == "__deleted__" or owner_id in existing_revoked
+                ):
+                    self._conn.rollback()
+                    return False
+                if expected_generation is not None and int(expected_generation) != existing_gen:
                     self._conn.rollback()
                     return False
                 if expected_seq is not None:
@@ -414,13 +429,18 @@ class ArchiveStore:
                     self._conn.rollback()
                     return False
                 target_seq = existing_seq + 1
-                meta_value = json.dumps(
-                    {
-                        "seq": target_seq,
-                        "owner": owner_id or "",
-                        "epoch": int(owner_epoch) if owner_epoch is not None else 0,
-                    },
-                    separators=(",", ":"),
+                active_owners = list(existing_active)
+                if owner_id:
+                    if owner_id in active_owners:
+                        active_owners.remove(owner_id)
+                    active_owners.append(owner_id)
+                meta_value = _encode_auth_state_meta(
+                    seq=target_seq,
+                    owner=owner_id or "",
+                    epoch=int(owner_epoch) if owner_epoch is not None else 0,
+                    generation=existing_gen,
+                    revoked_owners=existing_revoked,
+                    active_owners=active_owners,
                 )
                 self._conn.execute(
                     """
@@ -486,9 +506,17 @@ class ArchiveStore:
                     "SELECT value FROM meta WHERE key = ?",
                     (seq_key,),
                 ).fetchone()
-                existing_seq, _existing_owner, _existing_epoch = _parse_auth_state_meta(
-                    seq_row["value"] if seq_row is not None else None
+                existing_seq, existing_owner, _existing_epoch, existing_gen, existing_revoked, existing_active = (
+                    _parse_auth_state_meta(seq_row["value"] if seq_row is not None else None)
                 )
+                revoked = list(existing_revoked)
+                for candidate in (*existing_active, existing_owner):
+                    if candidate and candidate != "__deleted__":
+                        if candidate in revoked:
+                            revoked.remove(candidate)
+                        revoked.append(candidate)
+                if len(revoked) > 64:
+                    revoked = revoked[-64:]
                 self._conn.execute(
                     """
                     INSERT INTO meta(key, value) VALUES (?, ?)
@@ -496,9 +524,13 @@ class ArchiveStore:
                     """,
                     (
                         seq_key,
-                        json.dumps(
-                            {"seq": existing_seq + 1, "owner": "__deleted__", "epoch": 0},
-                            separators=(",", ":"),
+                        _encode_auth_state_meta(
+                            seq=existing_seq + 1,
+                            owner="__deleted__",
+                            epoch=0,
+                            generation=existing_gen + 1,
+                            revoked_owners=revoked,
+                            active_owners=(),
                         ),
                     ),
                 )
@@ -6431,24 +6463,63 @@ def resolve_effective_policy(
     return (default_disabled_backup_policy(), "none")
 
 
-def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:
+def _parse_auth_state_meta(
+    raw: str | None,
+) -> tuple[int, str, int, int, tuple[str, ...], tuple[str, ...]]:
     if raw is None:
-        return (0, "", 0)
+        return (0, "", 0, 0, (), ())
     text = str(raw).strip()
     if not text:
-        return (0, "", 0)
+        return (0, "", 0, 0, (), ())
     if text.isdigit():
-        return (int(text), "", 0)
+        return (int(text), "", 0, 0, (), ())
     try:
         parsed = json.loads(text)
     except Exception:
-        return (0, "", 0)
+        return (0, "", 0, 0, (), ())
     if isinstance(parsed, dict):
         seq = int(parsed.get("seq") or 0)
         owner = str(parsed.get("owner") or "")
         epoch = int(parsed.get("epoch") or 0)
-        return (seq, owner, epoch)
-    return (0, "", 0)
+        generation = int(parsed.get("gen") or 0)
+        revoked_raw = parsed.get("revoked_owners")
+        revoked: tuple[str, ...] = (
+            tuple(str(item) for item in revoked_raw if isinstance(item, str) and item)
+            if isinstance(revoked_raw, list)
+            else ()
+        )
+        active_raw = parsed.get("active_owners")
+        active: tuple[str, ...] = (
+            tuple(str(item) for item in active_raw if isinstance(item, str) and item)
+            if isinstance(active_raw, list)
+            else ()
+        )
+        return (seq, owner, epoch, generation, revoked, active)
+    return (0, "", 0, 0, (), ())
+
+
+def _encode_auth_state_meta(
+    *,
+    seq: int,
+    owner: str,
+    epoch: int,
+    generation: int,
+    revoked_owners: Iterable[str],
+    active_owners: Iterable[str] = (),
+) -> str:
+    payload: dict[str, Any] = {
+        "seq": int(seq),
+        "owner": owner,
+        "epoch": int(epoch),
+        "gen": int(generation),
+    }
+    revoked_list = [str(item) for item in revoked_owners if item]
+    if revoked_list:
+        payload["revoked_owners"] = revoked_list[-64:]
+    active_list = [str(item) for item in active_owners if item]
+    if active_list:
+        payload["active_owners"] = active_list[-64:]
+    return json.dumps(payload, separators=(",", ":"))
 
 
 def _parse_media_staging_dir_name(name: str) -> tuple[str, int] | None:
