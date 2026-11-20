@@ -1022,6 +1022,8 @@ def _delete_management_account(
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         telegram_runtime.unregister_account(account_id)
     deleted_rows = store.delete_management_account(source, account_id)
+    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+        telegram_runtime.trigger_media_cleanup()
     return {"source": source, "account_id": account_id, "deleted_rows": deleted_rows}
 
 

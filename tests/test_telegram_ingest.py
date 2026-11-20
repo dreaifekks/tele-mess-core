@@ -2000,7 +2000,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=220)
         self.assertEqual(len(files), 1)
         published_path = Path(files[0]["file_path"])
-        self.assertEqual(published_path, target_dir / f"{job_id}-t2" / f"{msg.id}.bin")
+        final_job = self.store.get_media_download_job(job_id)
+        assert final_job is not None
+        self.assertGreater(final_job["claim_token"], 1)
+        self.assertEqual(published_path, target_dir / f"{job_id}-t{final_job['claim_token']}" / f"{msg.id}.bin")
         self.assertEqual(published_path.read_bytes(), b"media")
         # Exactly one exclusive publish dir remains on disk — zero leftover .part dirs or uncommitted crash files.
         self.assertEqual(list(target_dir.iterdir()), [published_path.parent])
@@ -3001,6 +3004,264 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(v1_path.exists())
         self.assertFalse(v1_path.parent.exists())
         self.assertEqual(self.store.list_media_download_jobs(account_id="main"), [])
+
+    async def test_cleanup_fences_stale_claim_atomically_and_never_deletes_renewed_staging_dir(self) -> None:
+        chat_id = -1091
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.05, stale_seconds=60.0),
+        )
+        msg = FakeMessage(390, chat_id, media=MessageMediaDocument())
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        claimed = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed is not None
+        job_id = claimed["job_id"]
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        staging_dir = target_dir / f".part-{job_id}-t1"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_file = staging_dir / "390.bin"
+        staged_file.write_bytes(b"in-progress")
+
+        store2 = ArchiveStore(self.store.database_path)
+        try:
+            # Make lease briefly stale, then renew via heartbeat before connection 2 fences it.
+            self.store._conn.execute(
+                "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+                (job_id,),
+            )
+            self.store._conn.commit()
+            self.assertTrue(self.store.heartbeat_media_download_job(job_id, expected_claim_token=1))
+            self.assertFalse(
+                store2.cleanup_orphan_media_staging_dirs(
+                    account_id="main",
+                    source=SOURCE_TELEGRAM,
+                    stale_seconds=60.0,
+                )
+            )
+            self.assertTrue(staged_file.exists())
+
+            # When lease is genuinely stale and cleanup wins the write lock, it fences claim_token BEFORE rmtree.
+            self.store._conn.execute(
+                "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+                (job_id,),
+            )
+            self.store._conn.commit()
+            self.assertFalse(
+                store2.cleanup_orphan_media_staging_dirs(
+                    account_id="main",
+                    source=SOURCE_TELEGRAM,
+                    stale_seconds=60.0,
+                )
+            )
+            self.assertFalse(staging_dir.exists())
+            self.assertFalse(self.store.heartbeat_media_download_job(job_id, expected_claim_token=1))
+            fenced_job = self.store.get_media_download_job(job_id)
+            assert fenced_job is not None
+            self.assertEqual(fenced_job["status"], "failed")
+            self.assertGreater(fenced_job["claim_token"], 1)
+        finally:
+            store2.close()
+
+    async def test_idle_worker_decouples_sqlite_polling_from_filesystem_staging_scan(self) -> None:
+        from unittest import mock
+
+        chat_id = -1092
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        for idx in range(100):
+            (target_dir / f"mdj_existing{idx:04d}-t1").mkdir(exist_ok=True)
+
+        class IdleClient(FakeMediaClient):
+            def on(self, event_builder: object):
+                return lambda fn: fn
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            def is_connected(self) -> bool:
+                return True
+
+            def iter_messages(self, cid: int, **kwargs):
+                return FakeBackfillIterator(messages=[])
+
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                return []
+
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+        )
+        fs_calls = {"count": 0}
+        claim_calls = {"count": 0}
+        orig_fs = self.store.cleanup_orphan_media_staging_dirs
+        orig_claim = self.store.claim_media_download_job
+
+        def count_fs(*args, **kwargs):
+            fs_calls["count"] += 1
+            return orig_fs(*args, **kwargs)
+
+        def count_claim(*args, **kwargs):
+            claim_calls["count"] += 1
+            return orig_claim(*args, **kwargs)
+
+        try:
+            with (
+                mock.patch.object(self.store, "cleanup_orphan_media_staging_dirs", side_effect=count_fs),
+                mock.patch.object(self.store, "claim_media_download_job", side_effect=count_claim),
+            ):
+                await service.activate(IdleClient())
+                await asyncio.sleep(0.45)
+        finally:
+            await service.stop()
+
+        self.assertGreaterEqual(claim_calls["count"], 4)
+        self.assertEqual(fs_calls["count"], 1)
+
+    async def test_deleting_last_account_cleans_up_crashed_part_dir_and_pending_path_via_runtime_manager(self) -> None:
+        import shutil
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountRecord
+        from tele_mess_core.server.api import _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        chat_id = -1093
+        self.store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "Main Account", "user"))
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        app_config = AppConfig(
+            storage=StorageConfig(database=self.store.database_path),
+            server=ServerConfig(),
+            logging=LoggingConfig(),
+            telegram=TelegramConfig(
+                accounts=[self.config],
+                media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+            ),
+        )
+
+        # Create both a crashed .part-* staging dir AND a superseded pending_file_path under main.
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=app_config.telegram.media_download,
+        )
+
+        class ReplaceMsg(FakeMessage):
+            def __init__(self, payload: bytes, edit_date: datetime | None = None) -> None:
+                super().__init__(391, chat_id, media=MessageMediaDocument())
+                self._payload = payload
+                self.edit_date = edit_date
+
+            async def download_media(self, file: str) -> str:
+                path = Path(file) / "doc.bin"
+                path.write_bytes(self._payload)
+                return str(path)
+
+        msg_v1 = ReplaceMsg(b"old-doc")
+        service.client = FakeMediaClient(msg_v1)
+        self.assertTrue(await service._store_message(msg_v1, event_type="new"))
+        await service.process_pending_media_downloads()
+        v1_path = Path(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=391)[0]["file_path"])
+
+        msg_v2 = ReplaceMsg(b"new-doc", edit_date=datetime(2026, 3, 4, 12, 0, tzinfo=timezone.utc))
+        service.client = FakeMediaClient(msg_v2)
+        self.assertTrue(await service._store_message(msg_v2, event_type="edit"))
+
+        crashed_part_dir = self.store.database_path.parent / "media" / "main" / str(chat_id) / ".part-mdj_crashed0001-t1"
+        crashed_part_dir.mkdir(parents=True, exist_ok=True)
+        (crashed_part_dir / "partial.bin").write_bytes(b"partial-crash")
+
+        class MinimalRuntimeClient:
+            def __init__(self) -> None:
+                self._connected = True
+
+            async def connect(self) -> None:
+                self._connected = True
+
+            async def disconnect(self) -> None:
+                self._connected = False
+
+            def is_connected(self) -> bool:
+                return self._connected
+
+            async def is_user_authorized(self) -> bool:
+                return False
+
+            def on(self, event_builder: object):
+                return lambda fn: fn
+
+        manager = TelegramRuntimeManager(
+            app_config,
+            self.store,
+            client_factory=lambda _cfg: MinimalRuntimeClient(),
+            ingest=False,
+        )
+        orig_unlink = Path.unlink
+        orig_stat = Path.stat
+        orig_rmtree = shutil.rmtree
+        block_cleanup = {"enabled": True}
+
+        def guarded_unlink(path_self: Path, *args, **kwargs):
+            if block_cleanup["enabled"] and path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_unlink(path_self, *args, **kwargs)
+
+        def guarded_stat(path_self: Path, *args, **kwargs):
+            if block_cleanup["enabled"] and path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_stat(path_self, *args, **kwargs)
+
+        def guarded_rmtree(path_arg, *args, **kwargs):
+            if block_cleanup["enabled"] and Path(path_arg) == crashed_part_dir:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_arg))
+            return orig_rmtree(path_arg, *args, **kwargs)
+
+        await manager.start()
+        try:
+            with (
+                mock.patch.object(Path, "unlink", guarded_unlink),
+                mock.patch.object(Path, "stat", guarded_stat),
+                mock.patch("tele_mess_core.archive.store.shutil.rmtree", side_effect=guarded_rmtree),
+            ):
+                await service.process_pending_media_downloads(max_jobs=1)
+                # Delete the ONLY account through the management API helper (from a worker thread, like HTTP does).
+                await asyncio.to_thread(
+                    _delete_management_account,
+                    self.store,
+                    {"source": SOURCE_TELEGRAM, "account_id": "main"},
+                    manager,
+                )
+                self.assertEqual(manager.statuses(), [])
+                self.assertTrue(v1_path.exists())
+                self.assertTrue(crashed_part_dir.exists())
+
+                # Release EACCES: manager's account-independent cleanup task must clean BOTH artifacts with 0 accounts!
+                block_cleanup["enabled"] = False
+                deadline = asyncio.get_running_loop().time() + 3.0
+                while asyncio.get_running_loop().time() < deadline:
+                    if not v1_path.exists() and not crashed_part_dir.exists():
+                        break
+                    await asyncio.sleep(0.03)
+
+            self.assertFalse(v1_path.exists())
+            self.assertFalse(v1_path.parent.exists())
+            self.assertFalse(crashed_part_dir.exists())
+            self.assertEqual(self.store.list_media_download_jobs(account_id="main"), [])
+        finally:
+            await manager.stop()
 
 
 if __name__ == "__main__":

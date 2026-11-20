@@ -252,22 +252,63 @@ class TelegramArchiveService:
         self._media_wakeup.set()
 
     async def _media_worker_loop(self) -> None:
-        cleanup_retry_count = 0
-        cleanup_retry_cap = 8
-        next_cleanup_at: float | None = None
+        retry_cap = 8
+        pending_retry_count = 0
+        fs_retry_count = 0
+        stale_seconds = max(0.0, float(self.media_download.stale_seconds))
+        fs_clean_interval = max(30.0, min(stale_seconds, 300.0))
+        pending_clean_interval = min(max(1.0, stale_seconds / 2.0), 30.0)
         loop = asyncio.get_running_loop()
-        try:
+        next_pending_cleanup_at: float | None = None
+        next_fs_cleanup_at: float = loop.time()
+
+        async def _run_fs_cleanup() -> None:
+            nonlocal fs_retry_count, next_fs_cleanup_at
+            has_remaining_fs = False
             try:
-                if self._cleanup_orphan_media_artifacts():
-                    base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
-                    next_cleanup_at = loop.time() + min(base_delay, 60.0)
-                    cleanup_retry_count = 1
+                has_remaining_fs = await asyncio.to_thread(self._cleanup_staging_dirs)
+            except asyncio.CancelledError:
+                raise
             except Exception as exc:
+                has_remaining_fs = True
                 self.logger.warning(
-                    "Failed to clean up orphan media artifacts for account=%s: %s",
+                    "Failed to clean up orphan media staging dirs for account=%s: %s",
                     self.account_id,
                     exc,
                 )
+            if not has_remaining_fs:
+                fs_retry_count = 0
+                next_fs_cleanup_at = loop.time() + fs_clean_interval
+            else:
+                base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                delay = min(base_delay * (2 ** min(fs_retry_count, retry_cap)), 60.0)
+                fs_retry_count = min(fs_retry_count + 1, retry_cap)
+                next_fs_cleanup_at = loop.time() + delay
+
+        def _run_pending_cleanup() -> None:
+            nonlocal pending_retry_count, next_pending_cleanup_at
+            has_remaining_pending = False
+            try:
+                has_remaining_pending = self._cleanup_pending_media_paths()
+            except Exception as exc:
+                has_remaining_pending = True
+                self.logger.warning(
+                    "Failed to clean up pending media paths for account=%s: %s",
+                    self.account_id,
+                    exc,
+                )
+            if not has_remaining_pending:
+                pending_retry_count = 0
+                next_pending_cleanup_at = loop.time() + pending_clean_interval
+            else:
+                base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                delay = min(base_delay * (2 ** min(pending_retry_count, retry_cap)), 60.0)
+                pending_retry_count = min(pending_retry_count + 1, retry_cap)
+                next_pending_cleanup_at = loop.time() + delay
+
+        try:
+            await _run_fs_cleanup()
+            _run_pending_cleanup()
             while not self._closed:
                 self._media_wakeup.clear()
                 if self.client is None:
@@ -292,8 +333,8 @@ class TelegramArchiveService:
                     await self._wait_media_wakeup(1.0)
                     continue
                 if job is not None:
-                    cleanup_retry_count = 0
-                    next_cleanup_at = None
+                    pending_retry_count = 0
+                    next_pending_cleanup_at = None
                     try:
                         await self._execute_media_download_job(job)
                     except asyncio.CancelledError:
@@ -308,25 +349,10 @@ class TelegramArchiveService:
                         await self._wait_media_wakeup(1.0)
                     continue
                 now_mono = loop.time()
-                if next_cleanup_at is None or now_mono >= next_cleanup_at:
-                    has_remaining_cleanup = False
-                    try:
-                        has_remaining_cleanup = self._cleanup_orphan_media_artifacts()
-                    except Exception as exc:
-                        has_remaining_cleanup = True
-                        self.logger.warning(
-                            "Failed to clean up orphan media artifacts for account=%s: %s",
-                            self.account_id,
-                            exc,
-                        )
-                    if not has_remaining_cleanup:
-                        cleanup_retry_count = 0
-                        next_cleanup_at = None
-                    else:
-                        base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
-                        delay = min(base_delay * (2 ** min(cleanup_retry_count, cleanup_retry_cap)), 60.0)
-                        cleanup_retry_count = min(cleanup_retry_count + 1, cleanup_retry_cap)
-                        next_cleanup_at = loop.time() + delay
+                if next_pending_cleanup_at is None or now_mono >= next_pending_cleanup_at:
+                    _run_pending_cleanup()
+                if now_mono >= next_fs_cleanup_at:
+                    await _run_fs_cleanup()
                 try:
                     next_due = self.store.next_media_download_due_at(
                         self.account_id,
@@ -349,75 +375,47 @@ class TelegramArchiveService:
                     sleep_seconds = idle_poll_seconds
                 else:
                     sleep_seconds = min(_seconds_until_iso(next_due), idle_poll_seconds)
-                if next_cleanup_at is not None:
-                    cleanup_wait = max(0.0, next_cleanup_at - loop.time())
-                    sleep_seconds = min(sleep_seconds, cleanup_wait)
+                now_after = loop.time()
+                if next_pending_cleanup_at is not None:
+                    sleep_seconds = min(sleep_seconds, max(0.0, next_pending_cleanup_at - now_after))
+                sleep_seconds = min(sleep_seconds, max(0.0, next_fs_cleanup_at - now_after))
                 if sleep_seconds > 0:
                     await self._wait_media_wakeup(sleep_seconds)
                 if self._media_wakeup.is_set():
-                    cleanup_retry_count = 0
-                    next_cleanup_at = None
+                    pending_retry_count = 0
+                    next_pending_cleanup_at = None
         except asyncio.CancelledError:
             raise
         finally:
             if self._media_worker_task is asyncio.current_task():
                 self._media_worker_task = None
 
+    def _cleanup_staging_dirs(self) -> bool:
+        stale_seconds = max(0.0, float(self.media_download.stale_seconds))
+        return self.store.cleanup_orphan_media_staging_dirs(
+            account_id=self.account_id,
+            source=SOURCE_TELEGRAM,
+            stale_seconds=stale_seconds,
+            include_deleted_accounts=True,
+        )
+
+    def _cleanup_pending_media_paths(self) -> bool:
+        stale_seconds = max(0.0, float(self.media_download.stale_seconds))
+        return self.store.cleanup_orphan_media_pending_paths(
+            account_id=self.account_id,
+            source=SOURCE_TELEGRAM,
+            stale_seconds=stale_seconds,
+            include_deleted_accounts=True,
+        )
+
     def _cleanup_orphan_media_artifacts(self) -> bool:
         """Remove stale job staging directories and uncommitted pending publish files after crashes.
 
         Returns True when any orphan artifact could not be removed and should be retried later.
         """
-        has_remaining = False
-        account_media_dir = self.store.database_path.parent / "media" / self.account_id
-        stale_seconds = max(0.0, float(self.media_download.stale_seconds))
-        stale_before = (
-            datetime.now(dt_timezone.utc) - timedelta(seconds=stale_seconds)
-        ).isoformat()
-        if account_media_dir.exists():
-            for chat_dir in account_media_dir.iterdir():
-                if not chat_dir.is_dir():
-                    continue
-                for entry in chat_dir.iterdir():
-                    if not entry.is_dir():
-                        continue
-                    if entry.name.startswith(".part-"):
-                        parsed = _parse_staging_dir_name(entry.name)
-                        if parsed is None:
-                            continue
-                        job_id, token = parsed
-                        job = self.store.get_media_download_job(job_id)
-                        should_remove = job is None
-                        if job is not None:
-                            status = str(job.get("status") or "")
-                            current_token = int(job.get("claim_token") or 0)
-                            updated_at = str(job.get("updated_at") or "")
-                            should_remove = (
-                                status != "downloading"
-                                or current_token > token
-                                or updated_at <= stale_before
-                            )
-                        if should_remove:
-                            try:
-                                shutil.rmtree(entry)
-                            except FileNotFoundError:
-                                pass
-                            except OSError:
-                                has_remaining = True
-        for pending in self.store.list_media_jobs_with_pending_paths(
-            account_id=self.account_id,
-            source=SOURCE_TELEGRAM,
-            stale_seconds=stale_seconds,
-        ):
-            cleared, _unlinked = self.store.cleanup_media_download_pending_path(
-                str(pending["job_id"]),
-                expected_claim_token=int(pending["claim_token"]),
-                require_downloading=False,
-                stale_seconds=stale_seconds,
-            )
-            if not cleared:
-                has_remaining = True
-        return has_remaining
+        has_remaining_fs = self._cleanup_staging_dirs()
+        has_remaining_pending = self._cleanup_pending_media_paths()
+        return has_remaining_fs or has_remaining_pending
 
     def _cleanup_prior_job_staging_dirs(self, target_dir: Path, job_id: str, current_token: int) -> None:
         if not target_dir.exists():

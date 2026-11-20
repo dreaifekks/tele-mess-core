@@ -776,10 +776,13 @@ class TelegramRuntimeManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
+        self._media_cleanup_wakeup: asyncio.Event | None = None
+        self._media_cleanup_task: asyncio.Task[None] | None = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
+        self._media_cleanup_wakeup = asyncio.Event()
         configs = {item.account_id: item for item in self.config.telegram.accounts}
         for item in self.store.list_management_accounts():
             if item.get("source") == SOURCE_TELEGRAM and item["account_id"] not in configs:
@@ -788,13 +791,75 @@ class TelegramRuntimeManager:
             if self._account_ids is not None and account.account_id not in self._account_ids:
                 continue
             await self._register_account(account)
+        self._media_cleanup_task = asyncio.create_task(
+            self._run_deleted_account_media_cleanup(),
+            name="telegram-deleted-account-media-cleanup",
+        )
 
     async def stop(self) -> None:
+        cleanup_task = self._media_cleanup_task
+        self._media_cleanup_task = None
+        if cleanup_task is not None and not cleanup_task.done():
+            cleanup_task.cancel()
+            await asyncio.gather(cleanup_task, return_exceptions=True)
+        self._media_cleanup_wakeup = None
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
         await asyncio.gather(*(runtime.stop() for runtime in runtimes), return_exceptions=True)
         self._loop = None
         self._loop_thread_id = None
+
+    def trigger_media_cleanup(self) -> None:
+        """Wake account-independent cleanup for deleted-account staging dirs and pending paths."""
+        loop = self._loop
+        wakeup = self._media_cleanup_wakeup
+        if loop is None or loop.is_closed() or wakeup is None:
+            return
+        if threading.get_ident() == self._loop_thread_id:
+            wakeup.set()
+        else:
+            loop.call_soon_threadsafe(wakeup.set)
+
+    async def _run_deleted_account_media_cleanup(self) -> None:
+        retry_count = 0
+        retry_cap = 8
+        try:
+            while True:
+                wakeup = self._media_cleanup_wakeup
+                if wakeup is not None:
+                    wakeup.clear()
+                stale_seconds = max(0.0, float(self.config.telegram.media_download.stale_seconds))
+                active_ids = set(self._runtimes.keys())
+                has_remaining = False
+                try:
+                    has_remaining = await asyncio.to_thread(
+                        self.store.cleanup_deleted_account_media_artifacts,
+                        source=SOURCE_TELEGRAM,
+                        stale_seconds=stale_seconds,
+                        active_account_ids=active_ids,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    has_remaining = True
+                    self.logger.warning("Failed to clean up deleted-account media artifacts: %s", exc)
+                if has_remaining:
+                    configured_base = float(self.config.telegram.media_download.retry_delay_seconds)
+                    base_delay = max(0.05, min(configured_base, 5.0)) if configured_base > 0 else 0.05
+                    delay = min(base_delay * (2 ** min(retry_count, retry_cap)), 60.0)
+                    retry_count = min(retry_count + 1, retry_cap)
+                else:
+                    retry_count = 0
+                    delay = 300.0
+                if wakeup is None:
+                    return
+                try:
+                    await asyncio.wait_for(wakeup.wait(), timeout=delay)
+                    retry_count = 0
+                except TimeoutError:
+                    continue
+        except asyncio.CancelledError:
+            raise
 
     def call(
         self,

@@ -4,6 +4,7 @@ from datetime import datetime, timedelta, timezone as dt_timezone
 import functools
 import json
 import re
+import shutil
 import sqlite3
 import threading
 import uuid
@@ -493,6 +494,12 @@ class ArchiveStore:
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
+        self.cleanup_orphan_media_staging_dirs(
+            account_id=account_id,
+            source=source,
+            stale_seconds=0.0,
+            include_deleted_accounts=False,
+        )
         return deleted
 
     def list_management_accounts(self) -> list[dict[str, Any]]:
@@ -2398,6 +2405,111 @@ class ArchiveStore:
                     self._conn.rollback()
                 raise
 
+    def fence_stale_media_download_claim(
+        self,
+        job_id: str,
+        *,
+        expected_claim_token: int,
+        stale_seconds: float = 300.0,
+    ) -> bool:
+        """Atomically verify or invalidate a claim before deleting its staging directory.
+
+        Returns True only when the job no longer exists, is not downloading, has advanced
+        past `expected_claim_token`, or was stale and has now been fenced in SQLite.
+        """
+        with self._lock:
+            now_dt = datetime.now(dt_timezone.utc)
+            stale_before = (
+                now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))
+            ).isoformat()
+            # Lock-free read fast-path avoids write-lock contention for live or already-finished claims.
+            quick = self._conn.execute(
+                """
+                SELECT status, claim_token, updated_at
+                FROM media_download_jobs
+                WHERE job_id = ?
+                """,
+                (job_id,),
+            ).fetchone()
+            if quick is None:
+                return True
+            quick_status = str(quick["status"])
+            quick_token = int(quick["claim_token"])
+            if quick_status != "downloading" or quick_token > int(expected_claim_token):
+                return True
+            if quick_token < int(expected_claim_token) or str(quick["updated_at"]) > stale_before:
+                return False
+
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now_dt = datetime.now(dt_timezone.utc)
+                now = now_dt.isoformat()
+                stale_before = (
+                    now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))
+                ).isoformat()
+                row = self._conn.execute(
+                    """
+                    SELECT status, claim_token, attempts, max_attempts, updated_at
+                    FROM media_download_jobs
+                    WHERE job_id = ?
+                    """,
+                    (job_id,),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return True
+                status = str(row["status"])
+                current_token = int(row["claim_token"])
+                if status != "downloading" or current_token > int(expected_claim_token):
+                    self._conn.rollback()
+                    return True
+                if current_token < int(expected_claim_token):
+                    self._conn.rollback()
+                    return False
+                if str(row["updated_at"]) > stale_before:
+                    self._conn.rollback()
+                    return False
+                attempts = int(row["attempts"])
+                max_attempts = int(row["max_attempts"])
+                if attempts >= max_attempts:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'failed',
+                            claim_token = claim_token + 1,
+                            error_code = COALESCE(error_code, 'media_download_stale_exhausted'),
+                            last_error = COALESCE(last_error, 'stale download lease exhausted max attempts'),
+                            next_attempt_at = NULL,
+                            updated_at = ?,
+                            completed_at = ?
+                        WHERE job_id = ? AND status = 'downloading' AND claim_token = ? AND updated_at <= ?
+                        """,
+                        (now, now, job_id, int(expected_claim_token), stale_before),
+                    )
+                else:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'retry',
+                            claim_token = claim_token + 1,
+                            next_attempt_at = ?,
+                            error_code = COALESCE(error_code, 'media_download_stale'),
+                            last_error = COALESCE(last_error, 'stale download lease fenced during cleanup'),
+                            updated_at = ?
+                        WHERE job_id = ? AND status = 'downloading' AND claim_token = ? AND updated_at <= ?
+                        """,
+                        (now, now, job_id, int(expected_claim_token), stale_before),
+                    )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
     def list_media_jobs_with_pending_paths(
         self,
         *,
@@ -2405,12 +2517,30 @@ class ArchiveStore:
         source: str = SOURCE_TELEGRAM,
         stale_seconds: float = 300.0,
         include_deleted_accounts: bool = True,
+        deleted_accounts_only: bool = False,
     ) -> list[dict[str, Any]]:
         stale_before = (
             datetime.now(dt_timezone.utc) - timedelta(seconds=max(0.0, float(stale_seconds)))
         ).isoformat()
         with self._lock:
-            if account_id is None:
+            if deleted_accounts_only:
+                rows = self._conn.execute(
+                    """
+                    SELECT job_id, account_id, claim_token, status, updated_at, pending_file_path, error_code
+                    FROM media_download_jobs
+                    WHERE source = ?
+                      AND pending_file_path IS NOT NULL
+                      AND status = 'canceled'
+                      AND error_code = 'account_deleted'
+                      AND NOT EXISTS (
+                        SELECT 1 FROM accounts a
+                        WHERE a.source = media_download_jobs.source
+                          AND a.account_id = media_download_jobs.account_id
+                      )
+                    """,
+                    (source,),
+                ).fetchall()
+            elif account_id is None:
                 rows = self._conn.execute(
                     """
                     SELECT job_id, account_id, claim_token, status, updated_at, pending_file_path, error_code
@@ -2455,6 +2585,138 @@ class ArchiveStore:
                     (source, account_id, stale_before),
                 ).fetchall()
         return [_row_to_dict(row) for row in rows]
+
+    def cleanup_orphan_media_pending_paths(
+        self,
+        *,
+        account_id: str | None = None,
+        source: str = SOURCE_TELEGRAM,
+        stale_seconds: float = 300.0,
+        include_deleted_accounts: bool = True,
+        deleted_accounts_only: bool = False,
+    ) -> bool:
+        """Clean up DB-tracked pending/superseded media paths; returns True when retryable items remain."""
+        has_remaining = False
+        for pending in self.list_media_jobs_with_pending_paths(
+            account_id=account_id,
+            source=source,
+            stale_seconds=stale_seconds,
+            include_deleted_accounts=include_deleted_accounts,
+            deleted_accounts_only=deleted_accounts_only,
+        ):
+            cleared, _unlinked = self.cleanup_media_download_pending_path(
+                str(pending["job_id"]),
+                expected_claim_token=int(pending["claim_token"]),
+                require_downloading=False,
+                stale_seconds=stale_seconds,
+            )
+            if not cleared:
+                has_remaining = True
+        return has_remaining
+
+    def cleanup_orphan_media_staging_dirs(
+        self,
+        *,
+        account_id: str | None = None,
+        source: str = SOURCE_TELEGRAM,
+        stale_seconds: float = 300.0,
+        include_deleted_accounts: bool = True,
+        deleted_accounts_only: bool = False,
+        active_account_ids: Iterable[str] | None = None,
+    ) -> bool:
+        """Remove fenced/stale `.part-<job_id>-t<token>` staging directories; returns True when retryable items remain."""
+        has_remaining = False
+        media_root = self.database_path.parent / "media"
+        if not media_root.exists():
+            return False
+        active_accounts: set[str] = set(active_account_ids or ())
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT account_id FROM accounts WHERE source = ?",
+                (source,),
+            ).fetchall()
+            active_accounts.update(str(row["account_id"]) for row in rows)
+
+        account_dirs: list[Path] = []
+        seen_names: set[str] = set()
+        if not deleted_accounts_only and account_id is not None:
+            own_dir = media_root / account_id
+            if own_dir.is_dir():
+                account_dirs.append(own_dir)
+                seen_names.add(account_id)
+        if deleted_accounts_only or account_id is None or include_deleted_accounts:
+            try:
+                children = list(media_root.iterdir())
+            except OSError:
+                return True
+            for child in children:
+                if not child.is_dir() or child.name in seen_names:
+                    continue
+                if deleted_accounts_only or (account_id is not None and include_deleted_accounts):
+                    if child.name in active_accounts:
+                        continue
+                account_dirs.append(child)
+                seen_names.add(child.name)
+
+        for acc_dir in account_dirs:
+            try:
+                chat_dirs = list(acc_dir.iterdir())
+            except FileNotFoundError:
+                continue
+            except OSError:
+                has_remaining = True
+                continue
+            for chat_dir in chat_dirs:
+                if not chat_dir.is_dir():
+                    continue
+                try:
+                    entries = list(chat_dir.iterdir())
+                except FileNotFoundError:
+                    continue
+                except OSError:
+                    has_remaining = True
+                    continue
+                for entry in entries:
+                    if not entry.name.startswith(".part-") or not entry.is_dir():
+                        continue
+                    parsed = _parse_media_staging_dir_name(entry.name)
+                    if parsed is None:
+                        continue
+                    job_id, token = parsed
+                    if not self.fence_stale_media_download_claim(
+                        job_id,
+                        expected_claim_token=token,
+                        stale_seconds=stale_seconds,
+                    ):
+                        continue
+                    try:
+                        shutil.rmtree(entry)
+                    except FileNotFoundError:
+                        pass
+                    except OSError:
+                        has_remaining = True
+        return has_remaining
+
+    def cleanup_deleted_account_media_artifacts(
+        self,
+        *,
+        source: str = SOURCE_TELEGRAM,
+        stale_seconds: float = 300.0,
+        active_account_ids: Iterable[str] | None = None,
+    ) -> bool:
+        """Clean up both staging dirs and pending paths left behind by deleted accounts."""
+        has_remaining_fs = self.cleanup_orphan_media_staging_dirs(
+            source=source,
+            stale_seconds=stale_seconds,
+            deleted_accounts_only=True,
+            active_account_ids=active_account_ids,
+        )
+        has_remaining_pending = self.cleanup_orphan_media_pending_paths(
+            source=source,
+            stale_seconds=stale_seconds,
+            deleted_accounts_only=True,
+        )
+        return has_remaining_fs or has_remaining_pending
 
     def _clear_pending_path_value_unlocked(self, pending_path: str | None) -> str | None:
         """Return NULL if pending_path is absent, referenced, or confirmed unlinked; else preserve it for retry."""
@@ -6062,6 +6324,16 @@ def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:
         epoch = int(parsed.get("epoch") or 0)
         return (seq, owner, epoch)
     return (0, "", 0)
+
+
+def _parse_media_staging_dir_name(name: str) -> tuple[str, int] | None:
+    if not name.startswith(".part-"):
+        return None
+    body = name[len(".part-") :]
+    job_id, sep, token_str = body.rpartition("-t")
+    if not sep or not job_id or not token_str.isdigit():
+        return None
+    return job_id, int(token_str)
 
 
 def _unlink_file_confirmed(file_path: str) -> bool:
