@@ -87,8 +87,8 @@ class TelegramAuthService:
                 else None
             )
 
-            def persist_sent() -> None:
-                self._record_state(
+            def persist_sent() -> bool:
+                return self._record_state(
                     "code_sent",
                     phone=phone,
                     raw={"phone": phone, "phone_code_hash_set": bool(phone_code_hash)},
@@ -96,7 +96,9 @@ class TelegramAuthService:
                     extra_meta=extra_meta,
                 )
 
-            await self._run_write(persist_sent)
+            wrote = await self._run_write(persist_sent)
+            if not wrote:
+                return self._conflict_result("request_code", phone=phone)
             return {"account_id": self.account_id, "auth_state": "code_sent", "phone": phone}
         except Exception as exc:
             return self._handle_rpc_error(
@@ -153,11 +155,15 @@ class TelegramAuthService:
                 if not password:
                     probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
 
-                    def persist_password_needed() -> None:
-                        if self._record_state("password_needed", phone=phone, probe=probe):
+                    def persist_password_needed() -> bool:
+                        wrote = self._record_state("password_needed", phone=phone, probe=probe)
+                        if wrote:
                             self._record_operation("submit_code", "password_needed")
+                        return wrote
 
-                    await self._run_write(persist_password_needed)
+                    wrote = await self._run_write(persist_password_needed)
+                    if not wrote:
+                        return self._conflict_result("submit_code", phone=phone)
                     return {"account_id": self.account_id, "auth_state": "password_needed", "authorized": False}
                 try:
                     await client.sign_in(password=password)
@@ -182,15 +188,17 @@ class TelegramAuthService:
 
         probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
 
-        def persist_authorized() -> None:
-            self._record_state(
+        def persist_authorized() -> bool:
+            return self._record_state(
                 "authorized",
                 phone=phone,
                 probe=probe,
                 extra_meta={_phone_code_hash_key(self.account_id): ""},
             )
 
-        await self._run_write(persist_authorized)
+        wrote = await self._run_write(persist_authorized)
+        if not wrote:
+            return self._conflict_result("submit_code", phone=phone)
         return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
 
     def submit_code_error_result(
@@ -246,6 +254,27 @@ class TelegramAuthService:
                 operation,
                 exc_info=True,
             )
+
+    def _conflict_result(self, operation: str, *, phone: str) -> dict[str, Any]:
+        error_payload = {
+            "code": "auth_state_conflict",
+            "message": f"Account auth state changed concurrently while saving {operation}; retry the operation.",
+            "retryable": True,
+        }
+        if operation == "request_code":
+            return {
+                "account_id": self.account_id,
+                "auth_state": "conflict",
+                "phone": phone,
+                "sent": False,
+                "error": error_payload,
+            }
+        return {
+            "account_id": self.account_id,
+            "auth_state": "conflict",
+            "authorized": False,
+            "error": error_payload,
+        }
 
     def _handle_rpc_error(self, builder: Callable[[bool, bool], dict[str, Any]]) -> dict[str, Any]:
         if self._error_persister is None:

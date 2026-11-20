@@ -177,6 +177,27 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(request.kwargs["offset_topic"], 34)
         self.assertEqual(request.kwargs["limit"], 56)
 
+    async def test_partial_topic_write_failure_preserves_committed_topic_count(self) -> None:
+        import sqlite3
+        from unittest import mock
+
+        original_upsert = self.store.upsert_origin
+
+        def fail_second_topic(record: object) -> None:
+            if getattr(record, "topic_id", 0) == 11:
+                raise sqlite3.OperationalError("database is locked")
+            original_upsert(record)  # type: ignore[arg-type]
+
+        with mock.patch.object(self.store, "upsert_origin", side_effect=fail_second_topic):
+            result = await self.service.discover_origins(include_topics=True, topic_limit=10, client=self.client)
+
+        self.assertEqual(result["status"], "partial")
+        self.assertEqual(result["origins"], 2)
+        self.assertEqual(result["topics"], 1)
+        self.assertEqual(result["errors"][0]["code"], "origin_discovery_failed")
+        topics = [item for item in self.store.list_origins(account_id="main") if item["origin_type"] == "topic"]
+        self.assertEqual([item["topic_id"] for item in topics], [10])
+
 
 if __name__ == "__main__":
     unittest.main()

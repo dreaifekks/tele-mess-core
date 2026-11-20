@@ -833,6 +833,51 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
             release_old_write.set()
             await manager.stop()
 
+    async def test_request_code_returns_conflict_when_concurrent_write_rejects_hash_commit(self) -> None:
+        from types import SimpleNamespace
+
+        other_store = ArchiveStore(self.root / "archive.db")
+        other_store.initialize()
+        original_upsert = self.store.upsert_account_auth
+
+        def intercept_upsert(auth: AccountAuthRecord, **kwargs: object) -> bool:
+            if auth.auth_state == "code_sent" and auth.phone == "+3000":
+                # Simulate another connection updating auth state right before request_code commits its hash.
+                other_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="main",
+                        auth_state="authorized",
+                    )
+                )
+            return original_upsert(auth, **kwargs)
+
+        class HashClient(FakeClient):
+            async def send_code_request(self, phone: str) -> object:
+                return SimpleNamespace(phone_code_hash="hash_rejected")
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: HashClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            with unittest.mock.patch.object(self.store, "upsert_account_auth", side_effect=intercept_upsert):
+                result = await manager.execute("main", "request_code", phone="+3000")
+            self.assertFalse(result["sent"])
+            self.assertEqual(result["auth_state"], "conflict")
+            self.assertEqual(result["error"]["code"], "auth_state_conflict")
+            self.assertIsNone(self.store.get_meta("telegram_auth:main:phone_code_hash"))
+            accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+            self.assertEqual(accounts["main"]["auth_state"], "authorized")
+        finally:
+            await manager.stop()
+            other_store.close()
+
     async def test_discover_and_refresh_timeout_after_commit_preserves_partial_counts_without_reconnect(self) -> None:
         from types import SimpleNamespace
 

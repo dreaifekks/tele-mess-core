@@ -59,28 +59,22 @@ class TelegramDiscoveryService:
     ) -> dict[str, Any]:
         probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
         effective_topic_limit, requested_topic_limit = _bounded_discovery_limit(topic_limit, MAX_TOPIC_DISCOVERY_LIMIT)
-        if progress is not None:
-            progress.setdefault("authorized", False)
-            progress.setdefault("origins", 0)
-            progress.setdefault("topics", 0)
-            progress.setdefault("private_skipped", 0)
-            progress.setdefault("errors", [])
-            progress.setdefault("topics_truncated", False)
-            progress["topic_limit"] = effective_topic_limit
-            progress["include_private"] = include_private
+        state = progress if progress is not None else {}
+        state.setdefault("authorized", False)
+        state.setdefault("origins", 0)
+        state.setdefault("topics", 0)
+        state.setdefault("private_skipped", 0)
+        state.setdefault("errors", [])
+        state.setdefault("topics_truncated", False)
+        state["topic_limit"] = effective_topic_limit
+        state["include_private"] = include_private
         try:
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login", probe=probe)
                 return {"account_id": self.account_id, "authorized": False, "status": "needs_login", "origins": 0, "topics": 0}
 
             self._set_auth_state("authorized", probe=probe)
-            if progress is not None:
-                progress["authorized"] = True
-            origin_count = 0
-            topic_count = 0
-            private_skipped = 0
-            errors: list[dict[str, Any]] = []
-            topics_truncated = False
+            state["authorized"] = True
             try:
                 async for dialog in client.iter_dialogs():
                     try:
@@ -88,9 +82,7 @@ class TelegramDiscoveryService:
                         origin_id = int(getattr(dialog, "id"))
                         origin_type = _dialog_origin_type(dialog, entity)
                         if origin_type == "private" and not include_private:
-                            private_skipped += 1
-                            if progress is not None:
-                                progress["private_skipped"] = private_skipped
+                            state["private_skipped"] = int(state["private_skipped"]) + 1
                             continue
                         is_forum = bool(getattr(entity, "forum", False))
                         origin_record = OriginRecord(
@@ -106,29 +98,20 @@ class TelegramDiscoveryService:
                             raw_json=json.dumps(_safe_dict(entity), ensure_ascii=False, default=str),
                         )
                         await self._run_write(lambda rec=origin_record: self.store.upsert_origin(rec))
-                        origin_count += 1
-                        if progress is not None:
-                            progress["origins"] = origin_count
+                        state["origins"] = int(state["origins"]) + 1
                         if include_topics and is_forum:
                             topic_result = await self._discover_topics(
                                 client,
                                 entity,
                                 origin_id,
                                 effective_topic_limit,
-                                progress=progress,
+                                progress=state,
                             )
-                            topic_count += int(topic_result["topics"])
-                            topics_truncated = topics_truncated or bool(topic_result["truncated"])
-                            errors.extend(topic_result["errors"])
-                            if progress is not None:
-                                progress["topics"] = topic_count
-                                progress["topics_truncated"] = topics_truncated
+                            state["topics_truncated"] = bool(state["topics_truncated"]) or bool(topic_result["truncated"])
                     except Exception as exc:
                         error = classify_telegram_exception(exc, default_code="origin_discovery_failed")
                         payload = error.to_public_dict()
-                        errors.append(payload)
-                        if progress is not None:
-                            progress["errors"].append(payload)
+                        state["errors"].append(payload)
                         self._record_operation_diagnostic(
                             "discover_origins",
                             "failed",
@@ -139,15 +122,16 @@ class TelegramDiscoveryService:
             except Exception as exc:
                 error = classify_telegram_exception(exc, default_code="dialog_discovery_failed")
                 payload = error.to_public_dict()
-                errors.append(payload)
-                if progress is not None:
-                    progress["errors"].append(payload)
+                state["errors"].append(payload)
                 self._record_operation_diagnostic("discover_origins", "failed", error=payload)
             if requested_topic_limit > effective_topic_limit:
-                topics_truncated = True
-                if progress is not None:
-                    progress["topics_truncated"] = True
-            status = "ok" if not errors else "partial" if origin_count else "failed"
+                state["topics_truncated"] = True
+            origin_count = int(state["origins"])
+            topic_count = int(state["topics"])
+            private_skipped = int(state["private_skipped"])
+            errors = list(state["errors"])
+            topics_truncated = bool(state["topics_truncated"])
+            status = "ok" if not errors else "partial" if (origin_count or topic_count) else "failed"
             return {
                 "account_id": self.account_id,
                 "authorized": True,
@@ -162,10 +146,10 @@ class TelegramDiscoveryService:
             }
         except Exception as exc:
             if self._error_persister is not None:
-                result = self.discover_origins_error_result(exc, persist=False, progress=progress)
+                result = self.discover_origins_error_result(exc, persist=False, progress=state)
                 self._error_persister(lambda err=exc: self.discover_origins_error_result(err, persist=True))
                 return result
-            return self.discover_origins_error_result(exc, progress=progress)
+            return self.discover_origins_error_result(exc, progress=state)
 
     def discover_origins_error_result(
         self,
