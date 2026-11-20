@@ -936,11 +936,6 @@ def _create_management_account(
         )
     )
     session_dir = _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
-    auth_seq = (
-        telegram_runtime.next_auth_state_seq(account_id)
-        if telegram_runtime is not None and source == SOURCE_TELEGRAM
-        else None
-    )
     store.upsert_account_auth(
         AccountAuthRecord(
             source=source,
@@ -951,9 +946,10 @@ def _create_management_account(
             session_dir=session_dir,
             updated_at=now,
             raw_json=raw,
-        ),
-        monotonic_seq=auth_seq,
+        )
     )
+    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+        telegram_runtime.bump_auth_state_epoch(account_id)
     item = _find_account(store, source, account_id)
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         telegram_runtime.register_account(_account_config(config, store, account_id))
@@ -998,11 +994,6 @@ def _update_account_auth(
         if partial and "last_error" not in payload
         else _optional_payload_str(payload, "last_error")
     )
-    auth_seq = (
-        telegram_runtime.next_auth_state_seq(account_id)
-        if telegram_runtime is not None and source == SOURCE_TELEGRAM
-        else None
-    )
     store.upsert_account_auth(
         AccountAuthRecord(
             source=source,
@@ -1014,9 +1005,10 @@ def _update_account_auth(
             last_error=last_error,
             updated_at=now,
             raw_json=_public_raw_json(payload, hidden={"api_hash", "password", "code"}),
-        ),
-        monotonic_seq=auth_seq,
+        )
     )
+    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+        telegram_runtime.bump_auth_state_epoch(account_id)
     return _find_account(store, source, account_id)
 
 

@@ -333,14 +333,16 @@ class ArchiveStore:
 
     def get_auth_state_seq(self, source: str, account_id: str) -> int:
         seq_key = f"auth_state_seq:{source}:{account_id}"
-        raw = self.get_meta(seq_key)
-        return int(raw) if raw is not None and str(raw).isdigit() else 0
+        seq, _owner, _epoch = _parse_auth_state_meta(self.get_meta(seq_key))
+        return seq
 
     def upsert_account_auth(
         self,
         auth: AccountAuthRecord,
         *,
-        monotonic_seq: int | None = None,
+        expected_seq: int | None = None,
+        owner_id: str | None = None,
+        owner_epoch: int | None = None,
     ) -> bool:
         now = auth.updated_at or utc_now_iso()
         seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
@@ -351,20 +353,34 @@ class ArchiveStore:
                     "SELECT value FROM meta WHERE key = ?",
                     (seq_key,),
                 ).fetchone()
-                existing_seq = int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
-                if monotonic_seq is not None:
-                    target_seq = int(monotonic_seq)
-                    if target_seq <= existing_seq:
+                existing_seq, existing_owner, existing_epoch = _parse_auth_state_meta(
+                    row["value"] if row is not None else None
+                )
+                if expected_seq is not None:
+                    same_owner_newer = (
+                        owner_id is not None
+                        and existing_owner == owner_id
+                        and owner_epoch is not None
+                        and int(owner_epoch) > existing_epoch
+                    )
+                    if existing_seq != int(expected_seq) and not same_owner_newer:
                         self._conn.rollback()
                         return False
-                else:
-                    target_seq = existing_seq + 1
+                target_seq = existing_seq + 1
+                meta_value = json.dumps(
+                    {
+                        "seq": target_seq,
+                        "owner": owner_id or "",
+                        "epoch": int(owner_epoch) if owner_epoch is not None else 0,
+                    },
+                    separators=(",", ":"),
+                )
                 self._conn.execute(
                     """
                     INSERT INTO meta(key, value) VALUES (?, ?)
                     ON CONFLICT(key) DO UPDATE SET value = excluded.value
                     """,
-                    (seq_key, str(target_seq)),
+                    (seq_key, meta_value),
                 )
                 self._conn.execute(
                     """
@@ -4377,6 +4393,26 @@ def _fts_literal_query(query: str) -> str:
         escaped = token.replace('"', '""')
         quoted.append(f'"{escaped}"')
     return " ".join(quoted) or '""'
+
+
+def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:
+    if raw is None:
+        return (0, "", 0)
+    text = str(raw).strip()
+    if not text:
+        return (0, "", 0)
+    if text.isdigit():
+        return (int(text), "", 0)
+    try:
+        parsed = json.loads(text)
+    except Exception:
+        return (0, "", 0)
+    if isinstance(parsed, dict):
+        seq = int(parsed.get("seq") or 0)
+        owner = str(parsed.get("owner") or "")
+        epoch = int(parsed.get("epoch") or 0)
+        return (seq, owner, epoch)
+    return (0, "", 0)
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

@@ -32,13 +32,13 @@ class TelegramDiscoveryService:
         store: ArchiveStore,
         *,
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
-        auth_seq_provider: Callable[[], int] | None = None,
+        auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
     ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
         self._error_persister = error_persister
-        self._auth_seq_provider = auth_seq_provider
+        self._auth_probe_provider = auth_probe_provider
         self.logger = logging.getLogger(__name__)
 
     async def discover_origins(
@@ -49,12 +49,13 @@ class TelegramDiscoveryService:
         *,
         client: Any,
     ) -> dict[str, Any]:
+        probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
         try:
             if not await client.is_user_authorized():
-                self._set_auth_state("needs_login")
+                self._set_auth_state("needs_login", probe=probe)
                 return {"account_id": self.account_id, "authorized": False, "status": "needs_login", "origins": 0, "topics": 0}
 
-            self._set_auth_state("authorized")
+            self._set_auth_state("authorized", probe=probe)
             origin_count = 0
             topic_count = 0
             private_skipped = 0
@@ -159,9 +160,10 @@ class TelegramDiscoveryService:
         *,
         client: Any,
     ) -> dict[str, Any]:
+        probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
         try:
             if not await client.is_user_authorized():
-                self._set_auth_state("needs_login")
+                self._set_auth_state("needs_login", probe=probe)
                 return {
                     "account_id": self.account_id,
                     "origin_id": origin_id,
@@ -170,7 +172,7 @@ class TelegramDiscoveryService:
                     "participants": 0,
                 }
 
-            self._set_auth_state("authorized")
+            self._set_auth_state("authorized", probe=probe)
             effective_limit, requested_limit = _bounded_discovery_limit(limit, MAX_PARTICIPANT_REFRESH_LIMIT)
             count = 0
             errors: list[dict[str, Any]] = []
@@ -367,7 +369,13 @@ class TelegramDiscoveryService:
             )
         raise RuntimeError("Telethon does not expose GetForumTopicsRequest")
 
-    def _set_auth_state(self, state: str) -> None:
+    def _set_auth_state(self, state: str, *, probe: tuple[int, str, int] | None = None) -> None:
+        if self._error_persister is not None:
+            self._error_persister(lambda st=state, pr=probe: self._persist_auth_state(st, probe=pr))
+            return
+        self._persist_auth_state(state, probe=probe)
+
+    def _persist_auth_state(self, state: str, *, probe: tuple[int, str, int] | None = None) -> None:
         record = AccountAuthRecord(
             source=SOURCE_TELEGRAM,
             account_id=self.account_id,
@@ -376,8 +384,14 @@ class TelegramDiscoveryService:
             session_dir=str(self.config.session_dir),
             updated_at=utc_now_iso(),
         )
-        if self._auth_seq_provider is not None:
-            self.store.upsert_account_auth(record, monotonic_seq=self._auth_seq_provider())
+        if probe is not None:
+            expected_seq, owner_id, owner_epoch = probe
+            self.store.upsert_account_auth(
+                record,
+                expected_seq=expected_seq,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+            )
         else:
             self.store.upsert_account_auth(record)
 

@@ -2120,6 +2120,128 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_discover_and_refresh_prelocked_sqlite_returns_within_budget(self) -> None:
+        import asyncio
+        import sqlite3
+        import threading
+        import time
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "archive.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            iter_calls = {"dialogs": 0, "participants": 0}
+
+            class CachedAuthDisconnectedClient:
+                async def connect(self) -> None:
+                    return None
+
+                async def disconnect(self) -> None:
+                    return None
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def iter_dialogs(self):
+                    iter_calls["dialogs"] += 1
+                    raise ConnectionError("network lost before first dialog page")
+                    yield  # pragma: no cover
+
+                async def iter_participants(self, origin_id: int, limit: int = 500):
+                    iter_calls["participants"] += 1
+                    raise ConnectionError("network lost before first participant page")
+                    yield  # pragma: no cover
+
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=db_path),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: CachedAuthDisconnectedClient(),
+                ingest=False,
+                connect_wait_seconds=0.5,
+                management_timeout_seconds=0.2,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            for _ in range(50):
+                if runtime.statuses() and runtime.statuses()[0]["connected"]:
+                    break
+                time.sleep(0.01)
+
+            # Lock SQLite BEFORE either HTTP request arrives.
+            blocker = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+            blocker.execute("BEGIN IMMEDIATE")
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                req1 = Request(
+                    f"http://127.0.0.1:{port}/manage/discover-origins",
+                    data=json.dumps({"account_id": "main", "include_topics": False}).encode("utf-8"),
+                    method="POST",
+                )
+                req1.add_header("Authorization", "Bearer secret")
+                req1.add_header("Content-Type", "application/json")
+                t0 = time.monotonic()
+                with urlopen(req1, timeout=2) as resp1:
+                    elapsed1 = time.monotonic() - t0
+                    body1 = json.loads(resp1.read().decode("utf-8"))
+                self.assertEqual(body1["item"]["status"], "failed")
+                self.assertEqual(body1["item"]["errors"][0]["code"], "dialog_discovery_failed")
+                self.assertEqual(iter_calls["dialogs"], 1)
+                self.assertLess(elapsed1, 0.2)
+
+                req2 = Request(
+                    f"http://127.0.0.1:{port}/manage/participants/refresh",
+                    data=json.dumps({"account_id": "main", "origin_id": -1001}).encode("utf-8"),
+                    method="POST",
+                )
+                req2.add_header("Authorization", "Bearer secret")
+                req2.add_header("Content-Type", "application/json")
+                t1 = time.monotonic()
+                with urlopen(req2, timeout=2) as resp2:
+                    elapsed2 = time.monotonic() - t1
+                    body2 = json.loads(resp2.read().decode("utf-8"))
+                self.assertEqual(body2["item"]["status"], "failed")
+                self.assertEqual(body2["item"]["errors"][0]["code"], "participant_refresh_failed")
+                self.assertEqual(iter_calls["participants"], 1)
+                self.assertLess(elapsed2, 0.2)
+            finally:
+                blocker.execute("ROLLBACK")
+                blocker.close()
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

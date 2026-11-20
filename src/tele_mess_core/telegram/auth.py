@@ -17,21 +17,23 @@ class TelegramAuthService:
         store: ArchiveStore,
         *,
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
-        auth_seq_provider: Callable[[], int] | None = None,
+        auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
+        auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
     ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
         self._error_persister = error_persister
-        self._auth_seq_provider = auth_seq_provider
+        self._auth_probe_provider = auth_probe_provider
+        self._auth_owner_provider = auth_owner_provider
         self.logger = logging.getLogger(__name__)
 
     async def status(self, client: Any) -> dict[str, Any]:
-        probe_seq = self._auth_seq_provider() if self._auth_seq_provider is not None else None
+        probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
         try:
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
-            self._record_state(state, monotonic_seq=probe_seq)
+            self._record_state(state, probe=probe)
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
         except Exception as exc:
             return self._handle_rpc_error(
@@ -226,7 +228,7 @@ class TelegramAuthService:
         last_error: str | None = None,
         raw: dict[str, Any] | None = None,
         *,
-        monotonic_seq: int | None = None,
+        probe: tuple[int, str, int] | None = None,
     ) -> None:
         now = utc_now_iso()
         self.store.upsert_account(
@@ -249,11 +251,21 @@ class TelegramAuthService:
             updated_at=now,
             raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
         )
-        seq = monotonic_seq
-        if seq is None and self._auth_seq_provider is not None:
-            seq = self._auth_seq_provider()
-        if seq is not None:
-            self.store.upsert_account_auth(auth_record, monotonic_seq=seq)
+        if probe is not None:
+            expected_seq, owner_id, owner_epoch = probe
+            self.store.upsert_account_auth(
+                auth_record,
+                expected_seq=expected_seq,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+            )
+        elif self._auth_owner_provider is not None:
+            owner_id, owner_epoch = self._auth_owner_provider()
+            self.store.upsert_account_auth(
+                auth_record,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+            )
         else:
             self.store.upsert_account_auth(auth_record)
 

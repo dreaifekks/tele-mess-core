@@ -565,13 +565,14 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         try:
             await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
             runtime = manager._runtimes["main"]
+            stale_db_seq = self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main")
             stale_epoch = runtime._auth_state_epoch
 
             # Interactive request_code completes and writes code_sent while supervisor probe is still running.
             sent = await manager.execute("main", "request_code", phone="+1000")
             self.assertEqual(sent["auth_state"], "code_sent")
 
-            # Now let the earlier supervisor probe finish AND also directly attempt a delayed DB write with stale_epoch.
+            # Now let the earlier supervisor probe finish AND also directly attempt a delayed DB write with stale probe.
             release_probe.set()
             await asyncio.sleep(0.05)
             wrote = self.store.upsert_account_auth(
@@ -581,7 +582,9 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
                     auth_state="error",
                     last_error="stale error",
                 ),
-                monotonic_seq=stale_epoch,
+                expected_seq=stale_db_seq,
+                owner_id=runtime._runtime_owner_id,
+                owner_epoch=stale_epoch,
             )
             self.assertFalse(wrote)
         finally:
@@ -624,15 +627,19 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(accounts["main"]["auth_state"], "code_sent")
 
     async def test_auth_seq_survives_restart_and_clock_rollback(self) -> None:
-        # Simulate a prior process that persisted a very high auth_state_seq (e.g. before clock rollback).
+        # Simulate a prior process that persisted a legacy high integer seq (e.g. before clock rollback).
+        with self.store._lock:
+            self.store.set_meta("auth_state_seq:telegram:main", "10000000000000000000")
+            self.store._conn.commit()
         self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
                 account_id="main",
                 auth_state="needs_login",
-            ),
-            monotonic_seq=10000000000000000000,
+            )
         )
+        baseline_seq = self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main")
+        self.assertEqual(baseline_seq, 10000000000000000001)
 
         manager = TelegramRuntimeManager(
             self.config,
@@ -651,7 +658,63 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
 
         accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
         self.assertEqual(accounts["main"]["auth_state"], "code_sent")
-        self.assertGreater(self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main"), 10000000000000000000)
+        self.assertGreater(self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main"), baseline_seq)
+
+    async def test_cross_connection_auth_write_cannot_be_overwritten_by_earlier_probe(self) -> None:
+        # Persist an initial auth state so DB seq starts at 1.
+        self.store.upsert_account_auth(
+            AccountAuthRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                auth_state="needs_login",
+            )
+        )
+        self.assertEqual(self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main"), 1)
+
+        probe_entered = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        class FailingProbeClient(FakeClient):
+            async def is_user_authorized(self) -> bool:
+                probe_entered.set()
+                await release_probe.wait()
+                raise ConnectionError("probe failed after cross-connection write")
+
+        other_store = ArchiveStore(self.root / "archive.db")
+        other_store.initialize()
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: FailingProbeClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
+            # Second connection writes code_sent while runtime's probe is paused (DB seq 1 -> 2).
+            wrote = other_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    auth_state="code_sent",
+                    phone="+1000",
+                )
+            )
+            self.assertTrue(wrote)
+            self.assertEqual(other_store.get_auth_state_seq(SOURCE_TELEGRAM, "main"), 2)
+
+            # Release the older probe (which allocated multiple in-memory epochs) to fail and write error.
+            release_probe.set()
+            await asyncio.sleep(0.08)
+        finally:
+            release_probe.set()
+            await manager.stop()
+            other_store.close()
+
+        accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+        self.assertEqual(accounts["main"]["auth_state"], "code_sent")
 
     async def test_auth_rpc_error_persister_callbacks_run_without_name_error(self) -> None:
         from tele_mess_core.telegram.auth import TelegramAuthService
