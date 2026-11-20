@@ -510,10 +510,9 @@ class TelegramArchiveService:
                 return
 
             def _prepare_media() -> MediaFileRecord:
+                file_size = staged_path.stat().st_size
                 final_path = _unique_media_target_path(target_dir, staged_path.name, record.message_id)
-                os.replace(staged_path, final_path)
-                file_size = final_path.stat().st_size if final_path.exists() else None
-                return MediaFileRecord(
+                media_record = MediaFileRecord(
                     source=SOURCE_TELEGRAM,
                     account_id=self.account_id,
                     chat_id=record.chat_id,
@@ -524,6 +523,8 @@ class TelegramArchiveService:
                     downloaded_at=utc_now_iso(),
                     raw_json=json.dumps({"downloaded": str(final_path)}, ensure_ascii=False),
                 )
+                os.replace(staged_path, final_path)
+                return media_record
 
             def _rollback_media(media_record: MediaFileRecord) -> None:
                 Path(media_record.file_path).unlink(missing_ok=True)

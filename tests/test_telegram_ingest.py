@@ -1496,6 +1496,52 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(list(target_dir.iterdir()), [])
         self.assertFalse(self.store._conn.in_transaction)
 
+        # 3) Fault during stat() before atomic replace leaves zero files in target_dir and zero DB rows.
+        from unittest import mock
+
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        orig_stat = Path.stat
+
+        def failing_stat(path_self: Path, *args, **kwargs):
+            if path_self.name == "stat-fail.bin":
+                raise OSError(5, "Input/output error")
+            return orig_stat(path_self, *args, **kwargs)
+
+        class StatFailMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                staged = Path(file) / "stat-fail.bin"
+                staged.write_bytes(b"complete-bytes")
+                return str(staged)
+
+        msg3 = StatFailMessage(99, chat_id, text="stat fail", media=MessageMediaDocument())
+        with mock.patch.object(Path, "stat", failing_stat):
+            with self.assertRaises(OSError):
+                await service._store_message(msg3, event_type="new")
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=99), [])
+        self.assertEqual(list(target_dir.iterdir()), [])
+        self.assertFalse(self.store._conn.in_transaction)
+
+        # 4) Fault during DB insert after atomic replace rolls back both DB row and published file.
+        class DbFailMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                staged = Path(file) / "db-fail.bin"
+                staged.write_bytes(b"complete-bytes")
+                return str(staged)
+
+        msg4 = DbFailMessage(100, chat_id, text="db fail", media=MessageMediaDocument())
+        with mock.patch.object(
+            self.store,
+            "_upsert_media_file_row_unlocked",
+            side_effect=RuntimeError("simulated sqlite insert error"),
+        ):
+            with self.assertRaisesRegex(RuntimeError, "simulated sqlite insert error"):
+                await service._store_message(msg4, event_type="new")
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=100), [])
+        self.assertEqual(list(target_dir.iterdir()), [])
+        self.assertFalse(self.store._conn.in_transaction)
+
 
 if __name__ == "__main__":
     unittest.main()
