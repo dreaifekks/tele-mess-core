@@ -361,11 +361,35 @@ CREATE TABLE IF NOT EXISTS events (
   payload_json TEXT NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS media_download_jobs (
+  job_id TEXT PRIMARY KEY,
+  source TEXT NOT NULL DEFAULT 'telegram',
+  account_id TEXT NOT NULL,
+  chat_id INTEGER NOT NULL,
+  message_id INTEGER NOT NULL,
+  topic_id INTEGER NOT NULL DEFAULT 0,
+  media_kind TEXT,
+  is_sticker_like INTEGER NOT NULL DEFAULT 0,
+  status TEXT NOT NULL DEFAULT 'pending',
+  attempts INTEGER NOT NULL DEFAULT 0,
+  max_attempts INTEGER NOT NULL DEFAULT 8,
+  claim_token INTEGER NOT NULL DEFAULT 0,
+  next_attempt_at TEXT,
+  last_error TEXT,
+  error_code TEXT,
+  created_at TEXT NOT NULL,
+  updated_at TEXT NOT NULL,
+  completed_at TEXT,
+  UNIQUE(source, account_id, chat_id, message_id)
+);
+
 
 CREATE INDEX IF NOT EXISTS idx_origins_account_type ON origins(source, account_id, origin_type);
 CREATE INDEX IF NOT EXISTS idx_capture_cursors_account ON capture_cursors(source, account_id, origin_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_message ON media_files(source, account_id, chat_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_downloaded ON media_files(downloaded_at);
+CREATE INDEX IF NOT EXISTS idx_media_download_jobs_claim ON media_download_jobs(source, account_id, status, next_attempt_at, created_at);
+CREATE INDEX IF NOT EXISTS idx_media_download_jobs_status ON media_download_jobs(status);
 CREATE INDEX IF NOT EXISTS idx_operation_events_account ON operation_events(source, account_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_operation_events_status ON operation_events(status, error_code);
 CREATE INDEX IF NOT EXISTS idx_backup_policies_enabled ON backup_policies(enabled);
@@ -463,4 +487,26 @@ WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
   OR NEW.claim_token < 0
 BEGIN
   SELECT RAISE(ABORT, 'invalid delivery outbox state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS media_download_jobs_validate_insert
+BEFORE INSERT ON media_download_jobs
+WHEN NEW.status NOT IN ('pending', 'downloading', 'retry', 'completed', 'failed', 'canceled')
+  OR NEW.attempts < 0
+  OR NEW.max_attempts <= 0
+  OR NEW.claim_token < 0
+  OR NEW.is_sticker_like NOT IN (0, 1)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid media download job state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS media_download_jobs_validate_update
+BEFORE UPDATE ON media_download_jobs
+WHEN NEW.status NOT IN ('pending', 'downloading', 'retry', 'completed', 'failed', 'canceled')
+  OR NEW.attempts < 0
+  OR NEW.max_attempts <= 0
+  OR NEW.claim_token < 0
+  OR NEW.is_sticker_like NOT IN (0, 1)
+BEGIN
+  SELECT RAISE(ABORT, 'invalid media download job state');
 END;

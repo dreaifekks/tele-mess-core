@@ -1893,6 +1893,12 @@
           "last_event_seq": {
             "type": "integer"
           },
+          "media_download_failed": {
+            "type": "integer"
+          },
+          "media_download_pending": {
+            "type": "integer"
+          },
           "message_count": {
             "type": "integer"
           },
@@ -2987,6 +2993,12 @@
           "last_event_seq": {
             "type": "integer"
           },
+          "media_download_failed": {
+            "type": "integer"
+          },
+          "media_download_pending": {
+            "type": "integer"
+          },
           "message_count": {
             "type": "integer"
           },
@@ -3049,7 +3061,7 @@
   "info": {
     "title": "tele-mess-core API",
     "version": "2026-11-20.1",
-    "x-contract-hash": "f16be4b2ff70d8ad"
+    "x-contract-hash": "160d630fc8c8273d"
   },
   "openapi": "3.1.0",
   "paths": {

@@ -347,6 +347,63 @@ daily:
             with self.assertRaisesRegex(ValueError, "daily.delivery.origin_id"):
                 load_config(config_path)
 
+    def test_media_download_config_defaults_and_overrides(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            default_path = Path(tmp) / "default.yml"
+            default_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+""",
+                encoding="utf-8",
+            )
+            default_cfg = load_config(default_path)
+            self.assertEqual(default_cfg.telegram.media_download.effective_max_attempts(), 8)
+            self.assertEqual(default_cfg.telegram.media_download.max_retry_delay_seconds, 3600.0)
+            self.assertEqual(default_cfg.telegram.media_download.stale_seconds, 300.0)
+
+            legacy_path = Path(tmp) / "legacy.yml"
+            legacy_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+  media_download:
+    retries: 2
+    retry_delay_seconds: 0.5
+""",
+                encoding="utf-8",
+            )
+            legacy_cfg = load_config(legacy_path)
+            self.assertEqual(legacy_cfg.telegram.media_download.effective_max_attempts(), 3)
+            self.assertEqual(legacy_cfg.telegram.media_download.retry_delay_seconds, 0.5)
+
+            explicit_path = Path(tmp) / "explicit.yml"
+            explicit_path.write_text(
+                """
+storage:
+  database: ./archive.db
+telegram:
+  api_id: 1
+  api_hash: hash
+  media_download:
+    retries: 2
+    max_attempts: 10
+    max_retry_delay_seconds: 120
+    stale_seconds: 90
+""",
+                encoding="utf-8",
+            )
+            explicit_cfg = load_config(explicit_path)
+            self.assertEqual(explicit_cfg.telegram.media_download.effective_max_attempts(), 10)
+            self.assertEqual(explicit_cfg.telegram.media_download.max_retry_delay_seconds, 120.0)
+            self.assertEqual(explicit_cfg.telegram.media_download.stale_seconds, 90.0)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -2913,6 +2913,179 @@ class ArchiveMigrationTest(unittest.TestCase):
                     pass
                 reopened.close()
 
+    def test_v21_upgrade_creates_media_download_jobs_and_refuses_while_v20_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v20_upgrade.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            store.close()
+            old_conn = sqlite3.connect(str(db_path))
+            old_conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS media_download_jobs_validate_insert;
+                DROP TRIGGER IF EXISTS media_download_jobs_validate_update;
+                DROP TABLE IF EXISTS media_download_jobs;
+                UPDATE meta SET value = '20' WHERE key = 'schema_version';
+                PRAGMA user_version = 20;
+                """
+            )
+            old_conn.commit()
+            reopened = ArchiveStore(db_path)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "stop running services before upgrading"):
+                    reopened.initialize()
+                old_conn.close()
+                reopened.initialize()
+                self.assertEqual(reopened.state()["schema_version"], 21)
+                self.assertEqual(reopened.state()["media_download_pending"], 0)
+                self.assertEqual(reopened.state()["media_download_failed"], 0)
+                self.assertTrue(reopened._has_table("media_download_jobs"))
+                # Validation triggers reject invalid status and negative attempts.
+                with self.assertRaises(sqlite3.IntegrityError):
+                    reopened._conn.execute(
+                        """
+                        INSERT INTO media_download_jobs(
+                          job_id, source, account_id, chat_id, message_id, status,
+                          attempts, max_attempts, claim_token, created_at, updated_at
+                        )
+                        VALUES ('bad1', 'telegram', 'main', -1, 1, 'bogus', 0, 8, 0, '2026-01-01T00:00:00+00:00', '2026-01-01T00:00:00+00:00')
+                        """
+                    )
+                if reopened._conn.in_transaction:
+                    reopened._conn.rollback()
+            finally:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+                reopened.close()
+
+    def test_media_download_job_lifecycle_stale_recovery_and_monotonic_claim_token(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArchiveStore(Path(tmp) / "media_jobs.db")
+            store.initialize()
+            try:
+                now = utc_now_iso()
+                store.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "main", -2001, enabled=True, download_media=True)
+                )
+                for mid in (1, 2):
+                    store.upsert_message(
+                        MessageRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="main",
+                            chat_id=-2001,
+                            message_id=mid,
+                            sent_at=now,
+                            ingested_at=now,
+                            text=f"media {mid}",
+                            has_media=True,
+                            media_kind="MessageMediaDocument",
+                        ),
+                        event_type="new",
+                    )
+
+                job1 = store.enqueue_media_download_job(
+                    account_id="main",
+                    chat_id=-2001,
+                    message_id=1,
+                    max_attempts=2,
+                )
+                assert job1 is not None
+                # Idempotent re-enqueue returns the existing row without duplicating.
+                job1_dup = store.enqueue_media_download_job(
+                    account_id="main",
+                    chat_id=-2001,
+                    message_id=1,
+                    max_attempts=2,
+                )
+                assert job1_dup is not None
+                self.assertEqual(job1["job_id"], job1_dup["job_id"])
+                self.assertEqual(store.state()["media_download_pending"], 1)
+
+                claimed1 = store.claim_media_download_job("main")
+                assert claimed1 is not None
+                self.assertEqual(claimed1["status"], "downloading")
+                self.assertEqual(claimed1["attempts"], 1)
+                self.assertEqual(claimed1["claim_token"], 1)
+
+                # Release preserves attempt budget without decrementing claim_token.
+                self.assertTrue(
+                    store.release_media_download_job(
+                        claimed1["job_id"],
+                        expected_claim_token=1,
+                    )
+                )
+                released = store.get_media_download_job(claimed1["job_id"])
+                assert released is not None
+                self.assertEqual(released["status"], "retry")
+                self.assertEqual(released["attempts"], 0)
+                self.assertEqual(released["claim_token"], 1)
+
+                # Next claim increments claim_token to 2; stale token 1 is rejected on complete_media_download_with_file.
+                claimed2 = store.claim_media_download_job("main")
+                assert claimed2 is not None
+                self.assertEqual(claimed2["claim_token"], 2)
+                self.assertEqual(claimed2["attempts"], 1)
+                prepared_called = False
+
+                def _should_not_run() -> MediaFileRecord:
+                    nonlocal prepared_called
+                    prepared_called = True
+                    return MediaFileRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="main",
+                        chat_id=-2001,
+                        message_id=1,
+                        file_path="/tmp/never.bin",
+                    )
+
+                outcome, published = store.complete_media_download_with_file(
+                    job_id=claimed2["job_id"],
+                    expected_claim_token=1,
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-2001,
+                    prepare_media=_should_not_run,
+                )
+                self.assertEqual(outcome, "stale_claim")
+                self.assertIsNone(published)
+                self.assertFalse(prepared_called)
+                self.assertFalse(store._conn.in_transaction)
+
+                # Backdate updated_at to simulate stale lease recovery (attempt 1 -> 2), then exhaust at max_attempts=2.
+                old_ts = "2020-01-01T00:00:00+00:00"
+                store._conn.execute(
+                    "UPDATE media_download_jobs SET updated_at = ? WHERE job_id = ?",
+                    (old_ts, claimed2["job_id"]),
+                )
+                store._conn.commit()
+                recovered = store.claim_media_download_job("main", stale_seconds=60.0)
+                assert recovered is not None
+                self.assertEqual(recovered["claim_token"], 3)
+                self.assertEqual(recovered["attempts"], 2)
+
+                # Another stale timeout at attempts == max_attempts transitions to failed instead of retrying forever.
+                store._conn.execute(
+                    "UPDATE media_download_jobs SET updated_at = ? WHERE job_id = ?",
+                    (old_ts, recovered["job_id"]),
+                )
+                store._conn.commit()
+                self.assertIsNone(store.claim_media_download_job("main", stale_seconds=60.0))
+                exhausted = store.get_media_download_job(recovered["job_id"])
+                assert exhausted is not None
+                self.assertEqual(exhausted["status"], "failed")
+                self.assertEqual(store.state()["media_download_pending"], 0)
+                self.assertEqual(store.state()["media_download_failed"], 1)
+
+                # delete_management_account cleans up media_download_jobs for that account.
+                store.enqueue_media_download_job(account_id="main", chat_id=-2001, message_id=2)
+                self.assertEqual(len(store.list_media_download_jobs(account_id="main")), 2)
+                store.delete_management_account(SOURCE_TELEGRAM, "main")
+                self.assertEqual(store.list_media_download_jobs(account_id="main"), [])
+            finally:
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -45,7 +45,7 @@ from tele_mess_core.media import (
 )
 
 
-SCHEMA_VERSION = 20
+SCHEMA_VERSION = 21
 UPGRADE_PENDING_META = "upgrade_pending"
 LEGACY_SCHEMA_BASELINE = 12
 
@@ -443,6 +443,7 @@ class ArchiveStore:
                 "DELETE FROM backup_policies WHERE source = ? AND account_id = ?",
                 "DELETE FROM participants WHERE source = ? AND account_id = ?",
                 "DELETE FROM capture_cursors WHERE source = ? AND account_id = ?",
+                "DELETE FROM media_download_jobs WHERE source = ? AND account_id = ?",
                 "DELETE FROM operation_events WHERE source = ? AND account_id = ?",
                 "DELETE FROM accounts WHERE source = ? AND account_id = ?",
             ):
@@ -1322,6 +1323,7 @@ class ArchiveStore:
         topic_id: int,
         event_type: str,
         build_record: Callable[[dict[str, Any]], MessageRecord],
+        build_media_job: Callable[[dict[str, Any], MessageRecord], dict[str, Any] | None] | None = None,
     ) -> tuple[int, dict[str, Any]] | None:
         """Atomically resolve effective backup policy, build the message from it, and insert/update in one write transaction."""
         with self._lock:
@@ -1349,12 +1351,49 @@ class ArchiveStore:
                     event_at=now,
                     payload=payload,
                 )
+                if build_media_job is not None:
+                    job_spec = build_media_job(effective_policy, message)
+                    if job_spec is not None:
+                        self._enqueue_media_download_job_unlocked(
+                            source=message.source,
+                            account_id=message.account_id,
+                            chat_id=message.chat_id,
+                            message_id=message.message_id,
+                            topic_id=int(message.topic_id or 0),
+                            media_kind=job_spec.get("media_kind"),
+                            is_sticker_like=bool(job_spec.get("is_sticker_like", False)),
+                            max_attempts=int(job_spec.get("max_attempts", 8)),
+                            now=now,
+                        )
                 self._conn.commit()
                 return event_seq, effective_policy
             except Exception:
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
+
+    def get_message(
+        self,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        message_id: int,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT source, account_id, chat_id, message_id, topic_id, sender_id, sender_name,
+                       sender_username, sent_at, edited_at, ingested_at, deleted_at, text,
+                       has_media, media_kind, grouped_id, reply_to_message_id, forward_from_id,
+                       forward_from_name, permalink, reactions_json, raw_json, version
+                FROM messages
+                WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                """,
+                (source, account_id, chat_id, message_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_dict(row, json_fields={"reactions_json", "raw_json"}, bool_fields={"has_media"})
 
     def _upsert_message_row_unlocked(self, message: MessageRecord, event_type: str, now: str) -> None:
         self._conn.execute(
@@ -1487,6 +1526,14 @@ class ArchiveStore:
                     )
                     if cur.rowcount == 0:
                         continue
+                    self._cancel_pending_media_jobs_for_message_unlocked(
+                        source=source,
+                        account_id=account_id,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        reason="message_deleted",
+                        now=at,
+                    )
                     seqs.append(
                         self._insert_event(
                             source=source,
@@ -1576,6 +1623,14 @@ class ArchiveStore:
                             (at, at, source, account_id, chat_id, message_id),
                         )
                         if cur.rowcount > 0:
+                            self._cancel_pending_media_jobs_for_message_unlocked(
+                                source=source,
+                                account_id=account_id,
+                                chat_id=chat_id,
+                                message_id=message_id,
+                                reason="message_deleted",
+                                now=at,
+                            )
                             seqs.append(
                                 self._insert_event(
                                     source=source,
@@ -1718,6 +1773,714 @@ class ArchiveStore:
                     except OSError:
                         pass
                 raise
+
+    def _cancel_pending_media_jobs_for_message_unlocked(
+        self,
+        *,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        message_id: int,
+        reason: str,
+        now: str,
+    ) -> None:
+        self._conn.execute(
+            """
+            UPDATE media_download_jobs
+            SET status = 'canceled',
+                next_attempt_at = NULL,
+                last_error = ?,
+                error_code = ?,
+                updated_at = ?,
+                completed_at = ?
+            WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+              AND status IN ('pending', 'retry')
+            """,
+            (reason, reason, now, now, source, account_id, chat_id, message_id),
+        )
+
+    def _enqueue_media_download_job_unlocked(
+        self,
+        *,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        message_id: int,
+        topic_id: int = 0,
+        media_kind: str | None = None,
+        is_sticker_like: bool = False,
+        max_attempts: int = 8,
+        requeue_failed: bool = False,
+        now: str | None = None,
+    ) -> dict[str, Any] | None:
+        existing_file = self._conn.execute(
+            """
+            SELECT 1 FROM media_files
+            WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+            LIMIT 1
+            """,
+            (source, account_id, chat_id, message_id),
+        ).fetchone()
+        if existing_file is not None:
+            return None
+        deleted_msg = self._conn.execute(
+            """
+            SELECT 1 FROM messages
+            WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+              AND deleted_at IS NOT NULL
+            LIMIT 1
+            """,
+            (source, account_id, chat_id, message_id),
+        ).fetchone()
+        if deleted_msg is not None:
+            return None
+        ts = now or utc_now_iso()
+        attempts_limit = max(1, int(max_attempts))
+        sticker_flag = 1 if is_sticker_like else 0
+        existing = self._conn.execute(
+            """
+            SELECT * FROM media_download_jobs
+            WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+            """,
+            (source, account_id, chat_id, message_id),
+        ).fetchone()
+        if existing is not None:
+            status = str(existing["status"])
+            if status in ("pending", "downloading", "retry", "completed"):
+                return _row_to_dict(existing, bool_fields={"is_sticker_like"})
+            if status == "failed" and not requeue_failed:
+                return _row_to_dict(existing, bool_fields={"is_sticker_like"})
+            self._conn.execute(
+                """
+                UPDATE media_download_jobs
+                SET topic_id = ?,
+                    media_kind = ?,
+                    is_sticker_like = ?,
+                    status = 'pending',
+                    attempts = 0,
+                    max_attempts = ?,
+                    next_attempt_at = NULL,
+                    last_error = NULL,
+                    error_code = NULL,
+                    updated_at = ?,
+                    completed_at = NULL
+                WHERE job_id = ?
+                """,
+                (
+                    int(topic_id or 0),
+                    media_kind,
+                    sticker_flag,
+                    attempts_limit,
+                    ts,
+                    existing["job_id"],
+                ),
+            )
+            refreshed = self._conn.execute(
+                "SELECT * FROM media_download_jobs WHERE job_id = ?",
+                (existing["job_id"],),
+            ).fetchone()
+            return _row_to_dict(refreshed, bool_fields={"is_sticker_like"}) if refreshed else None
+
+        job_id = f"mdj_{uuid.uuid4().hex[:12]}"
+        self._conn.execute(
+            """
+            INSERT INTO media_download_jobs(
+              job_id, source, account_id, chat_id, message_id, topic_id, media_kind,
+              is_sticker_like, status, attempts, max_attempts, claim_token,
+              next_attempt_at, last_error, error_code, created_at, updated_at, completed_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, 0, NULL, NULL, NULL, ?, ?, NULL)
+            """,
+            (
+                job_id,
+                source,
+                account_id,
+                int(chat_id),
+                int(message_id),
+                int(topic_id or 0),
+                media_kind,
+                sticker_flag,
+                attempts_limit,
+                ts,
+                ts,
+            ),
+        )
+        inserted = self._conn.execute(
+            "SELECT * FROM media_download_jobs WHERE job_id = ?",
+            (job_id,),
+        ).fetchone()
+        return _row_to_dict(inserted, bool_fields={"is_sticker_like"}) if inserted else None
+
+    def enqueue_media_download_job(
+        self,
+        *,
+        source: str = SOURCE_TELEGRAM,
+        account_id: str,
+        chat_id: int,
+        message_id: int,
+        topic_id: int = 0,
+        media_kind: str | None = None,
+        is_sticker_like: bool = False,
+        max_attempts: int = 8,
+        requeue_failed: bool = False,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                before_changes = self._conn.total_changes
+                job = self._enqueue_media_download_job_unlocked(
+                    source=source,
+                    account_id=account_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    topic_id=topic_id,
+                    media_kind=media_kind,
+                    is_sticker_like=is_sticker_like,
+                    max_attempts=max_attempts,
+                    requeue_failed=requeue_failed,
+                    now=now,
+                )
+                if self._conn.total_changes > before_changes:
+                    self._conn.commit()
+                else:
+                    self._conn.rollback()
+                return job
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def claim_media_download_job(
+        self,
+        account_id: str,
+        *,
+        source: str = SOURCE_TELEGRAM,
+        stale_seconds: float = 300.0,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now_dt = datetime.now(dt_timezone.utc)
+                now = now_dt.isoformat()
+                stale_before = (now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))).isoformat()
+                expired = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'failed',
+                        error_code = COALESCE(error_code, 'media_download_stale_exhausted'),
+                        last_error = COALESCE(last_error, 'stale download lease exhausted max attempts'),
+                        next_attempt_at = NULL,
+                        updated_at = ?,
+                        completed_at = ?
+                    WHERE source = ?
+                      AND account_id = ?
+                      AND status = 'downloading'
+                      AND updated_at <= ?
+                      AND attempts >= max_attempts
+                    """,
+                    (now, now, source, account_id, stale_before),
+                )
+                row = self._conn.execute(
+                    """
+                    SELECT *
+                    FROM media_download_jobs
+                    WHERE source = ?
+                      AND account_id = ?
+                      AND (
+                        (status IN ('pending', 'retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
+                        OR (status = 'downloading' AND updated_at <= ? AND attempts < max_attempts)
+                      )
+                    ORDER BY COALESCE(next_attempt_at, created_at) ASC, created_at ASC, job_id ASC
+                    LIMIT 1
+                    """,
+                    (source, account_id, now, stale_before),
+                ).fetchone()
+                if row is None:
+                    if expired.rowcount > 0:
+                        self._conn.commit()
+                    else:
+                        self._conn.rollback()
+                    return None
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'downloading',
+                        claim_token = claim_token + 1,
+                        attempts = attempts + 1,
+                        next_attempt_at = NULL,
+                        updated_at = ?
+                    WHERE job_id = ? AND claim_token = ?
+                    """,
+                    (now, row["job_id"], int(row["claim_token"])),
+                )
+                if cur.rowcount == 0:
+                    if expired.rowcount > 0:
+                        self._conn.commit()
+                    else:
+                        self._conn.rollback()
+                    return None
+                claimed = self._conn.execute(
+                    "SELECT * FROM media_download_jobs WHERE job_id = ?",
+                    (row["job_id"],),
+                ).fetchone()
+                self._conn.commit()
+                return _row_to_dict(claimed, bool_fields={"is_sticker_like"}) if claimed else None
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def next_media_download_due_at(
+        self,
+        account_id: str,
+        *,
+        source: str = SOURCE_TELEGRAM,
+        stale_seconds: float = 300.0,
+    ) -> str | None:
+        with self._lock:
+            immediate = self._conn.execute(
+                """
+                SELECT 1
+                FROM media_download_jobs
+                WHERE source = ? AND account_id = ?
+                  AND status IN ('pending', 'retry')
+                  AND next_attempt_at IS NULL
+                LIMIT 1
+                """,
+                (source, account_id),
+            ).fetchone()
+            if immediate is not None:
+                return utc_now_iso()
+            next_row = self._conn.execute(
+                """
+                SELECT MIN(next_attempt_at) AS due_at
+                FROM media_download_jobs
+                WHERE source = ? AND account_id = ?
+                  AND status IN ('pending', 'retry')
+                  AND next_attempt_at IS NOT NULL
+                """,
+                (source, account_id),
+            ).fetchone()
+            downloading_row = self._conn.execute(
+                """
+                SELECT MIN(updated_at) AS oldest_updated_at
+                FROM media_download_jobs
+                WHERE source = ? AND account_id = ?
+                  AND status = 'downloading'
+                """,
+                (source, account_id),
+            ).fetchone()
+        candidates: list[str] = []
+        if next_row is not None and next_row["due_at"]:
+            candidates.append(str(next_row["due_at"]))
+        if downloading_row is not None and downloading_row["oldest_updated_at"]:
+            try:
+                started = datetime.fromisoformat(str(downloading_row["oldest_updated_at"]))
+                if started.tzinfo is None:
+                    started = started.replace(tzinfo=dt_timezone.utc)
+                stale_due = (started + timedelta(seconds=max(0.0, float(stale_seconds)))).isoformat()
+                candidates.append(stale_due)
+            except ValueError:
+                pass
+        return min(candidates) if candidates else None
+
+    def heartbeat_media_download_job(self, job_id: str, *, expected_claim_token: int) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET updated_at = ?
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (now, job_id, int(expected_claim_token)),
+                )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def complete_media_download_job(self, job_id: str, *, expected_claim_token: int) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'completed',
+                        next_attempt_at = NULL,
+                        last_error = NULL,
+                        error_code = NULL,
+                        updated_at = ?,
+                        completed_at = ?
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (now, now, job_id, int(expected_claim_token)),
+                )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def complete_media_download_with_file(
+        self,
+        *,
+        job_id: str,
+        expected_claim_token: int,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        topic_id: int = 0,
+        is_sticker_like: bool = False,
+        prepare_media: Callable[[], MediaFileRecord],
+        rollback_media: Callable[[MediaFileRecord], None] | None = None,
+    ) -> tuple[str, MediaFileRecord | None]:
+        """Atomically fence claim_token, verify message & effective policy, publish media, and complete the job."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            published: MediaFileRecord | None = None
+            try:
+                now = utc_now_iso()
+                job_row = self._conn.execute(
+                    """
+                    SELECT chat_id, message_id, topic_id
+                    FROM media_download_jobs
+                    WHERE job_id = ? AND source = ? AND account_id = ? AND chat_id = ?
+                      AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (job_id, source, account_id, int(chat_id), int(expected_claim_token)),
+                ).fetchone()
+                if job_row is None:
+                    self._conn.rollback()
+                    return "stale_claim", None
+                message_id = int(job_row["message_id"])
+                msg_row = self._conn.execute(
+                    """
+                    SELECT topic_id, deleted_at
+                    FROM messages
+                    WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                    """,
+                    (source, account_id, chat_id, message_id),
+                ).fetchone()
+                if msg_row is None or msg_row["deleted_at"] is not None:
+                    self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'canceled',
+                            next_attempt_at = NULL,
+                            last_error = 'message_deleted',
+                            error_code = 'message_deleted',
+                            updated_at = ?,
+                            completed_at = ?
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (now, now, job_id, int(expected_claim_token)),
+                    )
+                    self._conn.commit()
+                    return "canceled", None
+
+                effective_topic_id = int(msg_row["topic_id"] or topic_id or 0)
+                effective_policy, _policy_source = self._resolve_effective_backup_policy_unlocked(
+                    source,
+                    account_id,
+                    chat_id,
+                    topic_id=effective_topic_id,
+                )
+                allowed = bool(effective_policy.get("enabled")) and bool(
+                    effective_policy.get("download_stickers" if is_sticker_like else "download_media")
+                )
+                if not allowed:
+                    self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'canceled',
+                            next_attempt_at = NULL,
+                            last_error = 'policy_disabled',
+                            error_code = 'policy_disabled',
+                            updated_at = ?,
+                            completed_at = ?
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (now, now, job_id, int(expected_claim_token)),
+                    )
+                    self._conn.commit()
+                    return "canceled", None
+
+                existing_file = self._conn.execute(
+                    """
+                    SELECT 1 FROM media_files
+                    WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                    LIMIT 1
+                    """,
+                    (source, account_id, chat_id, message_id),
+                ).fetchone()
+                if existing_file is not None:
+                    self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'completed',
+                            next_attempt_at = NULL,
+                            last_error = NULL,
+                            error_code = NULL,
+                            updated_at = ?,
+                            completed_at = ?
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (now, now, job_id, int(expected_claim_token)),
+                    )
+                    self._conn.commit()
+                    return "already_exists", None
+
+                published = prepare_media()
+                self._upsert_media_file_row_unlocked(published)
+                self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'completed',
+                        next_attempt_at = NULL,
+                        last_error = NULL,
+                        error_code = NULL,
+                        updated_at = ?,
+                        completed_at = ?
+                    WHERE job_id = ? AND claim_token = ?
+                    """,
+                    (now, now, job_id, int(expected_claim_token)),
+                )
+                self._conn.commit()
+                return "completed", published
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                if published is not None and rollback_media is not None:
+                    try:
+                        rollback_media(published)
+                    except OSError:
+                        pass
+                raise
+
+    def retry_media_download_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+        error_code: str,
+        next_attempt_at: str,
+        expected_claim_token: int,
+        preserve_attempt_budget: bool = False,
+    ) -> str | None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                row = self._conn.execute(
+                    """
+                    SELECT attempts, max_attempts
+                    FROM media_download_jobs
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (job_id, int(expected_claim_token)),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return None
+                attempts = int(row["attempts"])
+                max_attempts = int(row["max_attempts"])
+                new_attempts = max(0, attempts - 1) if preserve_attempt_budget else attempts
+                if not preserve_attempt_budget and new_attempts >= max_attempts:
+                    self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET status = 'failed',
+                            attempts = ?,
+                            next_attempt_at = NULL,
+                            last_error = ?,
+                            error_code = ?,
+                            updated_at = ?,
+                            completed_at = ?
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (new_attempts, error, error_code, now, now, job_id, int(expected_claim_token)),
+                    )
+                    self._conn.commit()
+                    return "failed"
+                self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'retry',
+                        attempts = ?,
+                        next_attempt_at = ?,
+                        last_error = ?,
+                        error_code = ?,
+                        updated_at = ?
+                    WHERE job_id = ? AND claim_token = ?
+                    """,
+                    (new_attempts, next_attempt_at, error, error_code, now, job_id, int(expected_claim_token)),
+                )
+                self._conn.commit()
+                return "retry"
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def release_media_download_job(
+        self,
+        job_id: str,
+        *,
+        error: str = "worker_stopped",
+        expected_claim_token: int,
+    ) -> bool:
+        """Release a claimed media download on graceful shutdown without spending attempt budget or reusing claim_token."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'retry',
+                        attempts = MAX(0, attempts - 1),
+                        next_attempt_at = ?,
+                        last_error = ?,
+                        error_code = 'worker_stopped',
+                        updated_at = ?
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (now, error, now, job_id, int(expected_claim_token)),
+                )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def fail_media_download_job(
+        self,
+        job_id: str,
+        *,
+        error: str,
+        error_code: str,
+        expected_claim_token: int,
+    ) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'failed',
+                        next_attempt_at = NULL,
+                        last_error = ?,
+                        error_code = ?,
+                        updated_at = ?,
+                        completed_at = ?
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (error, error_code, now, now, job_id, int(expected_claim_token)),
+                )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def cancel_media_download_job(
+        self,
+        job_id: str,
+        *,
+        reason: str,
+        expected_claim_token: int,
+    ) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                cur = self._conn.execute(
+                    """
+                    UPDATE media_download_jobs
+                    SET status = 'canceled',
+                        next_attempt_at = NULL,
+                        last_error = ?,
+                        error_code = ?,
+                        updated_at = ?,
+                        completed_at = ?
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (reason, reason, now, now, job_id, int(expected_claim_token)),
+                )
+                if cur.rowcount > 0:
+                    self._conn.commit()
+                    return True
+                self._conn.rollback()
+                return False
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
+
+    def get_media_download_job(self, job_id: str) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT * FROM media_download_jobs WHERE job_id = ?",
+                (job_id,),
+            ).fetchone()
+        return _row_to_dict(row, bool_fields={"is_sticker_like"}) if row else None
+
+    def list_media_download_jobs(
+        self,
+        *,
+        account_id: str | None = None,
+        status: str | None = None,
+        source: str | None = None,
+        limit: int = 100,
+    ) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if source is not None:
+            clauses.append("source = ?")
+            params.append(source)
+        if account_id is not None:
+            clauses.append("account_id = ?")
+            params.append(account_id)
+        if status is not None:
+            clauses.append("status = ?")
+            params.append(status)
+        where = f"WHERE {' AND '.join(clauses)}" if clauses else ""
+        params.append(max(1, int(limit)))
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM media_download_jobs
+                {where}
+                ORDER BY created_at ASC, job_id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        return [_row_to_dict(row, bool_fields={"is_sticker_like"}) for row in rows]
 
     def list_media_files(
         self,
@@ -3925,12 +4688,22 @@ class ArchiveStore:
             operation_error_count = self._conn.execute(
                 "SELECT COUNT(*) AS count FROM operation_events WHERE status IN ('failed', 'partial', 'rate_limited')"
             ).fetchone()
+            media_counts = self._conn.execute(
+                """
+                SELECT
+                  SUM(CASE WHEN status IN ('pending', 'downloading', 'retry') THEN 1 ELSE 0 END) AS pending_count,
+                  SUM(CASE WHEN status = 'failed' THEN 1 ELSE 0 END) AS failed_count
+                FROM media_download_jobs
+                """
+            ).fetchone()
             return {
                 "database_id": self.get_meta("database_id"),
                 "schema_version": int(self.get_meta("schema_version") or 0),
                 "last_event_seq": row["seq"],
                 "message_count": message_count["count"],
                 "operation_error_count": operation_error_count["count"],
+                "media_download_pending": int((media_counts["pending_count"] or 0) if media_counts else 0),
+                "media_download_failed": int((media_counts["failed_count"] or 0) if media_counts else 0),
                 "server_time": utc_now_iso(),
             }
 

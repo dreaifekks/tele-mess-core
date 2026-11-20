@@ -29,8 +29,18 @@ class BackfillConfig:
 
 @dataclass(slots=True)
 class MediaDownloadConfig:
-    retries: int = 2
+    retries: int | None = None
     retry_delay_seconds: float = 1.0
+    max_attempts: int | None = None
+    max_retry_delay_seconds: float = 3600.0
+    stale_seconds: float = 300.0
+
+    def effective_max_attempts(self) -> int:
+        if self.max_attempts is not None:
+            return max(1, int(self.max_attempts))
+        if self.retries is not None:
+            return max(1, int(self.retries) + 1)
+        return 8
 
 
 @dataclass(slots=True)
@@ -316,9 +326,14 @@ def _parse_media_download(raw: Any) -> MediaDownloadConfig:
         raw = {}
     if not isinstance(raw, dict):
         raise ValueError("telegram.media_download must be a mapping")
+    retries_raw = raw.get("retries")
+    max_attempts_raw = raw.get("max_attempts")
     return MediaDownloadConfig(
-        retries=max(0, int(raw.get("retries", 2))),
+        retries=max(0, int(retries_raw)) if retries_raw is not None else None,
         retry_delay_seconds=max(0.0, float(raw.get("retry_delay_seconds", 1.0))),
+        max_attempts=max(1, int(max_attempts_raw)) if max_attempts_raw is not None else None,
+        max_retry_delay_seconds=max(0.0, float(raw.get("max_retry_delay_seconds", 3600.0))),
+        stale_seconds=max(1.0, float(raw.get("stale_seconds", 300.0))),
     )
 
 

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+from datetime import datetime, timedelta, timezone as dt_timezone
 import json
 import logging
 import os
@@ -39,6 +40,12 @@ class _InflightFetchState:
     deleted: bool = False
 
 
+class _MediaDownloadResultError(RuntimeError):
+    def __init__(self, code: str, message: str) -> None:
+        super().__init__(message)
+        self.code = code
+
+
 class TelegramArchiveService:
     def __init__(
         self,
@@ -58,6 +65,8 @@ class TelegramArchiveService:
         self._backfill_lock = asyncio.Lock()
         self._retry_targets: set[CaptureTarget] = set()
         self._retry_task: asyncio.Task[None] | None = None
+        self._media_wakeup = asyncio.Event()
+        self._media_worker_task: asyncio.Task[None] | None = None
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
         self._inflight_fetches: dict[tuple[int, int], dict[int, _InflightFetchState]] = {}
@@ -171,6 +180,7 @@ class TelegramArchiveService:
         self._handlers_registered = True
 
     async def activate(self, client: Any) -> None:
+        self._closed = False
         self.register_handlers(client)
         if not await client.is_user_authorized():
             raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
@@ -197,6 +207,7 @@ class TelegramArchiveService:
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):
             await catch_up()
+        self._start_media_worker()
         await self.refresh_capture_targets()
 
     async def refresh_capture_targets(self) -> None:
@@ -208,15 +219,114 @@ class TelegramArchiveService:
         )
         failed_targets = await self._backfill_capture_targets(capture_targets)
         self._schedule_backfill_retry(failed_targets)
+        self._media_wakeup.set()
 
     async def stop(self) -> None:
         self._closed = True
         self._retry_targets.clear()
+        self._media_wakeup.set()
+        tasks: list[asyncio.Task[None]] = []
         task = self._retry_task
         self._retry_task = None
         if task is not None and not task.done():
             task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            tasks.append(task)
+        media_task = self._media_worker_task
+        self._media_worker_task = None
+        if media_task is not None and not media_task.done():
+            media_task.cancel()
+            tasks.append(media_task)
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+    def _start_media_worker(self) -> None:
+        if self._closed:
+            return
+        if self._media_worker_task is not None and not self._media_worker_task.done():
+            self._media_wakeup.set()
+            return
+        self._media_worker_task = asyncio.create_task(
+            self._media_worker_loop(),
+            name=f"telegram-media-worker-{self.account_id}",
+        )
+        self._media_wakeup.set()
+
+    async def _media_worker_loop(self) -> None:
+        try:
+            while not self._closed:
+                self._media_wakeup.clear()
+                if self.client is None:
+                    await self._wait_media_wakeup(1.0)
+                    continue
+                is_connected = getattr(self.client, "is_connected", None)
+                if callable(is_connected) and not is_connected():
+                    await self._wait_media_wakeup(1.0)
+                    continue
+                try:
+                    job = self.store.claim_media_download_job(
+                        self.account_id,
+                        source=SOURCE_TELEGRAM,
+                        stale_seconds=self.media_download.stale_seconds,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to claim media download job for account=%s: %s",
+                        self.account_id,
+                        exc,
+                    )
+                    await self._wait_media_wakeup(1.0)
+                    continue
+                if job is not None:
+                    await self._execute_media_download_job(job)
+                    continue
+                try:
+                    next_due = self.store.next_media_download_due_at(
+                        self.account_id,
+                        source=SOURCE_TELEGRAM,
+                        stale_seconds=self.media_download.stale_seconds,
+                    )
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to inspect media download queue for account=%s: %s",
+                        self.account_id,
+                        exc,
+                    )
+                    await self._wait_media_wakeup(1.0)
+                    continue
+                if next_due is None:
+                    await self._media_wakeup.wait()
+                    continue
+                sleep_seconds = _seconds_until_iso(next_due)
+                if sleep_seconds > 0:
+                    await self._wait_media_wakeup(min(sleep_seconds, 60.0))
+        except asyncio.CancelledError:
+            raise
+        finally:
+            if self._media_worker_task is asyncio.current_task():
+                self._media_worker_task = None
+
+    async def _wait_media_wakeup(self, timeout: float) -> None:
+        if timeout <= 0:
+            return
+        try:
+            await asyncio.wait_for(self._media_wakeup.wait(), timeout=timeout)
+        except TimeoutError:
+            return
+
+    async def process_pending_media_downloads(self, *, max_jobs: int | None = None) -> int:
+        """Deterministically drain currently due media download jobs for this account."""
+        processed = 0
+        while max_jobs is None or processed < max_jobs:
+            job = self.store.claim_media_download_job(
+                self.account_id,
+                source=SOURCE_TELEGRAM,
+                stale_seconds=self.media_download.stale_seconds,
+            )
+            if job is None:
+                break
+            await self._execute_media_download_job(job)
+            processed += 1
+        return processed
 
     def _schedule_backfill_retry(self, targets: list[CaptureTarget]) -> None:
         if self._closed or not targets:
@@ -391,6 +501,28 @@ class TelegramArchiveService:
                 )
                 return built_record
 
+            enqueued_media = False
+
+            def _build_media_job(
+                effective: dict[str, Any],
+                record: MessageRecord,
+            ) -> dict[str, Any] | None:
+                nonlocal enqueued_media
+                download_media = bool(effective.get("download_media", False))
+                download_stickers = bool(effective.get("download_stickers", False))
+                should_download = download_stickers if is_sticker_like else download_media
+                if not should_download or not _message_media_downloadable(
+                    message,
+                    include_stickers=is_sticker_like,
+                ):
+                    return None
+                enqueued_media = True
+                return {
+                    "media_kind": record.media_kind,
+                    "is_sticker_like": is_sticker_like,
+                    "max_attempts": self.media_download.effective_max_attempts(),
+                }
+
             result = self.store.upsert_message_if_policy_enabled(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -398,6 +530,7 @@ class TelegramArchiveService:
                 topic_id=topic_id,
                 event_type=event_type,
                 build_record=_build_record,
+                build_media_job=_build_media_job,
             )
             if result is None or built_record is None:
                 return False
@@ -408,117 +541,162 @@ class TelegramArchiveService:
         finally:
             self._unregister_inflight_fetch(chat_id, message_id, active_state)
 
-        if self._should_download_media_for(
-            chat_id,
-            topic_id,
-            is_sticker_like=is_sticker_like,
-        ) and _message_media_downloadable(
-            message,
-            include_stickers=is_sticker_like,
-        ):
-            existing_media = (
-                self.store.list_media_files(
-                    account_id=self.account_id,
-                    chat_id=built_record.chat_id,
-                    message_id=built_record.message_id,
-                )
-                if event_type == "backfill"
-                else []
-            )
-            if not existing_media:
-                await self._download_message_media(
-                    message,
-                    built_record,
-                    is_sticker_like=is_sticker_like,
-                )
+        if enqueued_media:
+            self._media_wakeup.set()
         self._update_capture_cursor(chat_id, topic_id, message_id, built_record.sent_at)
         return True
 
+    async def _execute_media_download_job(self, job: dict[str, Any]) -> None:
+        from telethon.tl.types import MessageService
 
-    async def _download_message_media(
-        self,
-        message: Any,
-        record: MessageRecord,
-        *,
-        is_sticker_like: bool = False,
-    ) -> None:
-        target_dir = self.store.database_path.parent / "media" / self.account_id / str(record.chat_id)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        downloaded: str | None = None
-        staging_dir: Path | None = None
-        attempts = max(1, self.media_download.retries + 1)
-        success_attempt = 0
-        try:
-            for attempt in range(1, attempts + 1):
-                if not self._should_download_media_for(
-                    record.chat_id,
-                    record.topic_id,
-                    is_sticker_like=is_sticker_like,
-                ):
-                    return
-                attempt_dir = target_dir / f".part-{uuid.uuid4().hex}"
-                attempt_dir.mkdir(parents=True, exist_ok=True)
+        job_id = str(job["job_id"])
+        claim_token = int(job["claim_token"])
+        attempts = int(job["attempts"])
+        max_attempts = int(job["max_attempts"])
+        chat_id = int(job["chat_id"])
+        message_id = int(job["message_id"])
+        topic_id = int(job.get("topic_id") or 0)
+        is_sticker_like = bool(job.get("is_sticker_like", False))
+        effective_is_sticker = is_sticker_like
+        media_kind = job.get("media_kind")
+        attempt_dir: Path | None = None
+        heartbeat_task: asyncio.Task[None] | None = None
+
+        async def _heartbeat_loop() -> None:
+            interval = max(0.05, float(self.media_download.stale_seconds) / 3.0)
+            while True:
+                await asyncio.sleep(interval)
                 try:
-                    downloaded = await message.download_media(file=str(attempt_dir))
-                    staging_dir = attempt_dir
-                    success_attempt = attempt
-                    break
-                except Exception as exc:
-                    shutil.rmtree(attempt_dir, ignore_errors=True)
-                    error = classify_telegram_exception(exc, default_code="media_download_failed")
-                    self.logger.warning(
-                        "Failed to download media for account=%s chat=%s message=%s attempt=%s/%s: %s",
-                        self.account_id,
-                        record.chat_id,
-                        record.message_id,
-                        attempt,
-                        attempts,
-                        error.message,
+                    alive = self.store.heartbeat_media_download_job(
+                        job_id,
+                        expected_claim_token=claim_token,
                     )
-                    if attempt >= attempts:
-                        self._record_operation(
-                            "media_download",
-                            "failed",
-                            subject_type="message",
-                            subject_id=f"{record.chat_id}/{record.message_id}",
-                            error=error.to_public_dict() | {"attempts": attempts},
-                        )
+                    if not alive:
                         return
-                    if self.media_download.retry_delay_seconds > 0:
-                        await asyncio.sleep(self.media_download.retry_delay_seconds)
-                except BaseException:
-                    shutil.rmtree(attempt_dir, ignore_errors=True)
-                    raise
-            if not downloaded:
-                self._record_operation(
-                    "media_download",
-                    "failed",
-                    subject_type="message",
-                    subject_id=f"{record.chat_id}/{record.message_id}",
-                    error={"code": "media_download_empty", "message": "download_media returned no file path", "attempts": attempts},
+                except Exception:
+                    return
+
+        try:
+            existing_media = self.store.list_media_files(
+                account_id=self.account_id,
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            if existing_media:
+                self.store.complete_media_download_job(job_id, expected_claim_token=claim_token)
+                return
+
+            stored_message = self.store.get_message(SOURCE_TELEGRAM, self.account_id, chat_id, message_id)
+            if stored_message is None or stored_message.get("deleted_at") is not None:
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="message_deleted",
+                    expected_claim_token=claim_token,
                 )
                 return
+            topic_id = int(stored_message.get("topic_id") or topic_id or 0)
+
+            if not self._should_download_media_for(
+                chat_id,
+                topic_id,
+                is_sticker_like=is_sticker_like,
+            ):
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="policy_disabled",
+                    expected_claim_token=claim_token,
+                )
+                return
+
+            if self.client is None:
+                self.store.release_media_download_job(
+                    job_id,
+                    error="client_unavailable",
+                    expected_claim_token=claim_token,
+                )
+                return
+
+            fetched = await self.client.get_messages(chat_id, ids=message_id)
+            refreshed_messages = _coerce_messages(fetched)
+            refreshed_msg = next(
+                (
+                    item
+                    for item in refreshed_messages
+                    if int(getattr(item, "id", 0)) == message_id
+                    and (
+                        getattr(item, "chat_id", None) is None
+                        or int(getattr(item, "chat_id")) == chat_id
+                    )
+                ),
+                None,
+            )
+            if refreshed_msg is None or isinstance(refreshed_msg, MessageService):
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="media_unavailable",
+                    expected_claim_token=claim_token,
+                )
+                return
+
+            refreshed_is_sticker = _message_media_is_sticker_like(refreshed_msg)
+            effective_is_sticker = refreshed_is_sticker
+            if not self._should_download_media_for(
+                chat_id,
+                topic_id,
+                is_sticker_like=refreshed_is_sticker,
+            ):
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="policy_disabled",
+                    expected_claim_token=claim_token,
+                )
+                return
+
+            if not _message_media_downloadable(refreshed_msg, include_stickers=refreshed_is_sticker):
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="media_unavailable",
+                    expected_claim_token=claim_token,
+                )
+                return
+
+            refreshed_media_kind = (
+                type(refreshed_msg.media).__name__
+                if getattr(refreshed_msg, "media", None) is not None
+                else media_kind
+            )
+            target_dir = self.store.database_path.parent / "media" / self.account_id / str(chat_id)
+            target_dir.mkdir(parents=True, exist_ok=True)
+            attempt_dir = target_dir / f".part-{uuid.uuid4().hex}"
+            attempt_dir.mkdir(parents=True, exist_ok=True)
+
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(),
+                name=f"media-download-heartbeat-{job_id}",
+            )
+            downloaded = await refreshed_msg.download_media(file=str(attempt_dir))
+            if not downloaded:
+                raise _MediaDownloadResultError(
+                    "media_download_empty",
+                    "download_media returned no file path",
+                )
             staged_path = Path(downloaded)
             if not staged_path.exists():
-                self._record_operation(
-                    "media_download",
-                    "failed",
-                    subject_type="message",
-                    subject_id=f"{record.chat_id}/{record.message_id}",
-                    error={"code": "media_download_missing", "message": "download_media file path does not exist", "attempts": attempts},
+                raise _MediaDownloadResultError(
+                    "media_download_missing",
+                    "download_media file path does not exist",
                 )
-                return
 
             def _prepare_media() -> MediaFileRecord:
                 file_size = staged_path.stat().st_size
-                final_path = _unique_media_target_path(target_dir, staged_path.name, record.message_id)
+                final_path = _unique_media_target_path(target_dir, staged_path.name, message_id)
                 media_record = MediaFileRecord(
                     source=SOURCE_TELEGRAM,
                     account_id=self.account_id,
-                    chat_id=record.chat_id,
-                    message_id=record.message_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
                     file_path=str(final_path),
-                    media_kind=record.media_kind,
+                    media_kind=refreshed_media_kind,
                     file_size=file_size,
                     downloaded_at=utc_now_iso(),
                     raw_json=json.dumps({"downloaded": str(final_path)}, ensure_ascii=False),
@@ -529,28 +707,122 @@ class TelegramArchiveService:
             def _rollback_media(media_record: MediaFileRecord) -> None:
                 Path(media_record.file_path).unlink(missing_ok=True)
 
-            published = self.store.upsert_media_file_if_policy_allows(
+            outcome, _published = self.store.complete_media_download_with_file(
+                job_id=job_id,
+                expected_claim_token=claim_token,
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
-                chat_id=record.chat_id,
-                topic_id=record.topic_id,
-                is_sticker_like=is_sticker_like,
+                chat_id=chat_id,
+                topic_id=topic_id,
+                is_sticker_like=refreshed_is_sticker,
                 prepare_media=_prepare_media,
                 rollback_media=_rollback_media,
             )
-            if published is None:
-                return
-            if success_attempt > 1:
+            if outcome == "completed" and attempts > 1:
                 self._record_operation(
                     "media_download",
                     "ok",
                     subject_type="message",
-                    subject_id=f"{record.chat_id}/{record.message_id}",
-                    error={"attempts": success_attempt},
+                    subject_id=f"{chat_id}/{message_id}",
+                    error={"attempts": attempts, "job_id": job_id},
+                )
+        except asyncio.CancelledError:
+            if attempt_dir is not None:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                attempt_dir = None
+            try:
+                self.store.release_media_download_job(
+                    job_id,
+                    error="worker_stopped",
+                    expected_claim_token=claim_token,
+                )
+            except Exception as exc:
+                self.logger.debug("Failed to release media download job %s on cancel: %s", job_id, exc)
+            raise
+        except Exception as exc:
+            if attempt_dir is not None:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
+                attempt_dir = None
+            if not self._should_download_media_for(
+                chat_id,
+                topic_id,
+                is_sticker_like=effective_is_sticker,
+            ):
+                self.store.cancel_media_download_job(
+                    job_id,
+                    reason="policy_disabled",
+                    expected_claim_token=claim_token,
+                )
+                return
+            if isinstance(exc, _MediaDownloadResultError):
+                error = classify_telegram_exception(exc, default_code=exc.code)
+            else:
+                error = classify_telegram_exception(exc, default_code="media_download_failed")
+            self.logger.warning(
+                "Failed to download media for account=%s chat=%s message=%s attempt=%s/%s: %s",
+                self.account_id,
+                chat_id,
+                message_id,
+                attempts,
+                max_attempts,
+                error.message,
+            )
+            if error.code == "flood_wait":
+                wait_seconds = max(1.0, float(error.retry_after or 30))
+                next_at = (datetime.now(dt_timezone.utc) + timedelta(seconds=wait_seconds)).isoformat()
+                self.store.retry_media_download_job(
+                    job_id,
+                    error=error.message,
+                    error_code=error.code,
+                    next_attempt_at=next_at,
+                    expected_claim_token=claim_token,
+                    preserve_attempt_budget=True,
+                )
+                return
+            if error.code in {"access_denied", "needs_login"}:
+                failed = self.store.fail_media_download_job(
+                    job_id,
+                    error=error.message,
+                    error_code=error.code,
+                    expected_claim_token=claim_token,
+                )
+                if failed:
+                    self._record_operation(
+                        "media_download",
+                        "failed",
+                        subject_type="message",
+                        subject_id=f"{chat_id}/{message_id}",
+                        error=error.to_public_dict() | {"attempts": attempts, "job_id": job_id},
+                    )
+                return
+            base_delay = max(0.0, float(self.media_download.retry_delay_seconds))
+            backoff = min(
+                base_delay * (2 ** max(0, attempts - 1)),
+                max(0.0, float(self.media_download.max_retry_delay_seconds)),
+            )
+            next_at = (datetime.now(dt_timezone.utc) + timedelta(seconds=backoff)).isoformat()
+            result_status = self.store.retry_media_download_job(
+                job_id,
+                error=error.message,
+                error_code=error.code,
+                next_attempt_at=next_at,
+                expected_claim_token=claim_token,
+                preserve_attempt_budget=False,
+            )
+            if result_status == "failed":
+                self._record_operation(
+                    "media_download",
+                    "failed",
+                    subject_type="message",
+                    subject_id=f"{chat_id}/{message_id}",
+                    error=error.to_public_dict() | {"attempts": attempts, "job_id": job_id},
                 )
         finally:
-            if staging_dir is not None:
-                shutil.rmtree(staging_dir, ignore_errors=True)
+            if heartbeat_task is not None and not heartbeat_task.done():
+                heartbeat_task.cancel()
+                await asyncio.gather(heartbeat_task, return_exceptions=True)
+            if attempt_dir is not None:
+                shutil.rmtree(attempt_dir, ignore_errors=True)
 
 
     async def _backfill_capture_targets(self, targets: list[CaptureTarget]) -> list[CaptureTarget]:
@@ -1017,9 +1289,20 @@ def _coerce_messages(value: Any) -> list[Any]:
     if hasattr(value, "id"):
         return [value]
     try:
-        return list(value)
+        return [item for item in value if item is not None]
     except TypeError:
         return [value]
+
+
+def _seconds_until_iso(iso_timestamp: str) -> float:
+    try:
+        target = datetime.fromisoformat(iso_timestamp)
+        if target.tzinfo is None:
+            target = target.replace(tzinfo=dt_timezone.utc)
+        delta = (target - datetime.now(dt_timezone.utc)).total_seconds()
+        return max(0.0, delta)
+    except ValueError:
+        return 0.0
 
 
 def _message_media_downloadable(message: Any, *, include_stickers: bool = False) -> bool:

@@ -471,6 +471,77 @@ def _fail_trailing_outbox_after_failed(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_21(connection: sqlite3.Connection) -> None:
+    """Create the persistent media_download_jobs table, indexes, and validation triggers."""
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS media_download_jobs (
+          job_id TEXT PRIMARY KEY,
+          source TEXT NOT NULL DEFAULT 'telegram',
+          account_id TEXT NOT NULL,
+          chat_id INTEGER NOT NULL,
+          message_id INTEGER NOT NULL,
+          topic_id INTEGER NOT NULL DEFAULT 0,
+          media_kind TEXT,
+          is_sticker_like INTEGER NOT NULL DEFAULT 0,
+          status TEXT NOT NULL DEFAULT 'pending',
+          attempts INTEGER NOT NULL DEFAULT 0,
+          max_attempts INTEGER NOT NULL DEFAULT 8,
+          claim_token INTEGER NOT NULL DEFAULT 0,
+          next_attempt_at TEXT,
+          last_error TEXT,
+          error_code TEXT,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL,
+          completed_at TEXT,
+          UNIQUE(source, account_id, chat_id, message_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_download_jobs_claim
+          ON media_download_jobs(source, account_id, status, next_attempt_at, created_at)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_download_jobs_status
+          ON media_download_jobs(status)
+        """
+    )
+    connection.execute("DROP TRIGGER IF EXISTS media_download_jobs_validate_insert")
+    connection.execute("DROP TRIGGER IF EXISTS media_download_jobs_validate_update")
+    connection.execute(
+        """
+        CREATE TRIGGER media_download_jobs_validate_insert
+        BEFORE INSERT ON media_download_jobs
+        WHEN NEW.status NOT IN ('pending', 'downloading', 'retry', 'completed', 'failed', 'canceled')
+          OR NEW.attempts < 0
+          OR NEW.max_attempts <= 0
+          OR NEW.claim_token < 0
+          OR NEW.is_sticker_like NOT IN (0, 1)
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid media download job state');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER media_download_jobs_validate_update
+        BEFORE UPDATE ON media_download_jobs
+        WHEN NEW.status NOT IN ('pending', 'downloading', 'retry', 'completed', 'failed', 'canceled')
+          OR NEW.attempts < 0
+          OR NEW.max_attempts <= 0
+          OR NEW.claim_token < 0
+          OR NEW.is_sticker_like NOT IN (0, 1)
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid media download job state');
+        END
+        """
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -487,4 +558,5 @@ MIGRATIONS: dict[int, Migration] = {
     18: _migration_18,
     19: _migration_19,
     20: _migration_20,
+    21: _migration_21,
 }

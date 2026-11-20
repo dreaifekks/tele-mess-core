@@ -131,11 +131,22 @@ class SyncApiTest(unittest.TestCase):
             return resp.read(), resp.headers.get("Content-Type", "")
 
     def test_state_requires_token_and_returns_json(self) -> None:
+        self.store.enqueue_media_download_job(account_id="default", chat_id=-1001, message_id=1)
         req = Request(f"http://127.0.0.1:{self.port}/sync/state")
         req.add_header("Authorization", "Bearer secret")
         with urlopen(req, timeout=3) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
         self.assertEqual(payload["last_event_seq"], 1)
+        self.assertEqual(payload["media_download_pending"], 1)
+        self.assertEqual(payload["media_download_failed"], 0)
+        from tele_mess_core.server.contracts import openapi_document, validate_schema_value
+
+        openapi_schemas = openapi_document()["components"]["schemas"]
+        validate_schema_value(payload, openapi_schemas["StateResponse"], "state", schemas=openapi_schemas)
+        health = self.request_json("/healthz")
+        self.assertEqual(health["media_download_pending"], 1)
+        self.assertEqual(health["media_download_failed"], 0)
+        validate_schema_value(health, openapi_schemas["HealthResponse"], "health", schemas=openapi_schemas)
 
     def test_messages_endpoint(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/sync/messages?after=0")

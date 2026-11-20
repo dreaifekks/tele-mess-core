@@ -248,6 +248,25 @@ class BlockingPagedBackfillClient(FakePagedBackfillClient):
             self.active_gets -= 1
 
 
+class FakeMediaClient:
+    """Minimal client fake supporting message refresh for the decoupled media download worker."""
+
+    def __init__(self, *messages: FakeMessage) -> None:
+        self.messages: dict[tuple[int, int], FakeMessage] = {
+            (int(msg.chat_id), int(msg.id)): msg for msg in messages
+        }
+        self.refresh_calls: list[tuple[int, int]] = []
+
+    def add(self, message: FakeMessage) -> None:
+        self.messages[(int(message.chat_id), int(message.id))] = message
+
+    async def get_messages(self, chat_id: int, ids: int | None = None, **kwargs):
+        if ids is not None:
+            self.refresh_calls.append((int(chat_id), int(ids)))
+            return self.messages.get((int(chat_id), int(ids)))
+        return [msg for (cid, _mid), msg in self.messages.items() if cid == int(chat_id)]
+
+
 def _fake_topic_id(message: FakeMessage) -> int:
     reply_to = getattr(message, "reply_to", None)
     return int(getattr(reply_to, "reply_to_top_id", 0) or 0)
@@ -365,13 +384,23 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 download_media=True,
             )
         )
+        message = FakeMessage(12, -1003, media=MessageMediaDocument())
+        client = FakeMediaClient(message)
+        self.service.client = client
 
-        stored = await self.service._store_message(FakeMessage(12, -1003, media=MessageMediaDocument()), event_type="new")
+        stored = await self.service._store_message(message, event_type="new")
         self.assertTrue(stored)
+        # Ingest only enqueues; download runs asynchronously in the media worker.
+        self.assertEqual(message.download_attempts, 0)
+        self.assertEqual(self.store.state()["media_download_pending"], 1)
+
+        await self.service.process_pending_media_downloads()
+        self.assertEqual(client.refresh_calls, [(-1003, 12)])
         files = self.store.list_media_files(account_id="main", chat_id=-1003, message_id=12)
         self.assertEqual(len(files), 1)
         self.assertTrue(Path(files[0]["file_path"]).exists())
         self.assertEqual(files[0]["file_size"], 5)
+        self.assertEqual(self.store.state()["media_download_pending"], 0)
 
     async def test_backfill_does_not_redownload_existing_media(self) -> None:
         self.store.set_backup_policy(
@@ -384,9 +413,12 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         message = FakeMessage(23, -1019, media=MessageMediaDocument())
+        self.service.client = FakeMediaClient(message)
 
         await self.service._store_message(message, event_type="new")
+        await self.service.process_pending_media_downloads()
         await self.service._store_message(message, event_type="backfill")
+        await self.service.process_pending_media_downloads()
 
         self.assertEqual(message.download_attempts, 1)
         files = self.store.list_media_files(account_id="main", chat_id=-1019, message_id=23)
@@ -442,8 +474,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             text="",
             media=MessageMediaDocument(Document(attributes=[DocumentAttributeSticker("🙃")])),
         )
+        self.service.client = FakeMediaClient(message)
 
         stored = await self.service._store_message(message, event_type="new")
+        await self.service.process_pending_media_downloads()
 
         self.assertTrue(stored)
         self.assertEqual(message.download_attempts, 1)
@@ -527,8 +561,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         message = FakeMessage(13, -1004, media=MessageMediaDocument(), fail_download_times=1)
+        self.service.client = FakeMediaClient(message)
 
         stored = await self.service._store_message(message, event_type="new")
+        await self.service.process_pending_media_downloads()
 
         self.assertTrue(stored)
         self.assertEqual(message.download_attempts, 2)
@@ -549,8 +585,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         message = FakeMessage(14, -1005, media=MessageMediaDocument(), fail_download_times=3)
+        self.service.client = FakeMediaClient(message)
 
         stored = await self.service._store_message(message, event_type="new")
+        await self.service.process_pending_media_downloads()
 
         self.assertTrue(stored)
         self.assertEqual(message.download_attempts, 3)
@@ -558,6 +596,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         events = self.store.list_operation_events(account_id="main", status="failed")
         self.assertEqual(events[0]["operation"], "media_download")
         self.assertEqual(events[0]["error_code"], "media_download_failed")
+        self.assertEqual(self.store.state()["media_download_failed"], 1)
 
     async def test_pending_webpage_preview_does_not_attempt_media_download(self) -> None:
         self.store.set_backup_policy(
@@ -589,8 +628,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             )
         )
         message = FakeMessage(17, -1007, media=MessageMediaWebPage(WebPage(photo=object())))
+        self.service.client = FakeMediaClient(message)
 
         stored = await self.service._store_message(message, event_type="new")
+        await self.service.process_pending_media_downloads()
 
         self.assertTrue(stored)
         self.assertEqual(message.download_attempts, 1)
@@ -1437,9 +1478,13 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         msg = DisableOnFirstFailureMessage(96, chat_id, text="with media", media=MessageMediaDocument())
         msg.store_ref = self.store
+        service.client = FakeMediaClient(msg)
         self.assertTrue(await service._store_message(msg, event_type="new"))
+        await service.process_pending_media_downloads()
         self.assertEqual(attempts, [1])
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=96), [])
+        jobs = self.store.list_media_download_jobs(account_id="main")
+        self.assertEqual(jobs[0]["status"], "canceled")
 
     async def test_failed_and_policy_rejected_media_downloads_leave_no_partial_or_published_files(self) -> None:
         chat_id = -1097
@@ -1458,6 +1503,8 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             self.store,
             media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0),
         )
+        client = FakeMediaClient()
+        service.client = client
 
         # 1) Partial write before failure leaves zero files or staging directories behind.
         class PartialFailMessage(FakeMessage):
@@ -1471,7 +1518,9 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         msg1 = PartialFailMessage(97, chat_id, text="partial fail", media=MessageMediaDocument())
         msg1.store_ref = self.store
+        client.add(msg1)
         self.assertTrue(await service._store_message(msg1, event_type="new"))
+        await service.process_pending_media_downloads()
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=97), [])
         self.assertEqual(list(target_dir.iterdir()), [])
 
@@ -1491,7 +1540,9 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
 
         msg2 = DisableBeforePublishMessage(98, chat_id, text="disabled before publish", media=MessageMediaDocument())
         msg2.store_ref = self.store
+        client.add(msg2)
         self.assertTrue(await service._store_message(msg2, event_type="new"))
+        await service.process_pending_media_downloads()
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=98), [])
         self.assertEqual(list(target_dir.iterdir()), [])
         self.assertFalse(self.store._conn.in_transaction)
@@ -1516,9 +1567,10 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 return str(staged)
 
         msg3 = StatFailMessage(99, chat_id, text="stat fail", media=MessageMediaDocument())
+        client.add(msg3)
+        self.assertTrue(await service._store_message(msg3, event_type="new"))
         with mock.patch.object(Path, "stat", failing_stat):
-            with self.assertRaises(OSError):
-                await service._store_message(msg3, event_type="new")
+            await service.process_pending_media_downloads()
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=99), [])
         self.assertEqual(list(target_dir.iterdir()), [])
         self.assertFalse(self.store._conn.in_transaction)
@@ -1531,16 +1583,238 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 return str(staged)
 
         msg4 = DbFailMessage(100, chat_id, text="db fail", media=MessageMediaDocument())
+        client.add(msg4)
+        self.assertTrue(await service._store_message(msg4, event_type="new"))
         with mock.patch.object(
             self.store,
             "_upsert_media_file_row_unlocked",
             side_effect=RuntimeError("simulated sqlite insert error"),
         ):
-            with self.assertRaisesRegex(RuntimeError, "simulated sqlite insert error"):
-                await service._store_message(msg4, event_type="new")
+            await service.process_pending_media_downloads()
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=100), [])
         self.assertEqual(list(target_dir.iterdir()), [])
         self.assertFalse(self.store._conn.in_transaction)
+
+    async def test_backfill_cursor_advances_immediately_and_worker_recovers_via_message_refresh(self) -> None:
+        chat_id = -1096
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        stale_msg = FakeMessage(
+            110,
+            chat_id,
+            text="photo with expiring ref",
+            media=MessageMediaDocument(),
+            fail_download_times=99,
+        )
+        fresh_msg = FakeMessage(110, chat_id, text="photo with fresh ref", media=MessageMediaDocument())
+
+        class BackfillAndRefreshClient:
+            def __init__(self) -> None:
+                self.refresh_calls: list[tuple[int, int]] = []
+                self.serve_fresh = False
+
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                if ids is not None:
+                    self.refresh_calls.append((int(cid), int(ids)))
+                    return fresh_msg if self.serve_fresh else stale_msg
+                return [stale_msg]
+
+            def iter_messages(self, cid: int, **kwargs):
+                return FakeBackfillIterator(messages=[stale_msg])
+
+        client = BackfillAndRefreshClient()
+        self.service.client = client
+        await self.service.refresh_capture_targets()
+
+        # Backfill cursor completed immediately without blocking on media download.
+        cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, "main", chat_id)
+        self.assertIsNotNone(cursor)
+        assert cursor is not None
+        self.assertEqual(cursor["backfill_status"], "completed")
+        self.assertEqual(cursor["history_scanned_through_id"], 110)
+        self.assertEqual(self.store.state()["media_download_pending"], 1)
+
+        # First worker attempt sees failing stale_msg, schedules retry.
+        self.assertEqual(await self.service.process_pending_media_downloads(max_jobs=1), 1)
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=110), [])
+        jobs = self.store.list_media_download_jobs(account_id="main")
+        self.assertEqual(jobs[0]["status"], "retry")
+        self.assertEqual(jobs[0]["attempts"], 1)
+
+        # Next attempt refreshes via client.get_messages(chat_id, ids=110) and gets fresh_msg.
+        client.serve_fresh = True
+        self.assertEqual(await self.service.process_pending_media_downloads(max_jobs=1), 1)
+        self.assertEqual(client.refresh_calls, [(chat_id, 110), (chat_id, 110)])
+        files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=110)
+        self.assertEqual(len(files), 1)
+        self.assertTrue(Path(files[0]["file_path"]).exists())
+        self.assertEqual(self.store.state()["media_download_pending"], 0)
+
+    async def test_media_download_flood_wait_preserves_attempt_budget_and_permanent_error_fails_immediately(self) -> None:
+        class FloodWaitError(RuntimeError):
+            def __init__(self, seconds: int) -> None:
+                super().__init__(f"A wait of {seconds} seconds is required")
+                self.seconds = seconds
+
+        class ChannelPrivateError(RuntimeError):
+            pass
+
+        chat_id = -1095
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+
+        class FloodWaitMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                self.download_attempts += 1
+                raise FloodWaitError(25)
+
+        class PrivateErrorMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                self.download_attempts += 1
+                raise ChannelPrivateError("private channel")
+
+        flood_msg = FloodWaitMessage(111, chat_id, media=MessageMediaDocument())
+        priv_msg = PrivateErrorMessage(112, chat_id, media=MessageMediaDocument())
+        self.service.client = FakeMediaClient(flood_msg, priv_msg)
+
+        self.assertTrue(await self.service._store_message(flood_msg, event_type="new"))
+        self.assertTrue(await self.service._store_message(priv_msg, event_type="new"))
+        await self.service.process_pending_media_downloads()
+
+        jobs_by_msg = {
+            job["message_id"]: job
+            for job in self.store.list_media_download_jobs(account_id="main")
+        }
+        self.assertEqual(jobs_by_msg[111]["status"], "retry")
+        self.assertEqual(jobs_by_msg[111]["attempts"], 0)
+        self.assertEqual(jobs_by_msg[111]["error_code"], "flood_wait")
+        self.assertIsNotNone(jobs_by_msg[111]["next_attempt_at"])
+        self.assertEqual(flood_msg.download_attempts, 1)
+
+        self.assertEqual(jobs_by_msg[112]["status"], "failed")
+        self.assertEqual(jobs_by_msg[112]["attempts"], 1)
+        self.assertEqual(jobs_by_msg[112]["error_code"], "access_denied")
+        self.assertEqual(priv_msg.download_attempts, 1)
+        state = self.store.state()
+        self.assertEqual(state["media_download_pending"], 1)
+        self.assertEqual(state["media_download_failed"], 1)
+
+    async def test_media_worker_graceful_shutdown_releases_job_without_spending_attempt_or_leaving_part_files(self) -> None:
+        chat_id = -1094
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        started = asyncio.Event()
+        release_blocker = asyncio.Event()
+        allow_complete = False
+
+        class BlockingMediaMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                self.download_attempts += 1
+                part = Path(file) / "video.mp4"
+                part.write_bytes(b"partial-chunk")
+                if not allow_complete:
+                    started.set()
+                    await release_blocker.wait()
+                return str(part)
+
+        msg = BlockingMediaMessage(113, chat_id, media=MessageMediaDocument())
+
+        class ActivatableClient(FakeMediaClient):
+            def on(self, event_builder: object):
+                return lambda fn: fn
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            def is_connected(self) -> bool:
+                return True
+
+            def iter_messages(self, cid: int, **kwargs):
+                return FakeBackfillIterator(messages=[])
+
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                if ids is not None:
+                    return await super().get_messages(cid, ids=ids, **kwargs)
+                return []
+
+        client = ActivatableClient(msg)
+        await self.service.activate(client)
+        self.assertTrue(await self.service._store_message(msg, event_type="new"))
+        await asyncio.wait_for(started.wait(), timeout=2.0)
+
+        # Graceful shutdown cancels worker, removes .part-* dir, and releases job without spending attempt.
+        await self.service.stop()
+        self.assertEqual(list(target_dir.iterdir()), [])
+        jobs = self.store.list_media_download_jobs(account_id="main")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "retry")
+        self.assertEqual(jobs[0]["attempts"], 0)
+        self.assertEqual(jobs[0]["claim_token"], 1)
+        self.assertEqual(jobs[0]["error_code"], "worker_stopped")
+
+        # Subsequent claim uses monotonic claim_token=2 and completes cleanly.
+        allow_complete = True
+        self.assertEqual(await self.service.process_pending_media_downloads(), 1)
+        finished = self.store.get_media_download_job(jobs[0]["job_id"])
+        assert finished is not None
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["attempts"], 1)
+        self.assertEqual(finished["claim_token"], 2)
+        self.assertEqual(len(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=113)), 1)
+
+    async def test_media_download_cancels_when_message_deleted_or_topic_archived_while_queued(self) -> None:
+        from tele_mess_core.models import OriginRecord
+
+        forum_id = -1093
+        self.store.upsert_origin(OriginRecord(SOURCE_TELEGRAM, "main", forum_id, "group", title="Forum", is_forum=True))
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", forum_id, "topic", topic_id=7, parent_origin_id=forum_id, title="T7")
+        )
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", forum_id, "topic", topic_id=8, parent_origin_id=forum_id, title="T8")
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", forum_id, enabled=True, download_media=True)
+        )
+        msg_del = FakeMessage(
+            120,
+            forum_id,
+            media=MessageMediaDocument(),
+            reply_to=SimpleNamespace(reply_to_top_id=7),
+        )
+        msg_arch = FakeMessage(
+            121,
+            forum_id,
+            media=MessageMediaDocument(),
+            reply_to=SimpleNamespace(reply_to_top_id=8),
+        )
+        client = FakeMediaClient(msg_del, msg_arch)
+        self.service.client = client
+
+        self.assertTrue(await self.service._store_message(msg_del, event_type="new"))
+        self.assertTrue(await self.service._store_message(msg_arch, event_type="new"))
+        self.assertEqual(self.store.state()["media_download_pending"], 2)
+
+        # Deleting msg 120 immediately cancels its pending job in SQLite.
+        self.store.mark_deleted(SOURCE_TELEGRAM, forum_id, [120], account_id="main")
+        # Archiving topic 8 causes worker to cancel msg 121 without calling Telegram.
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", forum_id, topic_id=8, archived=True)
+        await self.service.process_pending_media_downloads()
+
+        jobs_by_msg = {
+            job["message_id"]: job
+            for job in self.store.list_media_download_jobs(account_id="main")
+        }
+        self.assertEqual(jobs_by_msg[120]["status"], "canceled")
+        self.assertEqual(jobs_by_msg[120]["error_code"], "message_deleted")
+        self.assertEqual(jobs_by_msg[121]["status"], "canceled")
+        self.assertEqual(jobs_by_msg[121]["error_code"], "policy_disabled")
+        self.assertEqual(client.refresh_calls, [])
+        self.assertEqual(self.store.state()["media_download_pending"], 0)
 
 
 if __name__ == "__main__":

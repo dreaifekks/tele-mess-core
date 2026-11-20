@@ -3,7 +3,7 @@
 This file is generated from `tele_mess_core.server.contracts`.
 
 - Contract version: `2026-11-20.1`
-- Contract hash: `f16be4b2ff70d8ad`
+- Contract hash: `160d630fc8c8273d`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1548,6 +1548,8 @@ Response: `McpJsonRpcResponse`
 | `message_count` | `integer` | yes |
 | `last_event_seq` | `integer` | yes |
 | `operation_error_count` | `integer` | no |
+| `media_download_pending` | `integer` | no |
+| `media_download_failed` | `integer` | no |
 | `server_time` | `string` | no |
 
 ### McpJsonRpcMessage
@@ -1880,6 +1882,8 @@ JSON-RPC 2.0 response carrying either result or error.
 | `message_count` | `integer` | yes |
 | `last_event_seq` | `integer` | yes |
 | `operation_error_count` | `integer` | no |
+| `media_download_pending` | `integer` | no |
+| `media_download_failed` | `integer` | no |
 | `server_time` | `string` | no |
 
 ### SubmitCodeInput
