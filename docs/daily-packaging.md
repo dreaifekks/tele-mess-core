@@ -57,7 +57,6 @@ Each package run writes files under:
 <daily.output_dir>/<YYYY-MM-DD>/<package-run-id>/
   package.json
   package.md
-  normal-groups/
   important-origins/
   point-origins/
   analysis/

@@ -199,6 +199,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(package["progress_label"], "completed")
         self.assertEqual(package["progress"]["normal_group_count"], 3)
         self.assertEqual(package["progress"]["important_origin_count"], 1)
+        self.assertFalse((Path(package["output_dir"]) / "normal-groups").exists())
         payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
         groups = {group["name"]: group for group in payload["normal_groups"]}
         self.assertEqual([origin["origin"]["origin_id"] for origin in groups["web3 it info"]["origins"]], [-1002])

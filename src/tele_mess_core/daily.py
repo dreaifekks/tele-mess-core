@@ -281,7 +281,6 @@ def build_daily_package(
     update_progress(0, 0, "selecting origins")
     try:
         output_root.mkdir(parents=True, exist_ok=True)
-        (output_root / "normal-groups").mkdir(exist_ok=True)
         (output_root / "important-origins").mkdir(exist_ok=True)
         (output_root / "point-origins").mkdir(exist_ok=True)
         (output_root / "analysis").mkdir(exist_ok=True)
@@ -348,11 +347,6 @@ def build_daily_package(
                 "media_count": sum(item["package_meta"]["media_count"] for item in origin_packages),
                 "origins": origin_packages,
             }
-            _write_json(output_root / "normal-groups" / f"{_slug(group['name'])}.json", group_payload)
-            (output_root / "normal-groups" / f"{_slug(group['name'])}.md").write_text(
-                _group_markdown(group_payload),
-                encoding="utf-8",
-            )
             group_packages.append(group_payload)
             totals["origin_count"] += len(origin_packages)
             totals["message_count"] += group_payload["message_count"]
@@ -3246,21 +3240,6 @@ def _package_markdown(package_payload: dict[str, Any]) -> str:
             f"important origin: {bool(meta.get('important'))}"
         )
         lines.append("")
-    return "\n".join(lines)
-
-
-def _group_markdown(group_payload: dict[str, Any]) -> str:
-    lines = [
-        f"# Group {group_payload['name']}",
-        "",
-        f"- Tags: {', '.join(group_payload.get('tags') or []) or '-'}",
-        f"- Origins: {group_payload['origin_count']}",
-        f"- Messages: {group_payload['message_count']}",
-        f"- Media: {group_payload['media_count']}",
-        "",
-    ]
-    for origin in group_payload.get("origins") or []:
-        lines.append(_origin_markdown(origin))
     return "\n".join(lines)
 
 

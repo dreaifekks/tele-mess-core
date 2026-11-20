@@ -47,6 +47,8 @@ validation rules.
 - Daily reports recognize images the same way the archive and the API do, so
   photos saved without a file extension and images sent as files are passed to
   image analysis and to the summary provider.
+- Daily packages no longer write the unused `normal-groups/` files; the
+  groups stay in `package.json`.
 
 ## 0.3.5 - 2026-10-13
 
