@@ -24,7 +24,7 @@ from tele_mess_core.daily import (
     resolve_daily_summary_delivery,
     run_daily_summary,
 )
-from tele_mess_core.models import DailySummaryJobRecord, utc_now_iso
+from tele_mess_core.models import DEFAULT_TIMEZONE, DailySummaryJobRecord, utc_now_iso
 
 
 TERMINAL_JOB_STATUSES = {"completed", "failed", "canceled"}
@@ -48,7 +48,7 @@ def enqueue_daily_summary_job(
     scope = dict(scope or {})
     package = store.get_daily_package_run(package_run_id) if package_run_id else None
     effective_timezone = str(
-        timezone_name or scope.get("timezone") or (package or {}).get("timezone") or "Asia/Tokyo"
+        timezone_name or scope.get("timezone") or (package or {}).get("timezone") or DEFAULT_TIMEZONE
     )
     effective_date = run_date or scope.get("date") or (package or {}).get("date")
     if not effective_date:

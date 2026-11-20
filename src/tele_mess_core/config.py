@@ -47,7 +47,6 @@ class TelegramAccountConfig:
     api_hash: str
     session_name: str
     session_dir: Path = Path("./data/sessions")
-    timezone: str = "Asia/Tokyo"
 
 
 @dataclass(slots=True)
@@ -213,7 +212,6 @@ def _parse_accounts(
                 if telegram_raw.get("session_dir")
                 else default_session_dir
             ),
-            timezone=str(telegram_raw.get("timezone", "Asia/Tokyo")),
         )
     ]
 
@@ -236,7 +234,6 @@ def _parse_account(
             if item.get("session_dir")
             else default_session_dir
         ),
-        timezone=str(item.get("timezone", "Asia/Tokyo")),
     )
 
 
@@ -299,7 +296,6 @@ def stored_account_config(config: AppConfig, item: dict[str, Any]) -> TelegramAc
         api_hash=template.api_hash,
         session_name=str(item.get("session_name") or account_id),
         session_dir=resolve_workspace_path(config, str(session_dir_raw)) if session_dir_raw else template.session_dir,
-        timezone=template.timezone,
     )
 
 

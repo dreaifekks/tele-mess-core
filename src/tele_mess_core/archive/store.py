@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Any
 
 from tele_mess_core.models import (
+    DEFAULT_TIMEZONE,
     AccountAuthRecord,
     AccountRecord,
     BackupPolicyRecord,
@@ -1437,7 +1438,7 @@ class ArchiveStore:
             return {
                 "enabled": False,
                 "time_of_day": "08:00",
-                "timezone": "Asia/Tokyo",
+                "timezone": DEFAULT_TIMEZONE,
                 "scope": {},
                 "system_manager": "systemd-user",
                 "installed": False,

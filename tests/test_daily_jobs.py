@@ -658,7 +658,6 @@ class DailyJobWorkerTest(unittest.TestCase):
             api_hash="hash",
             session_name="template",
             session_dir=self.root / "sessions",
-            timezone="UTC",
         )
         delivery_config = AppConfig(
             storage=self.config.storage,
@@ -774,7 +773,6 @@ class DailyJobWorkerTest(unittest.TestCase):
             api_hash="hash",
             session_name="main",
             session_dir=self.root / "sessions",
-            timezone="UTC",
         )
         delivery_config = AppConfig(
             storage=self.config.storage,

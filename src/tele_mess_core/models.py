@@ -4,6 +4,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any
 
+# Timezone of daily packages and of dates in the archive views until the
+# daily schedule sets another one.
+DEFAULT_TIMEZONE = "Asia/Tokyo"
+
 
 SOURCE_TELEGRAM = "telegram"
 
@@ -172,7 +176,7 @@ class OperationEventRecord:
 class DailyPackageScheduleRecord:
     enabled: bool = False
     time_of_day: str = "08:00"
-    timezone: str = "Asia/Tokyo"
+    timezone: str = DEFAULT_TIMEZONE
     scope_json: str | None = None
     system_manager: str = "systemd-user"
     installed: bool = False

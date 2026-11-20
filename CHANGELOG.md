@@ -41,6 +41,9 @@ validation rules.
   daily package runs, summary runs, summary jobs, and summary records now
   default to `limit=500` instead of 100, and `/sync/messages?latest=true`
   without a limit returns up to 100 messages instead of 50.
+- The unused `timezone` key of `telegram.accounts` entries was removed; daily
+  packages take their timezone from the request or the daily schedule. An old
+  config that still sets it keeps loading.
 
 ## 0.3.5 - 2026-10-13
 

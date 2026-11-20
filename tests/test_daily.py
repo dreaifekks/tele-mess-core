@@ -335,7 +335,6 @@ class DailyPackagingTest(unittest.TestCase):
                 api_hash="template-hash",
                 session_name="credential-template",
                 session_dir=self.root / "template-sessions",
-                timezone="UTC",
             )
         )
         self.store.upsert_account(
@@ -398,7 +397,6 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(account.api_hash, "template-hash")
         self.assertEqual(account.session_name, "runtime-session")
         self.assertEqual(account.session_dir, self.root / "runtime-sessions")
-        self.assertEqual(account.timezone, "UTC")
         service_class.return_value.send_summary.assert_awaited_once_with(
             resolved,
             "direct summary",

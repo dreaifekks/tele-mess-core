@@ -32,6 +32,7 @@ from tele_mess_core.config import (
     resolve_account_config,
 )
 from tele_mess_core.models import (
+    DEFAULT_TIMEZONE,
     DailyPackageRunRecord,
     DailyPackageScheduleRecord,
     DailyMessagePointRecord,
@@ -232,7 +233,7 @@ def build_daily_package(
     cancel_check: Callable[[], None] | None = None,
 ) -> dict[str, Any]:
     scope = dict(scope or {})
-    timezone_name = timezone_name or str(scope.get("timezone") or "Asia/Tokyo")
+    timezone_name = timezone_name or str(scope.get("timezone") or DEFAULT_TIMEZONE)
     tz = _zoneinfo(timezone_name)
     package_date = _resolve_package_date(run_date or scope.get("date"), tz)
     window_start_local = datetime.combine(package_date, time.min, tzinfo=tz)
@@ -2324,7 +2325,7 @@ def update_daily_package_schedule(
         raise ValueError("scope must be an object")
     time_of_day = str(payload.get("time_of_day", current.get("time_of_day") or "08:00"))
     _validate_time_of_day(time_of_day)
-    timezone_name = str(payload.get("timezone", current.get("timezone") or "Asia/Tokyo"))
+    timezone_name = str(payload.get("timezone", current.get("timezone") or DEFAULT_TIMEZONE))
     _zoneinfo(timezone_name)
     enabled = _payload_bool(payload, "enabled", bool(current.get("enabled", False)))
     system_manager = str(payload.get("system_manager", current.get("system_manager") or "systemd-user"))
@@ -2381,7 +2382,7 @@ def install_daily_package_timer(
         timer_path.write_text(
             _systemd_timer(
                 time_of_day=str(schedule.get("time_of_day") or "08:00"),
-                timezone_name=str(schedule.get("timezone") or "Asia/Tokyo"),
+                timezone_name=str(schedule.get("timezone") or DEFAULT_TIMEZONE),
             ),
             encoding="utf-8",
         )

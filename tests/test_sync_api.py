@@ -1258,7 +1258,6 @@ class SyncApiTest(unittest.TestCase):
                         api_hash="hash",
                         session_name="tele_mess_core",
                         session_dir=session_dir,
-                        timezone="UTC",
                     )
                 ]
             ),

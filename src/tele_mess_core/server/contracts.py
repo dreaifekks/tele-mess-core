@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from tele_mess_core.media import MEDIA_TYPES
+from tele_mess_core.models import DEFAULT_TIMEZONE
 
 
 API_CONTRACT_VERSION = "2026-11-20.1"
@@ -637,7 +638,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "enabled": {"type": "boolean", "default": False},
             "time_of_day": {"type": "string", "default": "08:00"},
-            "timezone": {"type": "string", "default": "Asia/Tokyo"},
+            "timezone": {"type": "string", "default": DEFAULT_TIMEZONE},
             "scope": {"type": "object"},
             "delivery": {"$ref": "#/components/schemas/DailySummaryDeliveryInput"},
             "system_manager": {"type": "string", "default": "systemd-user"},
@@ -648,7 +649,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "DailyPackageRunInput": _object(
         {
             "date": {"type": "string"},
-            "timezone": {"type": "string", "default": "Asia/Tokyo"},
+            "timezone": {"type": "string", "default": DEFAULT_TIMEZONE},
             "scope": {"type": "object"},
             "account_id": {"type": "string"},
             "origin_id": {"type": "integer"},
@@ -685,7 +686,7 @@ SCHEMAS: dict[str, dict[str, Any]] = {
         {
             "package_run_id": {"type": "string"},
             "date": {"type": "string"},
-            "timezone": {"type": "string", "default": "Asia/Tokyo"},
+            "timezone": {"type": "string", "default": DEFAULT_TIMEZONE},
             "scope": {"type": "object"},
             "account_id": {"type": "string"},
             "origin_id": {"type": "integer"},
