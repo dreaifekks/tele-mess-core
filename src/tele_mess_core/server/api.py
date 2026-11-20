@@ -1036,9 +1036,16 @@ def _delete_management_account(
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
     with _account_mutation_lock(store, source, account_id):
+        deletion_token: str | None = None
         if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-            telegram_runtime.unregister_account(account_id)
-        deleted_rows = store.delete_management_account(source, account_id)
+            deletion_token = telegram_runtime.begin_account_deletion(account_id)
+        try:
+            if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+                telegram_runtime.unregister_account(account_id)
+            deleted_rows = store.delete_management_account(source, account_id)
+        finally:
+            if telegram_runtime is not None and source == SOURCE_TELEGRAM and deletion_token is not None:
+                telegram_runtime.end_account_deletion(account_id, deletion_token)
         if telegram_runtime is not None and source == SOURCE_TELEGRAM:
             telegram_runtime.trigger_media_cleanup()
         return {"source": source, "account_id": account_id, "deleted_rows": deleted_rows}

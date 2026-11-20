@@ -3955,6 +3955,140 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(manager._stopping_runtimes, {})
             local_store.close()
 
+    async def test_auth_status_concurrent_with_account_delete_does_not_restart_deleted_sqlite_account(
+        self,
+    ) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.server.api import _auth_status, _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "auth_status_vs_delete.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            # "dyn" exists ONLY in SQLite (not in static config.telegram.accounts).
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            dyn_clients_created: list[object] = []
+
+            class DynClient:
+                def __init__(self, account_id: str) -> None:
+                    self.account_id = account_id
+                    self._connected = False
+                    if account_id == "dyn":
+                        dyn_clients_created.append(self)
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_me(self):
+                    return SimpleNamespace(id=99, first_name=self.account_id, last_name=None, username=self.account_id)
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            def blocking_dyn_scan(*args, **kwargs) -> bool:
+                if kwargs.get("account_id") == "dyn" and not kwargs.get("deleted_accounts_only"):
+                    entered.set()
+                    release.wait(timeout=5.0)
+                return False
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: DynClient(cfg.account_id),
+                ingest=True,
+            )
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_dyn_scan,
+            ):
+                await manager.start()
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                    delete_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _delete_management_account,
+                            local_store,
+                            {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                            manager,
+                        )
+                    )
+                    await asyncio.sleep(0.05)
+                    auth_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _auth_status,
+                            {"source": SOURCE_TELEGRAM, "account_id": "dyn"},
+                            manager,
+                        )
+                    )
+                    await asyncio.sleep(0.05)
+                    self.assertFalse(delete_task.done())
+                    self.assertFalse(auth_task.done())
+
+                    release.set()
+                    await asyncio.wait_for(delete_task, timeout=3.0)
+                    with self.assertRaises(ValueError):
+                        await asyncio.wait_for(auth_task, timeout=3.0)
+
+                    self.assertEqual(len(dyn_clients_created), 1)
+                    self.assertNotIn("dyn", {s["account_id"] for s in manager.statuses()})
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+                    auth_rows = local_store._conn.execute(
+                        "SELECT * FROM account_auth WHERE source = ? AND account_id = ?",
+                        (SOURCE_TELEGRAM, "dyn"),
+                    ).fetchall()
+                    self.assertEqual(auth_rows, [])
+                finally:
+                    release.set()
+                    await manager.stop()
+            local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -791,6 +791,9 @@ class TelegramRuntimeManager:
         self._stopping = False
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
         self._stopping_runtimes: dict[str, set[asyncio.Task[None]]] = {}
+        self._account_deletion_lock = threading.Lock()
+        self._deleting_accounts: dict[str, set[str]] = {}
+        self._deletion_events: dict[str, asyncio.Event] = {}
         self._media_cleanup_wakeup: asyncio.Event | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
         self._media_cleanup_stop = threading.Event()
@@ -818,6 +821,9 @@ class TelegramRuntimeManager:
     async def stop(self) -> None:
         self._stopping = True
         self._media_cleanup_stop.set()
+        with self._account_deletion_lock:
+            for event in self._deletion_events.values():
+                event.set()
         wakeup = self._media_cleanup_wakeup
         if wakeup is not None:
             wakeup.set()
@@ -961,13 +967,70 @@ class TelegramRuntimeManager:
 
         future.add_done_callback(done)
 
+    def begin_account_deletion(self, account_id: str) -> str:
+        """Block implicit or concurrent registrations for account_id until deletion commits."""
+        token = uuid.uuid4().hex
+        with self._account_deletion_lock:
+            self._deleting_accounts.setdefault(account_id, set()).add(token)
+        return token
+
+    def end_account_deletion(self, account_id: str, token: str) -> None:
+        """Release the deletion gate for account_id and wake any waiting callers."""
+        event: asyncio.Event | None = None
+        with self._account_deletion_lock:
+            tokens = self._deleting_accounts.get(account_id)
+            if tokens is not None:
+                tokens.discard(token)
+                if not tokens:
+                    self._deleting_accounts.pop(account_id, None)
+                    event = self._deletion_events.pop(account_id, None)
+        if event is None:
+            return
+        loop = self._loop
+        if loop is None or loop.is_closed():
+            return
+        if threading.get_ident() == self._loop_thread_id:
+            event.set()
+        else:
+            loop.call_soon_threadsafe(event.set)
+
+    def _deletion_wait_event(self, account_id: str) -> asyncio.Event | None:
+        with self._account_deletion_lock:
+            if not self._deleting_accounts.get(account_id):
+                return None
+            event = self._deletion_events.get(account_id)
+            if event is None:
+                event = asyncio.Event()
+                self._deletion_events[account_id] = event
+            return event
+
     async def execute(self, account_id: str, operation: str, **kwargs: Any) -> dict[str, Any]:
         if self._stopping:
             raise RuntimeError("Telegram runtime manager is stopping")
-        runtime = self._runtimes.get(account_id)
-        if runtime is None:
-            runtime = await self._register_account(resolve_account_config(self.config, self.store, account_id))
+        runtime = await self._ensure_runtime(account_id)
         return await runtime.execute(operation, **kwargs)
+
+    async def _ensure_runtime(self, account_id: str) -> TelegramAccountRuntime:
+        while True:
+            if self._stopping:
+                raise RuntimeError("Telegram runtime manager is stopping")
+            wait_event = self._deletion_wait_event(account_id)
+            if wait_event is not None:
+                await wait_event.wait()
+                continue
+            runtime = self._runtimes.get(account_id)
+            if runtime is not None:
+                return runtime
+            stopping = list(self._stopping_runtimes.get(account_id) or ())
+            if stopping:
+                for stop_task in stopping:
+                    await asyncio.shield(stop_task)
+                continue
+            config = resolve_account_config(self.config, self.store, account_id)
+            return await self._register_account(
+                config,
+                config_resolver=lambda: resolve_account_config(self.config, self.store, account_id),
+            )
 
     def register_account(self, config: TelegramAccountConfig) -> dict[str, Any]:
         if self._stopping:
@@ -1009,34 +1072,71 @@ class TelegramRuntimeManager:
         self._stopping_runtimes.setdefault(account_id, set()).add(stop_task)
         return stop_task
 
-    async def _register_account(self, config: TelegramAccountConfig) -> TelegramAccountRuntime:
+    async def _register_account(
+        self,
+        config: TelegramAccountConfig,
+        *,
+        config_resolver: Callable[[], TelegramAccountConfig] | None = None,
+    ) -> TelegramAccountRuntime:
+        account_id = config.account_id
+        current_config = config
         while True:
             if self._stopping:
                 raise RuntimeError("Telegram runtime manager is stopping")
-            existing = self._runtimes.get(config.account_id)
+            wait_event = self._deletion_wait_event(account_id)
+            if wait_event is not None:
+                await wait_event.wait()
+                if config_resolver is not None:
+                    current_config = config_resolver()
+                continue
+            existing = self._runtimes.get(account_id)
             if existing is not None:
                 return existing
-            stopping = list(self._stopping_runtimes.get(config.account_id) or ())
+            stopping = list(self._stopping_runtimes.get(account_id) or ())
             if stopping:
                 for stop_task in stopping:
                     await asyncio.shield(stop_task)
+                if config_resolver is not None:
+                    current_config = config_resolver()
                 continue
-            break
-        if self._stopping:
-            raise RuntimeError("Telegram runtime manager is stopping")
-        runtime = TelegramAccountRuntime(
-            config,
-            self.config,
-            self.store,
-            client_factory=self.client_factory,
-            ingest=self.ingest,
-            connect_wait_seconds=self.connect_wait_seconds,
-            management_timeout_seconds=self.management_timeout_seconds,
-            delivery_timeout_seconds=self.delivery_timeout_seconds,
-        )
-        self._runtimes[config.account_id] = runtime
-        await runtime.start()
-        return runtime
+            runtime = TelegramAccountRuntime(
+                current_config,
+                self.config,
+                self.store,
+                client_factory=self.client_factory,
+                ingest=self.ingest,
+                connect_wait_seconds=self.connect_wait_seconds,
+                management_timeout_seconds=self.management_timeout_seconds,
+                delivery_timeout_seconds=self.delivery_timeout_seconds,
+            )
+            with self._account_deletion_lock:
+                if self._stopping:
+                    raise RuntimeError("Telegram runtime manager is stopping")
+                if self._deleting_accounts.get(account_id):
+                    wait_event = self._deletion_events.get(account_id)
+                    if wait_event is None:
+                        wait_event = asyncio.Event()
+                        self._deletion_events[account_id] = wait_event
+                else:
+                    existing = self._runtimes.get(account_id)
+                    if existing is not None:
+                        return existing
+                    if self._stopping_runtimes.get(account_id):
+                        wait_event = None
+                        retry_stopping = True
+                    else:
+                        self._runtimes[account_id] = runtime
+                        retry_stopping = False
+                        wait_event = None
+            if wait_event is not None:
+                await wait_event.wait()
+                if config_resolver is not None:
+                    current_config = config_resolver()
+                continue
+            if retry_stopping:
+                continue
+            await runtime.start()
+            return runtime
 
     async def _unregister_account(self, account_id: str) -> dict[str, Any]:
         runtime = self._runtimes.pop(account_id, None)
