@@ -298,6 +298,14 @@ class TelegramArchiveService:
                         await self._wait_media_wakeup(1.0)
                     continue
                 try:
+                    self._cleanup_orphan_media_artifacts()
+                except Exception as exc:
+                    self.logger.warning(
+                        "Failed to clean up orphan media artifacts for account=%s: %s",
+                        self.account_id,
+                        exc,
+                    )
+                try:
                     next_due = self.store.next_media_download_due_at(
                         self.account_id,
                         source=SOURCE_TELEGRAM,
@@ -392,6 +400,7 @@ class TelegramArchiveService:
                 stale_seconds=self.media_download.stale_seconds,
             )
             if job is None:
+                self._cleanup_orphan_media_artifacts()
                 break
             await self._execute_media_download_job(job)
             processed += 1
@@ -771,7 +780,12 @@ class TelegramArchiveService:
                     "download_media file path does not exist",
                 )
 
-            planned_final_path = _unique_media_target_path(target_dir, staged_path.name, message_id)
+            planned_final_path = _exclusive_media_target_path(
+                target_dir,
+                staged_path.name,
+                message_id=message_id,
+                claim_token=claim_token,
+            )
             if not self.store.record_media_download_pending_path(
                 job_id,
                 expected_claim_token=claim_token,
@@ -1530,24 +1544,21 @@ def _reaction_payload(event: Any) -> dict[str, Any]:
     return _safe_dict(reactions) if reactions else {}
 
 
-def _unique_media_target_path(target_dir: Path, filename: str, message_id: int) -> Path:
+def _exclusive_media_target_path(
+    target_dir: Path,
+    filename: str,
+    *,
+    message_id: int,
+    claim_token: int,
+) -> Path:
+    """Return a publish path structurally exclusive to one (chat, message_id, claim_token)."""
     clean_name = Path(filename).name if filename else ""
     if not clean_name or clean_name in {".", ".."}:
-        clean_name = f"msg-{message_id}.bin"
-    candidate = target_dir / clean_name
-    if not candidate.exists():
-        return candidate
-    stem = candidate.stem or f"msg-{message_id}"
+        clean_name = "media.bin"
+    candidate = Path(clean_name)
+    stem = candidate.stem or "media"
     suffix = candidate.suffix
-    numbered = target_dir / f"{stem}_m{message_id}{suffix}"
-    if not numbered.exists():
-        return numbered
-    index = 1
-    while True:
-        alt = target_dir / f"{stem}_m{message_id}_{index}{suffix}"
-        if not alt.exists():
-            return alt
-        index += 1
+    return target_dir / f"{stem}_m{message_id}_t{claim_token}{suffix}"
 
 
 def _safe_dict(obj: Any) -> Any:

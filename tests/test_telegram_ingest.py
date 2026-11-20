@@ -1971,7 +1971,7 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         stale_part_dir = target_dir / f".part-{job_id}-t1"
         stale_part_dir.mkdir(parents=True, exist_ok=True)
         (stale_part_dir / "half.bin").write_bytes(b"half")
-        orphan_published = target_dir / f"{msg.id}.bin"
+        orphan_published = target_dir / f"{msg.id}_m{msg.id}_t1.bin"
         orphan_published.write_bytes(b"uncommitted-crash-file")
         self.assertTrue(
             self.store.record_media_download_pending_path(
@@ -1990,12 +1990,14 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         await self.service.process_pending_media_downloads()
 
         self.assertFalse(stale_part_dir.exists())
+        self.assertFalse(orphan_published.exists())
         files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=220)
         self.assertEqual(len(files), 1)
-        self.assertEqual(Path(files[0]["file_path"]), orphan_published)
-        self.assertEqual(orphan_published.read_bytes(), b"media")
-        # Exactly one indexed file remains on disk — zero leftover .part dirs or duplicate filenames.
-        self.assertEqual(list(target_dir.iterdir()), [orphan_published])
+        published_path = Path(files[0]["file_path"])
+        self.assertEqual(published_path, target_dir / f"{msg.id}_m{msg.id}_t2.bin")
+        self.assertEqual(published_path.read_bytes(), b"media")
+        # Exactly one indexed file remains on disk — zero leftover .part dirs or uncommitted crash files.
+        self.assertEqual(list(target_dir.iterdir()), [published_path])
 
     async def test_media_worker_heartbeats_during_slow_get_messages_preventing_stale_expiry(self) -> None:
         chat_id = -1089
@@ -2069,6 +2071,178 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(events[0]["event_type"], "media_ready")
         media_map = self.store.list_media_files_for_messages(next_page["items"])
         self.assertEqual(len(media_map[(SOURCE_TELEGRAM, "main", chat_id, 240)]), 1)
+
+    async def test_concurrent_same_filename_downloads_publish_to_exclusive_paths_without_overwrite(self) -> None:
+        chat_id = -1087
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        both_started = asyncio.Event()
+        release_both = asyncio.Event()
+        started_count = 0
+
+        class CoordinatedMessage(FakeMessage):
+            def __init__(self, msg_id: int, payload: bytes) -> None:
+                super().__init__(msg_id, chat_id, text=f"msg {msg_id}", media=MessageMediaDocument())
+                self._payload = payload
+
+            async def download_media(self, file: str) -> str:
+                nonlocal started_count
+                started_count += 1
+                if started_count == 2:
+                    both_started.set()
+                await asyncio.wait_for(release_both.wait(), timeout=2.0)
+                path = Path(file) / "report.bin"
+                path.write_bytes(self._payload)
+                return str(path)
+
+        msg1 = CoordinatedMessage(301, b"payload-301")
+        msg2 = CoordinatedMessage(302, b"payload-302")
+        self.assertTrue(await self.service._store_message(msg1, event_type="new"))
+        self.assertTrue(await self.service._store_message(msg2, event_type="new"))
+
+        store_a = ArchiveStore(self.store.database_path)
+        store_b = ArchiveStore(self.store.database_path)
+        store_a.initialize()
+        store_b.initialize()
+        try:
+            svc_a = TelegramArchiveService(self.config, store_a, media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0))
+            svc_b = TelegramArchiveService(self.config, store_b, media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0))
+            svc_a.client = FakeMediaClient(msg1, msg2)
+            svc_b.client = FakeMediaClient(msg1, msg2)
+
+            task_a = asyncio.create_task(svc_a.process_pending_media_downloads(max_jobs=1))
+            task_b = asyncio.create_task(svc_b.process_pending_media_downloads(max_jobs=1))
+            await asyncio.wait_for(both_started.wait(), timeout=2.0)
+            release_both.set()
+            await asyncio.gather(task_a, task_b)
+
+            files = self.store.list_media_files(account_id="main", chat_id=chat_id)
+            by_msg = {item["message_id"]: Path(item["file_path"]) for item in files}
+            self.assertEqual(set(by_msg), {301, 302})
+            self.assertNotEqual(by_msg[301], by_msg[302])
+            self.assertEqual(by_msg[301].read_bytes(), b"payload-301")
+            self.assertEqual(by_msg[302].read_bytes(), b"payload-302")
+        finally:
+            store_a.close()
+            store_b.close()
+
+    async def test_late_older_edit_does_not_cancel_or_regress_newer_attachment_job(self) -> None:
+        chat_id = -1086
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+
+        class PayloadMessage(FakeMessage):
+            def __init__(self, msg_id: int, *, payload: bytes | None, edit_dt: datetime | None) -> None:
+                super().__init__(
+                    msg_id,
+                    chat_id,
+                    text="body",
+                    media=MessageMediaDocument() if payload is not None else None,
+                )
+                self.edit_date = edit_dt
+                self._payload = payload
+
+            async def download_media(self, file: str) -> str:
+                assert self._payload is not None
+                path = Path(file) / "doc.bin"
+                path.write_bytes(self._payload)
+                return str(path)
+
+        v2 = PayloadMessage(310, payload=b"newest-v2", edit_dt=datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc))
+        late_no_media = PayloadMessage(310, payload=None, edit_dt=datetime(2026, 4, 2, 11, 0, tzinfo=timezone.utc))
+        late_with_media = PayloadMessage(310, payload=b"stale-v1", edit_dt=datetime(2026, 4, 2, 11, 30, tzinfo=timezone.utc))
+
+        self.service.client = FakeMediaClient(v2)
+        self.assertTrue(await self.service._store_message(v2, event_type="edit"))
+        # Late edit without media must NOT cancel the newer job.
+        self.assertTrue(await self.service._store_message(late_no_media, event_type="edit"))
+        # Late edit with media must NOT regress target_edited_at to 11:30.
+        self.assertTrue(await self.service._store_message(late_with_media, event_type="edit"))
+
+        jobs = self.store.list_media_download_jobs(account_id="main")
+        self.assertEqual(len(jobs), 1)
+        self.assertEqual(jobs[0]["status"], "pending")
+        self.assertEqual(jobs[0]["target_edited_at"], "2026-04-02T12:00:00+00:00")
+
+        await self.service.process_pending_media_downloads()
+        finished = self.store.get_media_download_job(jobs[0]["job_id"])
+        assert finished is not None
+        self.assertEqual(finished["status"], "completed")
+        files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=310)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(Path(files[0]["file_path"]).read_bytes(), b"newest-v2")
+
+    async def test_exhausted_stale_crash_and_transient_unlink_failure_clean_up_on_retry(self) -> None:
+        from unittest import mock
+
+        chat_id = -1085
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0, stale_seconds=60.0),
+        )
+        msg = FakeMessage(320, chat_id, media=MessageMediaDocument())
+        service.client = FakeMediaClient(msg)
+
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        claimed = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed is not None
+        job_id = claimed["job_id"]
+        part_dir = target_dir / f".part-{job_id}-t1"
+        part_dir.mkdir(parents=True, exist_ok=True)
+        (part_dir / "part.bin").write_bytes(b"half")
+        orphan_file = target_dir / f"320_m320_t1.bin"
+        orphan_file.write_bytes(b"uncommitted")
+        self.assertTrue(
+            self.store.record_media_download_pending_path(
+                job_id,
+                expected_claim_token=1,
+                pending_file_path=str(orphan_file),
+            )
+        )
+
+        # Restart BEFORE lease expires: startup cleanup must NOT touch active lease artifacts.
+        service._cleanup_orphan_media_artifacts()
+        self.assertTrue(part_dir.exists())
+        self.assertTrue(orphan_file.exists())
+
+        # Now expire the lease on the final attempt (attempts == max_attempts == 1).
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        self.store._conn.commit()
+
+        # First cleanup pass hits transient unlink PermissionError -> pending_file_path stays recorded in DB!
+        orig_unlink = Path.unlink
+
+        def flaky_unlink(path_self: Path, *args, **kwargs):
+            if path_self == orphan_file:
+                raise PermissionError("busy file")
+            return orig_unlink(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", flaky_unlink):
+            self.assertEqual(await service.process_pending_media_downloads(), 0)
+        job_after_err = self.store.get_media_download_job(job_id)
+        assert job_after_err is not None
+        self.assertEqual(job_after_err["status"], "failed")
+        self.assertEqual(job_after_err["pending_file_path"], str(orphan_file))
+        self.assertTrue(orphan_file.exists())
+        self.assertFalse(part_dir.exists())
+
+        # Next cleanup pass succeeds and removes the orphan file and clears pending_file_path.
+        self.assertEqual(await service.process_pending_media_downloads(), 0)
+        job_after_ok = self.store.get_media_download_job(job_id)
+        assert job_after_ok is not None
+        self.assertIsNone(job_after_ok["pending_file_path"])
+        self.assertEqual(list(target_dir.iterdir()), [])
 
 
 if __name__ == "__main__":

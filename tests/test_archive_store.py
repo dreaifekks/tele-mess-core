@@ -3086,6 +3086,60 @@ class ArchiveMigrationTest(unittest.TestCase):
             finally:
                 store.close()
 
+    def test_intermediate_v21_without_replace_and_pending_columns_repairs_on_initialize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v21_intermediate.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            store.close()
+            old_conn = sqlite3.connect(str(db_path))
+            old_conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS media_download_jobs_validate_insert;
+                DROP TRIGGER IF EXISTS media_download_jobs_validate_update;
+                DROP TABLE media_download_jobs;
+                CREATE TABLE media_download_jobs (
+                  job_id TEXT PRIMARY KEY,
+                  source TEXT NOT NULL DEFAULT 'telegram',
+                  account_id TEXT NOT NULL,
+                  chat_id INTEGER NOT NULL,
+                  message_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  media_kind TEXT,
+                  is_sticker_like INTEGER NOT NULL DEFAULT 0,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  max_attempts INTEGER NOT NULL DEFAULT 8,
+                  claim_token INTEGER NOT NULL DEFAULT 0,
+                  next_attempt_at TEXT,
+                  last_error TEXT,
+                  error_code TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  completed_at TEXT,
+                  UNIQUE(source, account_id, chat_id, message_id)
+                );
+                """
+            )
+            old_conn.commit()
+            reopened = ArchiveStore(db_path)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "stop running services before upgrading"):
+                    reopened.initialize()
+                old_conn.close()
+                reopened.initialize()
+                self.assertTrue(reopened._has_column("media_download_jobs", "replace_existing"))
+                self.assertTrue(reopened._has_column("media_download_jobs", "target_edited_at"))
+                self.assertTrue(reopened._has_column("media_download_jobs", "pending_file_path"))
+                job = reopened.enqueue_media_download_job(account_id="main", chat_id=-2009, message_id=1)
+                self.assertIsNotNone(job)
+            finally:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+                reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

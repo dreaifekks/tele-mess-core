@@ -501,6 +501,9 @@ def _migration_21(connection: sqlite3.Connection) -> None:
         )
         """
     )
+    _ensure_column(connection, "media_download_jobs", "replace_existing", "INTEGER NOT NULL DEFAULT 0")
+    _ensure_column(connection, "media_download_jobs", "target_edited_at", "TEXT")
+    _ensure_column(connection, "media_download_jobs", "pending_file_path", "TEXT")
     connection.execute(
         """
         CREATE INDEX IF NOT EXISTS idx_media_download_jobs_claim
