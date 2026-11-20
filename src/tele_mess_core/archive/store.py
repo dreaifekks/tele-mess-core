@@ -1354,11 +1354,16 @@ class ArchiveStore:
                 ).fetchone()
                 prev_edited_at = str(prev_row["edited_at"]) if (prev_row is not None and prev_row["edited_at"]) else None
                 prev_deleted = prev_row is not None and prev_row["deleted_at"] is not None
+                has_newer_edit = (
+                    prev_row is not None
+                    and message.edited_at is not None
+                    and (prev_edited_at is None or str(message.edited_at) > prev_edited_at)
+                )
                 is_stale_edit = (
-                    event_type == "edit"
-                    and prev_edited_at is not None
+                    prev_edited_at is not None
                     and (message.edited_at is None or str(message.edited_at) < prev_edited_at)
                 )
+                accepted_edited_at = prev_edited_at if is_stale_edit else (message.edited_at or prev_edited_at)
                 self._upsert_message_row_unlocked(message, event_type, now)
                 event_seq = self._insert_event(
                     source=message.source,
@@ -1371,6 +1376,7 @@ class ArchiveStore:
                 )
                 if build_media_job is not None and not is_stale_edit and not prev_deleted:
                     job_spec = build_media_job(effective_policy, message)
+                    should_replace = has_newer_edit or (event_type == "edit")
                     if job_spec is not None:
                         self._enqueue_media_download_job_unlocked(
                             source=message.source,
@@ -1381,11 +1387,11 @@ class ArchiveStore:
                             media_kind=job_spec.get("media_kind"),
                             is_sticker_like=bool(job_spec.get("is_sticker_like", False)),
                             max_attempts=int(job_spec.get("max_attempts", 8)),
-                            replace_existing=bool(job_spec.get("replace_existing", False)),
-                            target_edited_at=job_spec.get("target_edited_at"),
+                            replace_existing=bool(job_spec.get("replace_existing", False)) or should_replace,
+                            target_edited_at=accepted_edited_at,
                             now=now,
                         )
-                    elif event_type == "edit":
+                    elif should_replace:
                         self._invalidate_media_jobs_on_edit_unlocked(
                             source=message.source,
                             account_id=message.account_id,
@@ -2228,12 +2234,27 @@ class ArchiveStore:
         *,
         expected_claim_token: int,
         pending_file_path: str,
-    ) -> bool:
-        """Persist an exclusive target file path before os.replace so crash recovery can clean up uncommitted files."""
+    ) -> str:
+        """Persist an exclusive target file path before os.replace; returns ok, stale_claim, pending_uncleaned, or path_conflict."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 now = utc_now_iso()
+                row = self._conn.execute(
+                    """
+                    SELECT pending_file_path
+                    FROM media_download_jobs
+                    WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                    """,
+                    (job_id, int(expected_claim_token)),
+                ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return "stale_claim"
+                existing_pending = row["pending_file_path"]
+                if existing_pending and str(existing_pending) != pending_file_path:
+                    self._conn.rollback()
+                    return "pending_uncleaned"
                 conflict_file = self._conn.execute(
                     "SELECT 1 FROM media_files WHERE file_path = ? LIMIT 1",
                     (pending_file_path,),
@@ -2244,21 +2265,22 @@ class ArchiveStore:
                 ).fetchone()
                 if conflict_file is not None or conflict_job is not None:
                     self._conn.rollback()
-                    return False
+                    return "path_conflict"
                 cur = self._conn.execute(
                     """
                     UPDATE media_download_jobs
                     SET pending_file_path = ?,
                         updated_at = ?
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                      AND (pending_file_path IS NULL OR pending_file_path = ?)
                     """,
-                    (pending_file_path, now, job_id, int(expected_claim_token)),
+                    (pending_file_path, now, job_id, int(expected_claim_token), pending_file_path),
                 )
                 if cur.rowcount > 0:
                     self._conn.commit()
-                    return True
+                    return "ok"
                 self._conn.rollback()
-                return False
+                return "stale_claim"
             except Exception:
                 if self._conn.in_transaction:
                     self._conn.rollback()
@@ -2271,8 +2293,12 @@ class ArchiveStore:
         expected_claim_token: int,
         require_downloading: bool = True,
         stale_seconds: float | None = None,
-    ) -> str | None:
-        """Unlink an uncommitted pending_file_path first and clear it in SQLite only once removal is confirmed."""
+    ) -> tuple[bool, str | None]:
+        """Unlink an uncommitted pending_file_path and clear SQLite only once removal is confirmed.
+
+        Returns `(cleared_or_absent, unlinked_path)`. When `cleared_or_absent` is False,
+        the pending path could not be unlinked and remains recorded for a future retry.
+        """
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -2287,26 +2313,26 @@ class ArchiveStore:
                 ).fetchone()
                 if row is None or not row["pending_file_path"]:
                     self._conn.rollback()
-                    return None
+                    return True, None
                 status = str(row["status"])
                 if require_downloading:
                     if status != "downloading":
                         self._conn.rollback()
-                        return None
+                        return True, None
                 elif status == "downloading":
                     if stale_seconds is None:
                         self._conn.rollback()
-                        return None
+                        return True, None
                     stale_before = (now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))).isoformat()
                     if str(row["updated_at"]) > stale_before:
                         self._conn.rollback()
-                        return None
+                        return True, None
                 candidate = str(row["pending_file_path"])
                 referenced = self._media_file_path_referenced_unlocked(candidate)
                 if not referenced:
                     if not _unlink_file_confirmed(candidate):
                         self._conn.rollback()
-                        return None
+                        return False, None
                 self._conn.execute(
                     """
                     UPDATE media_download_jobs
@@ -2316,7 +2342,7 @@ class ArchiveStore:
                     (job_id, int(expected_claim_token)),
                 )
                 self._conn.commit()
-                return None if referenced else candidate
+                return True, (None if referenced else candidate)
             except Exception:
                 if self._conn.in_transaction:
                     self._conn.rollback()
@@ -5950,15 +5976,24 @@ def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:
 
 
 def _unlink_file_confirmed(file_path: str) -> bool:
-    """Remove file_path and return True only when it is confirmed absent from disk."""
+    """Remove file_path (and its empty job-claim publish directory, if any) and return True only when absent."""
     path = Path(file_path)
     try:
         path.unlink()
-        return True
+        removed = True
     except FileNotFoundError:
-        return True
+        removed = True
     except OSError:
-        return not path.exists()
+        removed = not path.exists()
+    if removed:
+        parent = path.parent
+        parent_name = parent.name
+        if parent_name.startswith("mdj_") and "-t" in parent_name:
+            try:
+                parent.rmdir()
+            except OSError:
+                pass
+    return removed
 
 
 def _bounded_limit(limit: int, max_limit: int = 1000) -> int:

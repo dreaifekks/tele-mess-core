@@ -251,6 +251,8 @@ class TelegramArchiveService:
         self._media_wakeup.set()
 
     async def _media_worker_loop(self) -> None:
+        cleanup_retry_count = 0
+        cleanup_retry_cap = 8
         try:
             try:
                 self._cleanup_orphan_media_artifacts()
@@ -284,6 +286,7 @@ class TelegramArchiveService:
                     await self._wait_media_wakeup(1.0)
                     continue
                 if job is not None:
+                    cleanup_retry_count = 0
                     try:
                         await self._execute_media_download_job(job)
                     except asyncio.CancelledError:
@@ -297,14 +300,18 @@ class TelegramArchiveService:
                         )
                         await self._wait_media_wakeup(1.0)
                     continue
+                has_remaining_cleanup = False
                 try:
-                    self._cleanup_orphan_media_artifacts()
+                    has_remaining_cleanup = self._cleanup_orphan_media_artifacts()
                 except Exception as exc:
+                    has_remaining_cleanup = True
                     self.logger.warning(
                         "Failed to clean up orphan media artifacts for account=%s: %s",
                         self.account_id,
                         exc,
                     )
+                if not has_remaining_cleanup:
+                    cleanup_retry_count = 0
                 try:
                     next_due = self.store.next_media_download_due_at(
                         self.account_id,
@@ -320,9 +327,21 @@ class TelegramArchiveService:
                     await self._wait_media_wakeup(1.0)
                     continue
                 if next_due is None:
+                    if has_remaining_cleanup and cleanup_retry_count < cleanup_retry_cap:
+                        base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                        delay = min(base_delay * (2 ** cleanup_retry_count), 60.0)
+                        cleanup_retry_count += 1
+                        await self._wait_media_wakeup(delay)
+                        continue
                     await self._media_wakeup.wait()
+                    cleanup_retry_count = 0
                     continue
                 sleep_seconds = _seconds_until_iso(next_due)
+                if has_remaining_cleanup and cleanup_retry_count < cleanup_retry_cap:
+                    base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                    delay = min(base_delay * (2 ** cleanup_retry_count), 60.0)
+                    cleanup_retry_count += 1
+                    sleep_seconds = min(sleep_seconds, delay) if sleep_seconds > 0 else delay
                 if sleep_seconds > 0:
                     await self._wait_media_wakeup(min(sleep_seconds, 60.0))
         except asyncio.CancelledError:
@@ -331,8 +350,12 @@ class TelegramArchiveService:
             if self._media_worker_task is asyncio.current_task():
                 self._media_worker_task = None
 
-    def _cleanup_orphan_media_artifacts(self) -> None:
-        """Remove stale job staging directories and uncommitted pending publish files after crashes."""
+    def _cleanup_orphan_media_artifacts(self) -> bool:
+        """Remove stale job staging directories and uncommitted pending publish files after crashes.
+
+        Returns True when any orphan artifact could not be removed and should be retried later.
+        """
+        has_remaining = False
         account_media_dir = self.store.database_path.parent / "media" / self.account_id
         stale_seconds = max(0.0, float(self.media_download.stale_seconds))
         stale_before = (
@@ -343,32 +366,54 @@ class TelegramArchiveService:
                 if not chat_dir.is_dir():
                     continue
                 for entry in chat_dir.iterdir():
-                    if not entry.is_dir() or not entry.name.startswith(".part-"):
+                    if not entry.is_dir():
                         continue
-                    parsed = _parse_staging_dir_name(entry.name)
-                    if parsed is None:
-                        continue
-                    job_id, token = parsed
-                    job = self.store.get_media_download_job(job_id)
-                    if job is None:
-                        shutil.rmtree(entry, ignore_errors=True)
-                        continue
-                    status = str(job.get("status") or "")
-                    current_token = int(job.get("claim_token") or 0)
-                    updated_at = str(job.get("updated_at") or "")
-                    if status != "downloading" or current_token > token or updated_at <= stale_before:
-                        shutil.rmtree(entry, ignore_errors=True)
+                    if entry.name.startswith(".part-"):
+                        parsed = _parse_staging_dir_name(entry.name)
+                        if parsed is None:
+                            continue
+                        job_id, token = parsed
+                        job = self.store.get_media_download_job(job_id)
+                        should_remove = job is None
+                        if job is not None:
+                            status = str(job.get("status") or "")
+                            current_token = int(job.get("claim_token") or 0)
+                            updated_at = str(job.get("updated_at") or "")
+                            should_remove = (
+                                status != "downloading"
+                                or current_token > token
+                                or updated_at <= stale_before
+                            )
+                        if should_remove:
+                            try:
+                                shutil.rmtree(entry)
+                            except OSError:
+                                if entry.exists():
+                                    has_remaining = True
+                    elif entry.name.startswith("mdj_") and "-t" in entry.name:
+                        try:
+                            next(entry.iterdir())
+                        except StopIteration:
+                            try:
+                                entry.rmdir()
+                            except OSError:
+                                pass
+                        except OSError:
+                            pass
         for pending in self.store.list_media_jobs_with_pending_paths(
             account_id=self.account_id,
             source=SOURCE_TELEGRAM,
             stale_seconds=stale_seconds,
         ):
-            self.store.cleanup_media_download_pending_path(
+            cleared, _unlinked = self.store.cleanup_media_download_pending_path(
                 str(pending["job_id"]),
                 expected_claim_token=int(pending["claim_token"]),
                 require_downloading=False,
                 stale_seconds=stale_seconds,
             )
+            if not cleared:
+                has_remaining = True
+        return has_remaining
 
     def _cleanup_prior_job_staging_dirs(self, target_dir: Path, job_id: str, current_token: int) -> None:
         if not target_dir.exists():
@@ -666,11 +711,16 @@ class TelegramArchiveService:
             )
             self._cleanup_prior_job_staging_dirs(target_dir, job_id, claim_token)
             if job.get("pending_file_path"):
-                self.store.cleanup_media_download_pending_path(
+                cleared, _unlinked = self.store.cleanup_media_download_pending_path(
                     job_id,
                     expected_claim_token=claim_token,
                     require_downloading=True,
                 )
+                if not cleared:
+                    raise _MediaDownloadResultError(
+                        "media_cleanup_failed",
+                        "previous uncommitted media file could not be cleaned up",
+                    )
 
             if not replace_existing:
                 existing_media = self.store.list_media_files(
@@ -780,18 +830,37 @@ class TelegramArchiveService:
                     "download_media file path does not exist",
                 )
 
-            planned_final_path = _exclusive_media_target_path(
-                target_dir,
-                staged_path.name,
-                message_id=message_id,
-                claim_token=claim_token,
-            )
-            if not self.store.record_media_download_pending_path(
-                job_id,
-                expected_claim_token=claim_token,
-                pending_file_path=str(planned_final_path),
-            ):
-                return
+            planned_final_path: Path | None = None
+            for suffix_index in range(8):
+                candidate_path = _exclusive_media_target_path(
+                    target_dir,
+                    staged_path.name,
+                    job_id=job_id,
+                    claim_token=claim_token,
+                    suffix_index=suffix_index,
+                )
+                if candidate_path.exists():
+                    continue
+                reserve_status = self.store.record_media_download_pending_path(
+                    job_id,
+                    expected_claim_token=claim_token,
+                    pending_file_path=str(candidate_path),
+                )
+                if reserve_status == "ok":
+                    planned_final_path = candidate_path
+                    break
+                if reserve_status == "stale_claim":
+                    return
+                if reserve_status == "pending_uncleaned":
+                    raise _MediaDownloadResultError(
+                        "media_cleanup_failed",
+                        "previous uncommitted media file could not be cleaned up",
+                    )
+            if planned_final_path is None:
+                raise _MediaDownloadResultError(
+                    "media_path_conflict",
+                    "failed to reserve an exclusive media publish path",
+                )
 
             def _prepare_media() -> MediaFileRecord:
                 file_size = staged_path.stat().st_size
@@ -806,11 +875,17 @@ class TelegramArchiveService:
                     downloaded_at=utc_now_iso(),
                     raw_json=json.dumps({"downloaded": str(planned_final_path)}, ensure_ascii=False),
                 )
+                planned_final_path.parent.mkdir(parents=True, exist_ok=True)
                 os.replace(staged_path, planned_final_path)
                 return media_record
 
             def _rollback_media(media_record: MediaFileRecord) -> None:
-                Path(media_record.file_path).unlink(missing_ok=True)
+                path = Path(media_record.file_path)
+                path.unlink(missing_ok=True)
+                try:
+                    path.parent.rmdir()
+                except OSError:
+                    pass
 
             outcome, _published = self.store.complete_media_download_with_file(
                 job_id=job_id,
@@ -1548,17 +1623,16 @@ def _exclusive_media_target_path(
     target_dir: Path,
     filename: str,
     *,
-    message_id: int,
+    job_id: str,
     claim_token: int,
+    suffix_index: int = 0,
 ) -> Path:
-    """Return a publish path structurally exclusive to one (chat, message_id, claim_token)."""
+    """Return a publish path inside a per-claim exclusive subdirectory while preserving the original filename."""
     clean_name = Path(filename).name if filename else ""
     if not clean_name or clean_name in {".", ".."}:
         clean_name = "media.bin"
-    candidate = Path(clean_name)
-    stem = candidate.stem or "media"
-    suffix = candidate.suffix
-    return target_dir / f"{stem}_m{message_id}_t{claim_token}{suffix}"
+    dir_name = f"{job_id}-t{claim_token}" if suffix_index == 0 else f"{job_id}-t{claim_token}-{suffix_index}"
+    return target_dir / dir_name / clean_name
 
 
 def _safe_dict(obj: Any) -> Any:
