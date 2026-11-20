@@ -34,8 +34,10 @@ from tele_mess_core.daily import (
     AiProviderRuntimeState,
     DailyJobInterrupted,
     _codex_provider_error,
+    _collect_image_paths,
     _daily_ai_work_dir,
     _expand_command,
+    _origin_image_paths,
     _run_summary_provider,
     build_daily_package,
     deliver_daily_summary,
@@ -326,6 +328,30 @@ class DailyPackagingTest(unittest.TestCase):
         summary_payload = json.loads((Path(summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
         self.assertEqual(summary_payload["delivery"]["status"], "sent")
         self.assertEqual(summary_payload["delivery"]["deliveries"], [{"kind": "point_summary", "result": delivery_result}])
+
+    def test_image_paths_follow_the_archive_media_classification(self) -> None:
+        media_dir = self.root / "media"
+        media_dir.mkdir()
+        photo = media_dir / "photo"
+        sent_as_file = media_dir / "chart.png"
+        clip = media_dir / "clip.mp4"
+        for path in (photo, sent_as_file, clip):
+            path.write_bytes(b"x")
+        origin_payload = {
+            "messages": [
+                {
+                    "media_files": [
+                        {"media_kind": "photo", "mime_type": None, "content_type": "application/octet-stream", "file_path": str(photo)},
+                        {"media_kind": "document", "mime_type": "application/octet-stream", "content_type": "application/octet-stream", "file_path": str(sent_as_file)},
+                        {"media_kind": "video", "mime_type": "video/mp4", "content_type": "video/mp4", "file_path": str(clip)},
+                    ]
+                }
+            ]
+        }
+
+        expected = [str(photo), str(sent_as_file)]
+        self.assertEqual(_origin_image_paths(origin_payload), expected)
+        self.assertEqual(_collect_image_paths({"point_origins": [origin_payload]}), expected)
 
     def test_daily_delivery_accepts_sqlite_telegram_management_account(self) -> None:
         self.config.telegram.accounts.append(

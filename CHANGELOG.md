@@ -44,6 +44,9 @@ validation rules.
 - The unused `timezone` key of `telegram.accounts` entries was removed; daily
   packages take their timezone from the request or the daily schedule. An old
   config that still sets it keeps loading.
+- Daily reports recognize images the same way the archive and the API do, so
+  photos saved without a file extension and images sent as files are passed to
+  image analysis and to the summary provider.
 
 ## 0.3.5 - 2026-10-13
 

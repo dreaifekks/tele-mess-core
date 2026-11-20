@@ -31,6 +31,7 @@ from tele_mess_core.config import (
     app_workspace_dir,
     resolve_account_config,
 )
+from tele_mess_core.media import classify_media_type
 from tele_mess_core.models import (
     DEFAULT_TIMEZONE,
     DailyPackageRunRecord,
@@ -2304,8 +2305,7 @@ def _origin_image_paths(origin_payload: dict[str, Any], limit: int | None = 20) 
 
 
 def _is_image_media(media: dict[str, Any]) -> bool:
-    content_type = str(media.get("content_type") or media.get("mime_type") or "")
-    return content_type.startswith("image/")
+    return classify_media_type(media.get("media_kind"), media.get("mime_type"), media.get("file_path")) == "image"
 
 
 def _truncate_text(value: str, limit: int) -> str:
@@ -3172,9 +3172,8 @@ def _collect_image_paths(package_payload: dict[str, Any], limit: int = 20) -> li
     for origin_payload in _iter_point_origin_payloads(package_payload):
         for message in origin_payload.get("messages") or []:
             for media in message.get("media_files") or []:
-                content_type = str(media.get("content_type") or media.get("mime_type") or "")
                 file_path = str(media.get("file_path") or "")
-                if content_type.startswith("image/") and file_path and Path(file_path).is_file():
+                if _is_image_media(media) and file_path and Path(file_path).is_file():
                     paths.append(file_path)
                     if len(paths) >= limit:
                         return paths
