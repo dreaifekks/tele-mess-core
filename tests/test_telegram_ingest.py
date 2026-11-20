@@ -3263,6 +3263,178 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.stop()
 
+    async def test_deleting_other_source_same_account_id_and_post_delete_claim_do_not_harm_live_telegram_download(
+        self,
+    ) -> None:
+        from tele_mess_core.models import AccountRecord
+        from tele_mess_core.server.api import _delete_management_account
+
+        chat_id = -1094
+        self.store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "TG Main", "user"))
+        self.store.upsert_account(AccountRecord("other_source", "main", "Other Main", "user"))
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.05, stale_seconds=60.0),
+        )
+        msg = FakeMessage(392, chat_id, media=MessageMediaDocument())
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        claimed = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed is not None
+        job_id = claimed["job_id"]
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        staging_dir = target_dir / f".part-{job_id}-t1"
+        staging_dir.mkdir(parents=True, exist_ok=True)
+        staged_file = staging_dir / "active.bin"
+        staged_file.write_bytes(b"live-telegram-bytes")
+
+        # Deleting other_source:main must NEVER fence or delete telegram:main's active download or staging dir.
+        _delete_management_account(self.store, {"source": "other_source", "account_id": "main"}, None)
+        job_after = self.store.get_media_download_job(job_id)
+        assert job_after is not None
+        self.assertEqual(job_after["status"], "downloading")
+        self.assertEqual(job_after["claim_token"], 1)
+        self.assertTrue(staged_file.exists())
+        self.assertTrue(self.store.heartbeat_media_download_job(job_id, expected_claim_token=1))
+
+        # Post-delete staging cleanup (allow_fencing_downloading=False) also protects any newly created claim.
+        self.assertFalse(
+            self.store.cleanup_orphan_media_staging_dirs(
+                account_id="main",
+                source=SOURCE_TELEGRAM,
+                stale_seconds=0.0,
+                include_deleted_accounts=False,
+                allow_fencing_downloading=False,
+            )
+        )
+        self.assertTrue(staged_file.exists())
+        job_still_live = self.store.get_media_download_job(job_id)
+        assert job_still_live is not None
+        self.assertEqual(job_still_live["status"], "downloading")
+
+    async def test_manager_stop_waits_for_inflight_cleanup_thread_before_returning(self) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "manager_stop_cleanup.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            thread_errors: list[BaseException] = []
+
+            def blocking_cleanup(*args, **kwargs) -> bool:
+                entered.set()
+                release.wait(timeout=5.0)
+                try:
+                    # Access SQLite after being released to prove store is still open until stop() completes.
+                    local_store.state()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+                    raise
+                return False
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: None,
+                ingest=False,
+            )
+            with mock.patch.object(
+                local_store,
+                "cleanup_deleted_account_media_artifacts",
+                side_effect=blocking_cleanup,
+            ):
+                await manager.start()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                stop_task = asyncio.create_task(manager.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop_task.done())
+                release.set()
+                await asyncio.wait_for(stop_task, timeout=2.0)
+            local_store.close()
+            self.assertEqual(thread_errors, [])
+
+    async def test_service_stop_waits_for_inflight_staging_scan_thread_before_returning(self) -> None:
+        import threading
+        from unittest import mock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "service_stop_cleanup.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            service = TelegramArchiveService(
+                self.config,
+                local_store,
+                media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            thread_errors: list[BaseException] = []
+
+            def blocking_fs_scan(*args, **kwargs) -> bool:
+                entered.set()
+                release.wait(timeout=5.0)
+                try:
+                    local_store.state()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+                    raise
+                return False
+
+            class IdleClient(FakeMediaClient):
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                def is_connected(self) -> bool:
+                    return True
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_fs_scan,
+            ):
+                await service.activate(IdleClient())
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                stop_task = asyncio.create_task(service.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop_task.done())
+                release.set()
+                await asyncio.wait_for(stop_task, timeout=2.0)
+            local_store.close()
+            self.assertEqual(thread_errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()

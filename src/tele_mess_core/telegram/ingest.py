@@ -2,10 +2,12 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta, timezone as dt_timezone
+import functools
 import json
 import logging
 import os
 import shutil
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -66,6 +68,8 @@ class TelegramArchiveService:
         self._retry_task: asyncio.Task[None] | None = None
         self._media_wakeup = asyncio.Event()
         self._media_worker_task: asyncio.Task[None] | None = None
+        self._media_cleanup_stop = threading.Event()
+        self._media_cleanup_future: asyncio.Future[bool] | None = None
         self._media_cleanup_failures: dict[str, int] = {}
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
@@ -223,6 +227,7 @@ class TelegramArchiveService:
 
     async def stop(self) -> None:
         self._closed = True
+        self._media_cleanup_stop.set()
         self._retry_targets.clear()
         self._media_wakeup.set()
         tasks: list[asyncio.Task[None]] = []
@@ -238,10 +243,14 @@ class TelegramArchiveService:
             tasks.append(media_task)
         if tasks:
             await asyncio.gather(*tasks, return_exceptions=True)
+        inflight = self._media_cleanup_future
+        if inflight is not None and not inflight.done():
+            await asyncio.gather(inflight, return_exceptions=True)
 
     def _start_media_worker(self) -> None:
         if self._closed:
             return
+        self._media_cleanup_stop.clear()
         if self._media_worker_task is not None and not self._media_worker_task.done():
             self._media_wakeup.set()
             return
@@ -264,10 +273,19 @@ class TelegramArchiveService:
 
         async def _run_fs_cleanup() -> None:
             nonlocal fs_retry_count, next_fs_cleanup_at
+            if self._closed or self._media_cleanup_stop.is_set():
+                return
             has_remaining_fs = False
+            future = loop.run_in_executor(
+                None,
+                functools.partial(self._cleanup_staging_dirs, stop_event=self._media_cleanup_stop),
+            )
+            self._media_cleanup_future = future
             try:
-                has_remaining_fs = await asyncio.to_thread(self._cleanup_staging_dirs)
+                has_remaining_fs = await asyncio.shield(future)
             except asyncio.CancelledError:
+                self._media_cleanup_stop.set()
+                await asyncio.gather(future, return_exceptions=True)
                 raise
             except Exception as exc:
                 has_remaining_fs = True
@@ -276,6 +294,9 @@ class TelegramArchiveService:
                     self.account_id,
                     exc,
                 )
+            finally:
+                if self._media_cleanup_future is future:
+                    self._media_cleanup_future = None
             if not has_remaining_fs:
                 fs_retry_count = 0
                 next_fs_cleanup_at = loop.time() + fs_clean_interval
@@ -289,7 +310,7 @@ class TelegramArchiveService:
             nonlocal pending_retry_count, next_pending_cleanup_at
             has_remaining_pending = False
             try:
-                has_remaining_pending = self._cleanup_pending_media_paths()
+                has_remaining_pending = self._cleanup_pending_media_paths(stop_event=self._media_cleanup_stop)
             except Exception as exc:
                 has_remaining_pending = True
                 self.logger.warning(
@@ -390,22 +411,24 @@ class TelegramArchiveService:
             if self._media_worker_task is asyncio.current_task():
                 self._media_worker_task = None
 
-    def _cleanup_staging_dirs(self) -> bool:
+    def _cleanup_staging_dirs(self, *, stop_event: threading.Event | None = None) -> bool:
         stale_seconds = max(0.0, float(self.media_download.stale_seconds))
         return self.store.cleanup_orphan_media_staging_dirs(
             account_id=self.account_id,
             source=SOURCE_TELEGRAM,
             stale_seconds=stale_seconds,
             include_deleted_accounts=True,
+            stop_event=stop_event,
         )
 
-    def _cleanup_pending_media_paths(self) -> bool:
+    def _cleanup_pending_media_paths(self, *, stop_event: threading.Event | None = None) -> bool:
         stale_seconds = max(0.0, float(self.media_download.stale_seconds))
         return self.store.cleanup_orphan_media_pending_paths(
             account_id=self.account_id,
             source=SOURCE_TELEGRAM,
             stale_seconds=stale_seconds,
             include_deleted_accounts=True,
+            stop_event=stop_event,
         )
 
     def _cleanup_orphan_media_artifacts(self) -> bool:

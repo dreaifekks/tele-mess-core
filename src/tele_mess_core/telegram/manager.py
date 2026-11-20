@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import TimeoutError as FutureTimeoutError
+import functools
 import inspect
 import json
 import logging
@@ -778,10 +779,13 @@ class TelegramRuntimeManager:
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
         self._media_cleanup_wakeup: asyncio.Event | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
+        self._media_cleanup_stop = threading.Event()
+        self._media_cleanup_future: asyncio.Future[bool] | None = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
+        self._media_cleanup_stop.clear()
         self._media_cleanup_wakeup = asyncio.Event()
         configs = {item.account_id: item for item in self.config.telegram.accounts}
         for item in self.store.list_management_accounts():
@@ -797,11 +801,18 @@ class TelegramRuntimeManager:
         )
 
     async def stop(self) -> None:
+        self._media_cleanup_stop.set()
+        wakeup = self._media_cleanup_wakeup
+        if wakeup is not None:
+            wakeup.set()
         cleanup_task = self._media_cleanup_task
         self._media_cleanup_task = None
         if cleanup_task is not None and not cleanup_task.done():
             cleanup_task.cancel()
             await asyncio.gather(cleanup_task, return_exceptions=True)
+        inflight = self._media_cleanup_future
+        if inflight is not None and not inflight.done():
+            await asyncio.gather(inflight, return_exceptions=True)
         self._media_cleanup_wakeup = None
         runtimes = list(self._runtimes.values())
         self._runtimes.clear()
@@ -811,6 +822,8 @@ class TelegramRuntimeManager:
 
     def trigger_media_cleanup(self) -> None:
         """Wake account-independent cleanup for deleted-account staging dirs and pending paths."""
+        if self._media_cleanup_stop.is_set():
+            return
         loop = self._loop
         wakeup = self._media_cleanup_wakeup
         if loop is None or loop.is_closed() or wakeup is None:
@@ -823,26 +836,38 @@ class TelegramRuntimeManager:
     async def _run_deleted_account_media_cleanup(self) -> None:
         retry_count = 0
         retry_cap = 8
+        loop = asyncio.get_running_loop()
         try:
-            while True:
+            while not self._media_cleanup_stop.is_set():
                 wakeup = self._media_cleanup_wakeup
                 if wakeup is not None:
                     wakeup.clear()
                 stale_seconds = max(0.0, float(self.config.telegram.media_download.stale_seconds))
                 active_ids = set(self._runtimes.keys())
                 has_remaining = False
+                cleanup_fn = functools.partial(
+                    self.store.cleanup_deleted_account_media_artifacts,
+                    source=SOURCE_TELEGRAM,
+                    stale_seconds=stale_seconds,
+                    active_account_ids=active_ids,
+                    stop_event=self._media_cleanup_stop,
+                )
+                future = loop.run_in_executor(None, cleanup_fn)
+                self._media_cleanup_future = future
                 try:
-                    has_remaining = await asyncio.to_thread(
-                        self.store.cleanup_deleted_account_media_artifacts,
-                        source=SOURCE_TELEGRAM,
-                        stale_seconds=stale_seconds,
-                        active_account_ids=active_ids,
-                    )
+                    has_remaining = await asyncio.shield(future)
                 except asyncio.CancelledError:
+                    self._media_cleanup_stop.set()
+                    await asyncio.gather(future, return_exceptions=True)
                     raise
                 except Exception as exc:
                     has_remaining = True
                     self.logger.warning("Failed to clean up deleted-account media artifacts: %s", exc)
+                finally:
+                    if self._media_cleanup_future is future:
+                        self._media_cleanup_future = None
+                if self._media_cleanup_stop.is_set():
+                    return
                 if has_remaining:
                     configured_base = float(self.config.telegram.media_download.retry_delay_seconds)
                     base_delay = max(0.05, min(configured_base, 5.0)) if configured_base > 0 else 0.05
@@ -851,7 +876,7 @@ class TelegramRuntimeManager:
                 else:
                     retry_count = 0
                     delay = 300.0
-                if wakeup is None:
+                if wakeup is None or self._media_cleanup_stop.is_set():
                     return
                 try:
                     await asyncio.wait_for(wakeup.wait(), timeout=delay)
