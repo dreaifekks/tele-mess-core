@@ -33,6 +33,7 @@ class TelegramDiscoveryService:
         *,
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
         auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
+        auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
         account_generation: int | None = None,
         store_write_runner: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ):
@@ -41,6 +42,7 @@ class TelegramDiscoveryService:
         self.store = store
         self._error_persister = error_persister
         self._auth_probe_provider = auth_probe_provider
+        self._auth_owner_provider = auth_owner_provider
         self._account_generation = account_generation
         self._store_write_runner = store_write_runner
         self.logger = logging.getLogger(__name__)
@@ -460,6 +462,14 @@ class TelegramDiscoveryService:
             self.store.upsert_account_auth(
                 record,
                 expected_seq=expected_seq,
+                owner_id=owner_id,
+                owner_epoch=owner_epoch,
+                expected_generation=self._account_generation,
+            )
+        elif self._auth_owner_provider is not None:
+            owner_id, owner_epoch = self._auth_owner_provider()
+            self.store.upsert_account_auth(
+                record,
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
                 expected_generation=self._account_generation,

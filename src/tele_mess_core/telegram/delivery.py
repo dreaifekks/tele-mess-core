@@ -5,7 +5,7 @@ import inspect
 import json
 import logging
 import re
-from typing import Any
+from typing import Any, Callable
 
 from telethon.extensions import markdown as telethon_markdown
 
@@ -20,10 +20,19 @@ TELEGRAM_SUMMARY_PARSE_MODE = "md"
 
 
 class TelegramSummaryDeliveryService:
-    def __init__(self, config: TelegramAccountConfig, store: ArchiveStore):
+    def __init__(
+        self,
+        config: TelegramAccountConfig,
+        store: ArchiveStore,
+        *,
+        auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
+        account_generation: int | None = None,
+    ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
+        self._auth_owner_provider = auth_owner_provider
+        self._account_generation = account_generation
         self.logger = logging.getLogger(__name__)
 
     async def send_chunk(
@@ -45,7 +54,12 @@ class TelegramSummaryDeliveryService:
                     auth_state="needs_login",
                 )
 
-            self._set_auth_state("authorized")
+            if not self._set_auth_state("authorized"):
+                raise TelegramOperationError(
+                    code="auth_state_conflict",
+                    message=f"Telegram account {self.account_id} was deleted or superseded before delivery",
+                    auth_state="conflict",
+                )
             entity = await client.get_entity(delivery.origin_id)
             body = telegram_markdown_for_send(content)
             message_id = await self._send_with_random_id(
@@ -67,12 +81,13 @@ class TelegramSummaryDeliveryService:
             self._record_operation("deliver_daily_summary", "ok", result=result)
             return result
         except TelegramOperationError as exc:
-            self._record_operation(
-                "deliver_daily_summary",
-                "failed",
-                subject_id=_delivery_subject_id(delivery),
-                error=exc.to_public_dict(),
-            )
+            if exc.code != "auth_state_conflict":
+                self._record_operation(
+                    "deliver_daily_summary",
+                    "failed",
+                    subject_id=_delivery_subject_id(delivery),
+                    error=exc.to_public_dict(),
+                )
             raise
         except Exception as exc:
             raise self.record_delivery_error(delivery, exc) from exc
@@ -151,8 +166,12 @@ class TelegramSummaryDeliveryService:
             error.error_type,
         )
 
-    def _set_auth_state(self, state: str) -> None:
-        self.store.upsert_account_auth(
+    def _set_auth_state(self, state: str) -> bool:
+        owner_id: str | None = None
+        owner_epoch: int | None = None
+        if self._auth_owner_provider is not None:
+            owner_id, owner_epoch = self._auth_owner_provider()
+        return self.store.upsert_account_auth(
             AccountAuthRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -160,7 +179,10 @@ class TelegramSummaryDeliveryService:
                 session_name=self.config.session_name,
                 session_dir=str(self.config.session_dir),
                 updated_at=utc_now_iso(),
-            )
+            ),
+            owner_id=owner_id,
+            owner_epoch=owner_epoch,
+            expected_generation=self._account_generation,
         )
 
     def _record_operation(

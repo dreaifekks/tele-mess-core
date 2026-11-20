@@ -4530,6 +4530,213 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 local_store.close()
 
+    async def test_inflight_delivery_aborts_without_resurrecting_deleted_account_auth(self) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            DailyDeliveryConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+        from tele_mess_core.telegram.runtime import TelegramOperationError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "delivery_vs_delete.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(accounts=[self.config]),
+            )
+            entered_auth = asyncio.Event()
+            release_auth = asyncio.Event()
+
+            class PausingDeliveryClient:
+                def __init__(self) -> None:
+                    self._connected = False
+                    self.send_count = 0
+                    self.pause_next_auth = False
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    if self.pause_next_auth:
+                        self.pause_next_auth = False
+                        entered_auth.set()
+                        await release_auth.wait()
+                    return True
+
+                async def get_entity(self, origin_id: int):
+                    return SimpleNamespace(id=origin_id)
+
+                async def send_message(self, entity, body: str, **kwargs):
+                    self.send_count += 1
+                    return SimpleNamespace(id=1)
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+            dyn_client = PausingDeliveryClient()
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: dyn_client if cfg.account_id == "dyn" else PausingDeliveryClient(),
+                ingest=False,
+            )
+            await manager.start()
+            try:
+                await asyncio.sleep(0.05)
+                dyn_client.pause_next_auth = True
+                delivery_task = asyncio.create_task(
+                    manager.execute(
+                        "dyn",
+                        "deliver_chunk",
+                        delivery=DailyDeliveryConfig(origin_id=-1099),
+                        content="daily summary",
+                    )
+                )
+                await asyncio.wait_for(entered_auth.wait(), timeout=2.0)
+
+                # Delete the account while delivery is paused in is_user_authorized().
+                local_store.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                release_auth.set()
+                with self.assertRaises(TelegramOperationError) as ctx:
+                    await asyncio.wait_for(delivery_task, timeout=2.0)
+                self.assertEqual(ctx.exception.code, "auth_state_conflict")
+                self.assertEqual(dyn_client.send_count, 0)
+                self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+                auth_rows = local_store._conn.execute(
+                    "SELECT * FROM account_auth WHERE source = ? AND account_id = ?",
+                    (SOURCE_TELEGRAM, "dyn"),
+                ).fetchall()
+                self.assertEqual(auth_rows, [])
+            finally:
+                release_auth.set()
+                await manager.stop()
+                local_store.close()
+
+    async def test_generation_rejected_ingest_activation_keeps_ingest_running_false(self) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "ingest_rejected_status.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(accounts=[self.config]),
+            )
+            entered_activate = asyncio.Event()
+            release_activate = asyncio.Event()
+
+            class PausingIngestClient:
+                def __init__(self, pause_second_auth: bool = False) -> None:
+                    self._connected = False
+                    self._auth_calls = 0
+                    self._pause_second_auth = pause_second_auth
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    self._auth_calls += 1
+                    # Call #1 is supervisor connect check; call #2 is TelegramArchiveService.activate().
+                    if self._pause_second_auth and self._auth_calls == 2:
+                        entered_activate.set()
+                        await release_activate.wait()
+                    return True
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: PausingIngestClient(pause_second_auth=(cfg.account_id == "dyn")),
+                ingest=True,
+            )
+            store2 = ArchiveStore(db_path)
+            try:
+                await manager.start()
+                await asyncio.wait_for(entered_activate.wait(), timeout=2.0)
+                dyn_runtime = manager._runtimes["dyn"]
+                # Delete "dyn" from a second SQLite connection while activate() is paused.
+                store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                self.assertIsNone(store2.get_management_account(SOURCE_TELEGRAM, "dyn"))
+
+                release_activate.set()
+                assert dyn_runtime._ingest_task is not None
+                activated = await asyncio.wait_for(asyncio.shield(dyn_runtime._ingest_task), timeout=2.0)
+                self.assertFalse(activated)
+                await asyncio.sleep(0.03)
+                self.assertFalse(dyn_runtime._ingest_active)
+                self.assertFalse(dyn_runtime.status()["ingest_running"])
+                self.assertIsNone(dyn_runtime._ingest_retry_task)
+                assert dyn_runtime._ingest_service is not None
+                self.assertIsNone(dyn_runtime._ingest_service._media_worker_task)
+                self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "dyn"))
+            finally:
+                release_activate.set()
+                await manager.stop()
+                store2.close()
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -246,6 +246,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                auth_owner_provider=self._next_auth_mutation_owner,
                 account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).discover_origins(
@@ -261,6 +262,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                auth_owner_provider=self._next_auth_mutation_owner,
                 account_generation=self._account_generation,
                 store_write_runner=write_runner,
             ).refresh_participants(
@@ -270,7 +272,12 @@ class TelegramAccountRuntime:
                 progress=progress,
             )
         if operation == "deliver_chunk":
-            return await TelegramSummaryDeliveryService(self.config, self.store).send_chunk(
+            return await TelegramSummaryDeliveryService(
+                self.config,
+                self.store,
+                auth_owner_provider=self._next_auth_mutation_owner,
+                account_generation=self._account_generation,
+            ).send_chunk(
                 kwargs["delivery"],
                 str(kwargs.get("content") or ""),
                 client=client,
@@ -283,8 +290,10 @@ class TelegramAccountRuntime:
             self._schedule_ingestion(client)
             task = self._ingest_task
             if task is not None:
-                await asyncio.shield(task)
-            if was_attached and self._ingest_service is not None:
+                activated = await asyncio.shield(task)
+                if activated is False:
+                    return {"account_id": self.config.account_id, "status": "conflict"}
+            if was_attached and self._ingest_service is not None and self._ingest_active:
                 await self._ingest_service.refresh_capture_targets()
             return {"account_id": self.config.account_id, "status": "refreshed"}
         raise ValueError(f"Unknown Telegram runtime operation: {operation}")
@@ -646,11 +655,14 @@ class TelegramAccountRuntime:
         )
         self._ingest_task.add_done_callback(self._ingest_done)
 
-    def _ingest_done(self, task: asyncio.Task[None]) -> None:
+    def _ingest_done(self, task: asyncio.Task[Any]) -> None:
         if task.cancelled() or self._stopping.is_set():
             return
         exc = task.exception()
         if exc is None:
+            if task.result() is False:
+                self._ingest_active = False
+                return
             self._ingest_active = True
             self._ingest_retry_delay = INGEST_RETRY_INITIAL_SECONDS
             return

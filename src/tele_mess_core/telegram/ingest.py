@@ -103,9 +103,9 @@ class TelegramArchiveService:
             if client.is_connected():
                 await client.disconnect()
 
-    async def attach(self, client: Any) -> None:
+    async def attach(self, client: Any) -> bool:
         self.register_handlers(client)
-        await self.activate(client)
+        return await self.activate(client)
 
     def register_handlers(self, client: Any) -> None:
         from telethon import TelegramClient, events, utils
@@ -188,7 +188,7 @@ class TelegramArchiveService:
 
         self._handlers_registered = True
 
-    async def activate(self, client: Any) -> None:
+    async def activate(self, client: Any) -> bool:
         self._closed = False
         self.register_handlers(client)
         if not await client.is_user_authorized():
@@ -219,12 +219,13 @@ class TelegramArchiveService:
             ),
         )
         if not wrote:
-            return
+            return False
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):
             await catch_up()
         self._start_media_worker()
         await self.refresh_capture_targets()
+        return True
 
     async def refresh_capture_targets(self) -> None:
         capture_targets = self._capture_targets()
