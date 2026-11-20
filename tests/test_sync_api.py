@@ -1795,6 +1795,103 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_connected_rpc_disconnect_not_blocked_by_sqlite_write_lock(self) -> None:
+        import asyncio
+        import sqlite3
+        import threading
+        import time
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        auth_calls = {"count": 0}
+
+        class DropOnRpcClient:
+            async def connect(self) -> None:
+                return None
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def is_user_authorized(self) -> bool:
+                auth_calls["count"] += 1
+                if auth_calls["count"] == 1:
+                    return False
+                raise ConnectionError("connection lost mid-rpc")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "archive.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=db_path),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: DropOnRpcClient(),
+                ingest=False,
+                connect_wait_seconds=0.5,
+                management_timeout_seconds=0.1,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            # Wait until client is connected and ready before locking SQLite.
+            for _ in range(50):
+                if runtime.statuses() and runtime.statuses()[0]["connected"] and auth_calls["count"] >= 1:
+                    break
+                time.sleep(0.01)
+            blocker = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+            blocker.execute("BEGIN IMMEDIATE")
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+                req = Request(
+                    f"http://127.0.0.1:{port}/manage/accounts/auth/status",
+                    data=json.dumps({"account_id": "main"}).encode("utf-8"),
+                    method="POST",
+                )
+                req.add_header("Authorization", "Bearer secret")
+                req.add_header("Content-Type", "application/json")
+                started_at = time.monotonic()
+                with urlopen(req, timeout=2) as resp:
+                    elapsed = time.monotonic() - started_at
+                    status = resp.status
+                    payload = json.loads(resp.read().decode("utf-8"))
+                self.assertEqual(status, 200)
+                self.assertEqual(payload["item"]["error"]["code"], "auth_status_failed")
+                self.assertLess(elapsed, 0.25)
+            finally:
+                blocker.execute("ROLLBACK")
+                blocker.close()
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

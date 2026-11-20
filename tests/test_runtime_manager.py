@@ -180,10 +180,10 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
 
         original_upsert = self.store.upsert_account_auth
 
-        def fail_error_auth(record: AccountAuthRecord) -> dict[str, object]:
+        def fail_error_auth(record: AccountAuthRecord, **kwargs: object) -> bool:
             if record.auth_state == "error":
                 raise sqlite3.OperationalError("database or disk is full")
-            return original_upsert(record)
+            return original_upsert(record, **kwargs)  # type: ignore[arg-type]
 
         manager = TelegramRuntimeManager(self.config, self.store, client_factory=factory)
         with (
@@ -539,6 +539,54 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 release_diag.set()
                 await manager.stop()
+
+        accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+        self.assertEqual(accounts["main"]["auth_state"], "code_sent")
+
+    async def test_stale_supervisor_probe_and_delayed_write_cannot_overwrite_code_sent(self) -> None:
+        probe_entered = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        class SlowProbeClient(FakeClient):
+            async def is_user_authorized(self) -> bool:
+                probe_entered.set()
+                await release_probe.wait()
+                return False
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: SlowProbeClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
+            runtime = manager._runtimes["main"]
+            stale_epoch = runtime._auth_state_epoch
+
+            # Interactive request_code completes and writes code_sent while supervisor probe is still running.
+            sent = await manager.execute("main", "request_code", phone="+1000")
+            self.assertEqual(sent["auth_state"], "code_sent")
+
+            # Now let the earlier supervisor probe finish AND also directly attempt a delayed DB write with stale_epoch.
+            release_probe.set()
+            await asyncio.sleep(0.05)
+            wrote = self.store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    auth_state="error",
+                    last_error="stale error",
+                ),
+                monotonic_seq=stale_epoch,
+            )
+            self.assertFalse(wrote)
+        finally:
+            release_probe.set()
+            await manager.stop()
 
         accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
         self.assertEqual(accounts["main"]["auth_state"], "code_sent")

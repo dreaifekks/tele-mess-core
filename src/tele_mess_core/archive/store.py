@@ -177,7 +177,7 @@ class ArchiveStore:
                     raise
                 return
 
-            if str(self.database_path) != ":memory:" and existing_schema_version < SCHEMA_VERSION:
+            if str(self.database_path) != ":memory:":
                 self._initialize_exclusive_upgrade(existing_schema_version)
                 return
 
@@ -331,38 +331,60 @@ class ArchiveStore:
             self._conn.commit()
 
 
-    def upsert_account_auth(self, auth: AccountAuthRecord) -> None:
+    def upsert_account_auth(
+        self,
+        auth: AccountAuthRecord,
+        *,
+        monotonic_seq: int | None = None,
+    ) -> bool:
         now = auth.updated_at or utc_now_iso()
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO account_auth(
-                  source, account_id, auth_state, phone, session_name, session_dir,
-                  last_error, updated_at, raw_json
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if monotonic_seq is not None:
+                    seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
+                    row = self._conn.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (seq_key,),
+                    ).fetchone()
+                    existing_seq = int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
+                    if existing_seq >= int(monotonic_seq):
+                        self._conn.rollback()
+                        return False
+                    self.set_meta(seq_key, str(int(monotonic_seq)))
+                self._conn.execute(
+                    """
+                    INSERT INTO account_auth(
+                      source, account_id, auth_state, phone, session_name, session_dir,
+                      last_error, updated_at, raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, account_id) DO UPDATE SET
+                      auth_state = excluded.auth_state,
+                      phone = excluded.phone,
+                      session_name = excluded.session_name,
+                      session_dir = excluded.session_dir,
+                      last_error = excluded.last_error,
+                      updated_at = excluded.updated_at,
+                      raw_json = excluded.raw_json
+                    """,
+                    (
+                        auth.source,
+                        auth.account_id,
+                        auth.auth_state,
+                        auth.phone,
+                        auth.session_name,
+                        auth.session_dir,
+                        auth.last_error,
+                        now,
+                        auth.raw_json,
+                    ),
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id) DO UPDATE SET
-                  auth_state = excluded.auth_state,
-                  phone = excluded.phone,
-                  session_name = excluded.session_name,
-                  session_dir = excluded.session_dir,
-                  last_error = excluded.last_error,
-                  updated_at = excluded.updated_at,
-                  raw_json = excluded.raw_json
-                """,
-                (
-                    auth.source,
-                    auth.account_id,
-                    auth.auth_state,
-                    auth.phone,
-                    auth.session_name,
-                    auth.session_dir,
-                    auth.last_error,
-                    now,
-                    auth.raw_json,
-                ),
-            )
-            self._conn.commit()
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def delete_management_account(self, source: str, account_id: str) -> int:
         deleted = 0

@@ -2712,6 +2712,57 @@ class ArchiveMigrationTest(unittest.TestCase):
             finally:
                 reopened.close()
 
+    def test_intermediate_v20_repair_refuses_while_old_connection_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v20_live_old.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            store.close()
+            old_conn = sqlite3.connect(str(db_path))
+            old_conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS delivery_outbox_validate_insert;
+                DROP TRIGGER IF EXISTS delivery_outbox_validate_update;
+                DROP TABLE delivery_outbox;
+                CREATE TABLE delivery_outbox (
+                  outbox_id TEXT PRIMARY KEY,
+                  summary_run_id TEXT NOT NULL,
+                  job_id TEXT,
+                  account_id TEXT NOT NULL,
+                  origin_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  content_kind TEXT NOT NULL DEFAULT 'summary',
+                  chunk_index INTEGER NOT NULL,
+                  chunk_count INTEGER NOT NULL,
+                  content TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  message_id INTEGER,
+                  last_error TEXT,
+                  next_attempt_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  sent_at TEXT,
+                  UNIQUE(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
+                );
+                """
+            )
+            old_conn.commit()
+            reopened = ArchiveStore(db_path)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "stop running services before upgrading"):
+                    reopened.initialize()
+                old_conn.close()
+                reopened.initialize()
+                self.assertTrue(reopened._has_column("delivery_outbox", "claim_token"))
+                self.assertTrue(reopened._has_column("delivery_outbox", "send_random_id"))
+            finally:
+                try:
+                    old_conn.close()
+                except Exception:
+                    pass
+                reopened.close()
+
 
 if __name__ == "__main__":
     unittest.main()

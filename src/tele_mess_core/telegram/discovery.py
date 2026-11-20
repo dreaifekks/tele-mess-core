@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from telethon import functions
 
@@ -26,10 +26,19 @@ MAX_PARTICIPANT_REFRESH_LIMIT = 10000
 
 
 class TelegramDiscoveryService:
-    def __init__(self, config: TelegramAccountConfig, store: ArchiveStore):
+    def __init__(
+        self,
+        config: TelegramAccountConfig,
+        store: ArchiveStore,
+        *,
+        error_persister: Callable[[Callable[[], Any]], None] | None = None,
+        auth_seq_provider: Callable[[], int] | None = None,
+    ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
+        self._error_persister = error_persister
+        self._auth_seq_provider = auth_seq_provider
         self.logger = logging.getLogger(__name__)
 
     async def discover_origins(
@@ -114,6 +123,10 @@ class TelegramDiscoveryService:
                 "include_private": include_private,
             }
         except Exception as exc:
+            if self._error_persister is not None:
+                result = self.discover_origins_error_result(exc, persist=False)
+                self._error_persister(lambda err=exc: self.discover_origins_error_result(err, persist=True))
+                return result
             return self.discover_origins_error_result(exc)
 
     def discover_origins_error_result(self, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
@@ -212,6 +225,12 @@ class TelegramDiscoveryService:
                 "limit": effective_limit,
             }
         except Exception as exc:
+            if self._error_persister is not None:
+                result = self.refresh_participants_error_result(origin_id, exc, persist=False)
+                self._error_persister(
+                    lambda oid=origin_id, err=exc: self.refresh_participants_error_result(oid, err, persist=True)
+                )
+                return result
             return self.refresh_participants_error_result(origin_id, exc)
 
     def refresh_participants_error_result(
@@ -343,16 +362,18 @@ class TelegramDiscoveryService:
         raise RuntimeError("Telethon does not expose GetForumTopicsRequest")
 
     def _set_auth_state(self, state: str) -> None:
-        self.store.upsert_account_auth(
-            AccountAuthRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                auth_state=state,
-                session_name=self.config.session_name,
-                session_dir=str(self.config.session_dir),
-                updated_at=utc_now_iso(),
-            )
+        record = AccountAuthRecord(
+            source=SOURCE_TELEGRAM,
+            account_id=self.account_id,
+            auth_state=state,
+            session_name=self.config.session_name,
+            session_dir=str(self.config.session_dir),
+            updated_at=utc_now_iso(),
         )
+        if self._auth_seq_provider is not None:
+            self.store.upsert_account_auth(record, monotonic_seq=self._auth_seq_provider())
+        else:
+            self.store.upsert_account_auth(record)
 
     def _record_operation(
         self,

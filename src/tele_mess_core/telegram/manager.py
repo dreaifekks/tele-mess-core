@@ -74,7 +74,7 @@ class TelegramAccountRuntime:
 
     def _next_auth_state_epoch(self) -> int:
         with self._diagnostic_lock:
-            self._auth_state_epoch += 1
+            self._auth_state_epoch = max(self._auth_state_epoch + 1, time.time_ns())
             return self._auth_state_epoch
 
     async def start(self) -> None:
@@ -157,20 +157,32 @@ class TelegramAccountRuntime:
         if client is None or not self._ready.is_set():
             return self._offline_result(operation, **kwargs)
         if operation == "auth_status":
-            self._next_auth_state_epoch()
-            result = await TelegramAuthService(self.config, self.store).status(client=client)
+            result = await TelegramAuthService(
+                self.config,
+                self.store,
+                error_persister=self._schedule_offline_diagnostic,
+                auth_seq_provider=self._next_auth_state_epoch,
+            ).status(client=client)
             if result.get("authorized"):
                 self._schedule_ingestion(client)
             return result
         if operation == "request_code":
-            self._next_auth_state_epoch()
-            return await TelegramAuthService(self.config, self.store).request_code(
+            return await TelegramAuthService(
+                self.config,
+                self.store,
+                error_persister=self._schedule_offline_diagnostic,
+                auth_seq_provider=self._next_auth_state_epoch,
+            ).request_code(
                 str(kwargs["phone"]),
                 client=client,
             )
         if operation == "submit_code":
-            self._next_auth_state_epoch()
-            result = await TelegramAuthService(self.config, self.store).submit_code(
+            result = await TelegramAuthService(
+                self.config,
+                self.store,
+                error_persister=self._schedule_offline_diagnostic,
+                auth_seq_provider=self._next_auth_state_epoch,
+            ).submit_code(
                 str(kwargs["phone"]),
                 str(kwargs["code"]),
                 kwargs.get("password"),
@@ -180,14 +192,24 @@ class TelegramAccountRuntime:
                 self._schedule_ingestion(client)
             return result
         if operation == "discover_origins":
-            return await TelegramDiscoveryService(self.config, self.store).discover_origins(
+            return await TelegramDiscoveryService(
+                self.config,
+                self.store,
+                error_persister=self._schedule_offline_diagnostic,
+                auth_seq_provider=self._next_auth_state_epoch,
+            ).discover_origins(
                 include_topics=bool(kwargs.get("include_topics", True)),
                 topic_limit=int(kwargs.get("topic_limit", 100)),
                 include_private=bool(kwargs.get("include_private", False)),
                 client=client,
             )
         if operation == "refresh_participants":
-            return await TelegramDiscoveryService(self.config, self.store).refresh_participants(
+            return await TelegramDiscoveryService(
+                self.config,
+                self.store,
+                error_persister=self._schedule_offline_diagnostic,
+                auth_seq_provider=self._next_auth_state_epoch,
+            ).refresh_participants(
                 int(kwargs["origin_id"]),
                 int(kwargs.get("limit", 500)),
                 client=client,
@@ -357,14 +379,14 @@ class TelegramAccountRuntime:
                     self._ready.set()
                     await self._notify_attempt()
                     delay = CONNECTION_RETRY_INITIAL_SECONDS
+                    probe_epoch = self._next_auth_state_epoch()
                     authorized = await self._await_supervised(
                         client.is_user_authorized(),
                         timeout=self._management_timeout_seconds,
                         label="is_user_authorized",
                     )
-                    auth_epoch = self._next_auth_state_epoch()
                     self._schedule_offline_diagnostic(
-                        lambda auth_state="authorized" if authorized else "needs_login", ep=auth_epoch: (
+                        lambda auth_state="authorized" if authorized else "needs_login", ep=probe_epoch: (
                             self._record_auth_state(auth_state, epoch=ep)
                         )
                     )
@@ -579,7 +601,8 @@ class TelegramAccountRuntime:
                 session_dir=str(self.config.session_dir),
                 last_error=last_error,
                 updated_at=utc_now_iso(),
-            )
+            ),
+            monotonic_seq=epoch,
         )
 
     def _record_runtime_failure(

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import TelegramAccountConfig
@@ -11,10 +11,19 @@ from tele_mess_core.telegram.runtime import classify_telegram_exception
 
 
 class TelegramAuthService:
-    def __init__(self, config: TelegramAccountConfig, store: ArchiveStore):
+    def __init__(
+        self,
+        config: TelegramAccountConfig,
+        store: ArchiveStore,
+        *,
+        error_persister: Callable[[Callable[[], Any]], None] | None = None,
+        auth_seq_provider: Callable[[], int] | None = None,
+    ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
+        self._error_persister = error_persister
+        self._auth_seq_provider = auth_seq_provider
         self.logger = logging.getLogger(__name__)
 
     async def status(self, client: Any) -> dict[str, Any]:
@@ -24,7 +33,11 @@ class TelegramAuthService:
             self._record_state(state)
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
         except Exception as exc:
-            return self.status_error_result(exc)
+            return self._handle_rpc_error(lambda persist, persist_auth: self.status_error_result(
+                exc,
+                persist=persist,
+                persist_auth_state=persist_auth,
+            ))
 
     def status_error_result(
         self,
@@ -62,7 +75,12 @@ class TelegramAuthService:
             )
             return {"account_id": self.account_id, "auth_state": "code_sent", "phone": phone}
         except Exception as exc:
-            return self.request_code_error_result(phone, exc)
+            return self._handle_rpc_error(lambda persist, persist_auth: self.request_code_error_result(
+                phone,
+                exc,
+                persist=persist,
+                persist_auth_state=persist_auth,
+            ))
 
     def request_code_error_result(
         self,
@@ -113,9 +131,19 @@ class TelegramAuthService:
                 try:
                     await client.sign_in(password=password)
                 except Exception as password_exc:
-                    return self.submit_code_error_result(phone, password_exc)
+                    return self._handle_rpc_error(lambda persist, persist_auth: self.submit_code_error_result(
+                        phone,
+                        password_exc,
+                        persist=persist,
+                        persist_auth_state=persist_auth,
+                    ))
             else:
-                return self.submit_code_error_result(phone, exc)
+                return self._handle_rpc_error(lambda persist, persist_auth: self.submit_code_error_result(
+                    phone,
+                    exc,
+                    persist=persist,
+                    persist_auth_state=persist_auth,
+                ))
 
         self.store.set_meta(_phone_code_hash_key(self.account_id), "")
         self._record_state("authorized", phone=phone)
@@ -175,6 +203,13 @@ class TelegramAuthService:
                 exc_info=True,
             )
 
+    def _handle_rpc_error(self, builder: Callable[[bool, bool], dict[str, Any]]) -> dict[str, Any]:
+        if self._error_persister is None:
+            return builder(True, True)
+        result = builder(False, False)
+        self._error_persister(lambda: builder(True, False))
+        return result
+
     def _record_state(
         self,
         state: str,
@@ -192,19 +227,21 @@ class TelegramAuthService:
                 updated_at=now,
             )
         )
-        self.store.upsert_account_auth(
-            AccountAuthRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                auth_state=state,
-                phone=phone,
-                session_name=self.config.session_name,
-                session_dir=str(self.config.session_dir),
-                last_error=last_error,
-                updated_at=now,
-                raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
-            )
+        auth_record = AccountAuthRecord(
+            source=SOURCE_TELEGRAM,
+            account_id=self.account_id,
+            auth_state=state,
+            phone=phone,
+            session_name=self.config.session_name,
+            session_dir=str(self.config.session_dir),
+            last_error=last_error,
+            updated_at=now,
+            raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
         )
+        if self._auth_seq_provider is not None:
+            self.store.upsert_account_auth(auth_record, monotonic_seq=self._auth_seq_provider())
+        else:
+            self.store.upsert_account_auth(auth_record)
 
     def _record_operation(self, operation: str, status: str, error: Any | None = None) -> None:
         self.store.add_operation_event(
