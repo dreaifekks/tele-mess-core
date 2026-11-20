@@ -1188,15 +1188,21 @@ def _delete_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[st
     }
 
 
+def _telegram_account_id(payload: dict[str, Any]) -> str:
+    source = _source(payload)
+    if source != SOURCE_TELEGRAM:
+        raise ValueError(f"Telegram operations do not support source: {source}")
+    return _required_str(payload, "account_id")
+
+
 def _auth_status(
     config: "AppConfig | None",
     store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
-    account_id = _required_str(payload, "account_id")
-    source = _source(payload)
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+    account_id = _telegram_account_id(payload)
+    if telegram_runtime is not None:
         return telegram_runtime.call(account_id, "auth_status")
     account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
@@ -1210,10 +1216,9 @@ def _request_auth_code(
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
-    account_id = _required_str(payload, "account_id")
-    source = _source(payload)
+    account_id = _telegram_account_id(payload)
     phone = _required_str(payload, "phone")
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+    if telegram_runtime is not None:
         return telegram_runtime.call(account_id, "request_code", phone=phone)
     account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
@@ -1227,12 +1232,11 @@ def _submit_auth_code(
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
-    account_id = _required_str(payload, "account_id")
-    source = _source(payload)
+    account_id = _telegram_account_id(payload)
     phone = _required_str(payload, "phone")
     code = _required_str(payload, "code")
     password = _optional_payload_str(payload, "password")
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+    if telegram_runtime is not None:
         return telegram_runtime.call(account_id, "submit_code", phone=phone, code=code, password=password)
     account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
@@ -1246,12 +1250,11 @@ def _discover_origins(
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
-    account_id = _required_str(payload, "account_id")
-    source = _source(payload)
+    account_id = _telegram_account_id(payload)
     include_topics = _payload_bool(payload, "include_topics", True)
     include_private = _payload_bool(payload, "include_private", False)
     topic_limit = _payload_int(payload, "topic_limit", 100)
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+    if telegram_runtime is not None:
         return telegram_runtime.call(
             account_id,
             "discover_origins",
@@ -1277,11 +1280,10 @@ def _refresh_participants(
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
-    account_id = _required_str(payload, "account_id")
-    source = _source(payload)
+    account_id = _telegram_account_id(payload)
     origin_id = _required_int(payload, "origin_id")
     limit = _payload_int(payload, "limit", 500)
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+    if telegram_runtime is not None:
         return telegram_runtime.call(
             account_id,
             "refresh_participants",

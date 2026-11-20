@@ -5,6 +5,7 @@ from http.client import HTTPConnection
 import tempfile
 import time
 import unittest
+from unittest.mock import Mock
 from pathlib import Path
 from urllib.error import HTTPError
 from urllib.parse import quote
@@ -22,6 +23,7 @@ from tele_mess_core.config import (
     TelegramConfig,
 )
 from tele_mess_core.models import (
+    AccountRecord,
     CaptureCursorRecord,
     ChatRecord,
     DailyMessagePointRecord,
@@ -35,7 +37,15 @@ from tele_mess_core.models import (
 )
 from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.server import SyncApiServer
-from tele_mess_core.server.api import MAX_JSON_BODY_BYTES, _account_config
+from tele_mess_core.server.api import (
+    MAX_JSON_BODY_BYTES,
+    _account_config,
+    _auth_status,
+    _discover_origins,
+    _refresh_participants,
+    _request_auth_code,
+    _submit_auth_code,
+)
 from tele_mess_core.server.contracts import API_CONTRACT_HASH, API_CONTRACT_VERSION, API_ENDPOINTS
 
 
@@ -1335,6 +1345,36 @@ class SyncApiTest(unittest.TestCase):
         self.assertEqual(account.api_hash, "hash")
         self.assertEqual(account.session_name, "second-main")
         self.assertEqual(account.session_dir, Path(self.tmp.name) / "managed-sessions")
+
+
+class TelegramOperationSourceTest(unittest.TestCase):
+    def test_telegram_operations_reject_other_sources(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArchiveStore(Path(tmp) / "archive.db")
+            store.initialize()
+            store.upsert_account(
+                AccountRecord(source=SOURCE_TELEGRAM, account_id="shared-id", display_name="Shared", kind="telegram")
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=Path(tmp), database=Path(tmp) / "archive.db"),
+                telegram=TelegramConfig(
+                    accounts=[
+                        TelegramAccountConfig(
+                            account_id="main", api_id=1, api_hash="hash", session_name="main", session_dir=Path(tmp)
+                        )
+                    ]
+                ),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            payload = {"source": "other", "account_id": "shared-id", "phone": "+1", "code": "1", "origin_id": -1}
+            for operation in (_auth_status, _request_auth_code, _submit_auth_code, _discover_origins, _refresh_participants):
+                with self.subTest(operation=operation.__name__):
+                    runtime = Mock()
+                    with self.assertRaisesRegex(ValueError, "source"):
+                        operation(config, store, payload, runtime)
+                    runtime.call.assert_not_called()
+            store.close()
 
 
 if __name__ == "__main__":
