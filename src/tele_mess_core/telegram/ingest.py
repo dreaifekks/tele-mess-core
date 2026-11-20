@@ -69,7 +69,7 @@ class TelegramArchiveService:
         self._media_wakeup = asyncio.Event()
         self._media_worker_task: asyncio.Task[None] | None = None
         self._media_cleanup_stop = threading.Event()
-        self._media_cleanup_future: asyncio.Future[bool] | None = None
+        self._media_cleanup_inflight: tuple[threading.Event, asyncio.Event] | None = None
         self._media_cleanup_failures: dict[str, int] = {}
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
@@ -230,22 +230,27 @@ class TelegramArchiveService:
         self._media_cleanup_stop.set()
         self._retry_targets.clear()
         self._media_wakeup.set()
-        tasks: list[asyncio.Task[None]] = []
         task = self._retry_task
-        self._retry_task = None
-        if task is not None and not task.done():
-            task.cancel()
-            tasks.append(task)
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await _await_shielded_task(task)
+            if self._retry_task is task and task.done():
+                self._retry_task = None
         media_task = self._media_worker_task
-        self._media_worker_task = None
-        if media_task is not None and not media_task.done():
-            media_task.cancel()
-            tasks.append(media_task)
-        if tasks:
-            await asyncio.gather(*tasks, return_exceptions=True)
-        inflight = self._media_cleanup_future
-        if inflight is not None and not inflight.done():
-            await asyncio.gather(inflight, return_exceptions=True)
+        if media_task is not None:
+            if not media_task.done():
+                media_task.cancel()
+            await _await_shielded_task(media_task)
+            if self._media_worker_task is media_task and media_task.done():
+                self._media_worker_task = None
+        inflight = self._media_cleanup_inflight
+        if inflight is not None:
+            thread_done, async_done = inflight
+            if not thread_done.is_set():
+                await async_done.wait()
+            if thread_done.is_set() and self._media_cleanup_inflight is inflight:
+                self._media_cleanup_inflight = None
 
     def _start_media_worker(self) -> None:
         if self._closed:
@@ -276,16 +281,25 @@ class TelegramArchiveService:
             if self._closed or self._media_cleanup_stop.is_set():
                 return
             has_remaining_fs = False
+            thread_done = threading.Event()
+            async_done = asyncio.Event()
+            inflight = (thread_done, async_done)
+            self._media_cleanup_inflight = inflight
+            cleanup_fn = functools.partial(self._cleanup_staging_dirs, stop_event=self._media_cleanup_stop)
             future = loop.run_in_executor(
                 None,
-                functools.partial(self._cleanup_staging_dirs, stop_event=self._media_cleanup_stop),
+                _run_cleanup_in_thread,
+                loop,
+                cleanup_fn,
+                thread_done,
+                async_done,
             )
-            self._media_cleanup_future = future
             try:
                 has_remaining_fs = await asyncio.shield(future)
             except asyncio.CancelledError:
                 self._media_cleanup_stop.set()
-                await asyncio.gather(future, return_exceptions=True)
+                if not thread_done.is_set():
+                    await async_done.wait()
                 raise
             except Exception as exc:
                 has_remaining_fs = True
@@ -295,8 +309,8 @@ class TelegramArchiveService:
                     exc,
                 )
             finally:
-                if self._media_cleanup_future is future:
-                    self._media_cleanup_future = None
+                if thread_done.is_set() and self._media_cleanup_inflight is inflight:
+                    self._media_cleanup_inflight = None
             if not has_remaining_fs:
                 fs_retry_count = 0
                 next_fs_cleanup_at = loop.time() + fs_clean_interval
@@ -1533,6 +1547,34 @@ def _coerce_messages(value: Any) -> list[Any]:
         return [item for item in value if item is not None]
     except TypeError:
         return [value]
+
+
+def _run_cleanup_in_thread(
+    loop: asyncio.AbstractEventLoop,
+    fn: Any,
+    thread_done: threading.Event,
+    async_done: asyncio.Event,
+) -> bool:
+    try:
+        return bool(fn())
+    finally:
+        thread_done.set()
+        if not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(async_done.set)
+            except RuntimeError:
+                pass
+
+
+async def _await_shielded_task(task: asyncio.Task[Any]) -> None:
+    try:
+        await asyncio.shield(task)
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if current is not None and current.cancelling() > 0:
+            raise
+    except Exception:
+        pass
 
 
 def _parse_staging_dir_name(name: str) -> tuple[str, int] | None:

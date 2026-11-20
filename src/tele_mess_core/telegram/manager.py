@@ -18,7 +18,11 @@ from tele_mess_core.models import AccountAuthRecord, OperationEventRecord, SOURC
 from tele_mess_core.telegram.auth import TelegramAuthService
 from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 from tele_mess_core.telegram.discovery import TelegramDiscoveryService
-from tele_mess_core.telegram.ingest import TelegramArchiveService
+from tele_mess_core.telegram.ingest import (
+    TelegramArchiveService,
+    _await_shielded_task,
+    _run_cleanup_in_thread,
+)
 
 
 ClientFactory = Callable[[TelegramAccountConfig], Any]
@@ -663,24 +667,29 @@ class TelegramAccountRuntime:
             raise
 
     async def _stop_ingestion(self) -> None:
-        task = self._ingest_task
-        retry_task = self._ingest_retry_task
-        service = self._ingest_service
-        self._ingest_task = None
-        self._ingest_retry_task = None
-        self._ingest_service = None
         self._ingest_active = False
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
-        if retry_task is not None and not retry_task.done():
-            retry_task.cancel()
-            await asyncio.gather(retry_task, return_exceptions=True)
+        task = self._ingest_task
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await _await_shielded_task(task)
+            if self._ingest_task is task and task.done():
+                self._ingest_task = None
+        retry_task = self._ingest_retry_task
+        if retry_task is not None:
+            if not retry_task.done():
+                retry_task.cancel()
+            await _await_shielded_task(retry_task)
+            if self._ingest_retry_task is retry_task and retry_task.done():
+                self._ingest_retry_task = None
+        service = self._ingest_service
         stop = getattr(service, "stop", None)
         if callable(stop):
             result = stop()
             if inspect.isawaitable(result):
                 await result
+        if self._ingest_service is service:
+            self._ingest_service = None
 
     def _record_auth_state(
         self,
@@ -777,10 +786,11 @@ class TelegramRuntimeManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
+        self._stopping_runtimes: set[TelegramAccountRuntime] = set()
         self._media_cleanup_wakeup: asyncio.Event | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
         self._media_cleanup_stop = threading.Event()
-        self._media_cleanup_future: asyncio.Future[bool] | None = None
+        self._media_cleanup_inflight: tuple[threading.Event, asyncio.Event] | None = None
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
@@ -806,17 +816,27 @@ class TelegramRuntimeManager:
         if wakeup is not None:
             wakeup.set()
         cleanup_task = self._media_cleanup_task
-        self._media_cleanup_task = None
-        if cleanup_task is not None and not cleanup_task.done():
-            cleanup_task.cancel()
-            await asyncio.gather(cleanup_task, return_exceptions=True)
-        inflight = self._media_cleanup_future
-        if inflight is not None and not inflight.done():
-            await asyncio.gather(inflight, return_exceptions=True)
+        if cleanup_task is not None:
+            if not cleanup_task.done():
+                cleanup_task.cancel()
+            await _await_shielded_task(cleanup_task)
+            if self._media_cleanup_task is cleanup_task and cleanup_task.done():
+                self._media_cleanup_task = None
+        inflight = self._media_cleanup_inflight
+        if inflight is not None:
+            thread_done, async_done = inflight
+            if not thread_done.is_set():
+                await async_done.wait()
+            if thread_done.is_set() and self._media_cleanup_inflight is inflight:
+                self._media_cleanup_inflight = None
+        for account_id, runtime in list(self._runtimes.items()):
+            self._stopping_runtimes.add(runtime)
+            if self._runtimes.get(account_id) is runtime:
+                del self._runtimes[account_id]
+        for runtime in list(self._stopping_runtimes):
+            await runtime.stop()
+            self._stopping_runtimes.discard(runtime)
         self._media_cleanup_wakeup = None
-        runtimes = list(self._runtimes.values())
-        self._runtimes.clear()
-        await asyncio.gather(*(runtime.stop() for runtime in runtimes), return_exceptions=True)
         self._loop = None
         self._loop_thread_id = None
 
@@ -845,6 +865,10 @@ class TelegramRuntimeManager:
                 stale_seconds = max(0.0, float(self.config.telegram.media_download.stale_seconds))
                 active_ids = set(self._runtimes.keys())
                 has_remaining = False
+                thread_done = threading.Event()
+                async_done = asyncio.Event()
+                inflight = (thread_done, async_done)
+                self._media_cleanup_inflight = inflight
                 cleanup_fn = functools.partial(
                     self.store.cleanup_deleted_account_media_artifacts,
                     source=SOURCE_TELEGRAM,
@@ -852,20 +876,27 @@ class TelegramRuntimeManager:
                     active_account_ids=active_ids,
                     stop_event=self._media_cleanup_stop,
                 )
-                future = loop.run_in_executor(None, cleanup_fn)
-                self._media_cleanup_future = future
+                future = loop.run_in_executor(
+                    None,
+                    _run_cleanup_in_thread,
+                    loop,
+                    cleanup_fn,
+                    thread_done,
+                    async_done,
+                )
                 try:
                     has_remaining = await asyncio.shield(future)
                 except asyncio.CancelledError:
                     self._media_cleanup_stop.set()
-                    await asyncio.gather(future, return_exceptions=True)
+                    if not thread_done.is_set():
+                        await async_done.wait()
                     raise
                 except Exception as exc:
                     has_remaining = True
                     self.logger.warning("Failed to clean up deleted-account media artifacts: %s", exc)
                 finally:
-                    if self._media_cleanup_future is future:
-                        self._media_cleanup_future = None
+                    if thread_done.is_set() and self._media_cleanup_inflight is inflight:
+                        self._media_cleanup_inflight = None
                 if self._media_cleanup_stop.is_set():
                     return
                 if has_remaining:
@@ -970,7 +1001,9 @@ class TelegramRuntimeManager:
         runtime = self._runtimes.pop(account_id, None)
         if runtime is None:
             return {"account_id": account_id, "stopped": False}
+        self._stopping_runtimes.add(runtime)
         await runtime.stop()
+        self._stopping_runtimes.discard(runtime)
         return {"account_id": account_id, "stopped": True}
 
     def _require_loop(self) -> asyncio.AbstractEventLoop:

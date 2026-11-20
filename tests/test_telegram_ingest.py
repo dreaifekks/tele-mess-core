@@ -3435,6 +3435,139 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             local_store.close()
             self.assertEqual(thread_errors, [])
 
+    async def test_cancelled_first_stop_still_blocks_second_stop_until_cleanup_threads_exit(self) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        # Part A: Manager stop() cancelled while deleted-account cleanup thread is paused;
+        # second stop() MUST still wait for the thread to exit before returning.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "manager_cancel_stop.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            thread_errors: list[BaseException] = []
+
+            def blocking_cleanup(*args, **kwargs) -> bool:
+                entered.set()
+                release.wait(timeout=5.0)
+                try:
+                    local_store.state()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+                    raise
+                return False
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: None,
+                ingest=False,
+            )
+            with mock.patch.object(
+                local_store,
+                "cleanup_deleted_account_media_artifacts",
+                side_effect=blocking_cleanup,
+            ):
+                await manager.start()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                stop1 = asyncio.create_task(manager.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop1.done())
+                stop1.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await stop1
+
+                stop2 = asyncio.create_task(manager.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop2.done())
+                release.set()
+                await asyncio.wait_for(stop2, timeout=2.0)
+            local_store.close()
+            self.assertEqual(thread_errors, [])
+
+        # Part B: Service stop() cancelled while staging-scan thread is paused;
+        # second stop() MUST still wait for the thread to exit before returning.
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "service_cancel_stop.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            service = TelegramArchiveService(
+                self.config,
+                local_store,
+                media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            thread_errors = []
+
+            def blocking_fs_scan(*args, **kwargs) -> bool:
+                entered.set()
+                release.wait(timeout=5.0)
+                try:
+                    local_store.state()
+                except BaseException as exc:
+                    thread_errors.append(exc)
+                    raise
+                return False
+
+            class IdleClient(FakeMediaClient):
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                def is_connected(self) -> bool:
+                    return True
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_fs_scan,
+            ):
+                await service.activate(IdleClient())
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                stop1 = asyncio.create_task(service.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop1.done())
+                stop1.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await stop1
+
+                stop2 = asyncio.create_task(service.stop())
+                await asyncio.sleep(0.05)
+                self.assertFalse(stop2.done())
+                release.set()
+                await asyncio.wait_for(stop2, timeout=2.0)
+            local_store.close()
+            self.assertEqual(thread_errors, [])
+
 
 if __name__ == "__main__":
     unittest.main()
