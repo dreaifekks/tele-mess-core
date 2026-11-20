@@ -1041,7 +1041,7 @@ def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, An
             raw_json=_public_raw_json(payload),
         )
     )
-    return _find_origin(store, account_id, origin_id, topic_id)
+    return _find_origin(store, source, account_id, origin_id, topic_id)
 
 
 def _set_origin_important(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1053,7 +1053,7 @@ def _set_origin_important(store: ArchiveStore, payload: dict[str, Any]) -> dict[
     changed = store.set_origin_important(source, account_id, origin_id, topic_id, important)
     if changed == 0:
         raise ValueError("origin was not found")
-    return _find_origin(store, account_id, origin_id, topic_id)
+    return _find_origin(store, source, account_id, origin_id, topic_id)
 
 
 def _delete_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1129,7 +1129,7 @@ def _set_backup_policy(
             updated_at=utc_now_iso(),
         )
     )
-    item = _find_policy(store, account_id, origin_id, topic_id)
+    item = _find_policy(store, source, account_id, origin_id, topic_id)
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         telegram_runtime.notify(account_id, "refresh_capture")
     return item
@@ -1170,7 +1170,7 @@ def _create_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[st
             raw_json=_public_raw_json(payload),
         )
     )
-    return _find_participant(store, account_id, origin_id, user_id)
+    return _find_participant(store, source, account_id, origin_id, user_id)
 
 
 def _delete_participant(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1488,31 +1488,31 @@ def _normalized_session_dir(config: "AppConfig | None", raw: str | None) -> str 
 
 
 def _find_account(store: ArchiveStore, source: str, account_id: str) -> dict[str, Any]:
-    for item in store.list_management_accounts():
-        if item["source"] == source and item["account_id"] == account_id:
-            return item
-    raise ValueError("account was not persisted")
+    item = store.get_management_account(source, account_id)
+    if item is None:
+        raise ValueError("account was not persisted")
+    return item
 
 
-def _find_origin(store: ArchiveStore, account_id: str, origin_id: int, topic_id: int) -> dict[str, Any]:
-    for item in store.list_origins(account_id=account_id):
-        if item["origin_id"] == origin_id and item["topic_id"] == topic_id:
-            return item
-    raise ValueError("origin was not persisted")
+def _find_origin(store: ArchiveStore, source: str, account_id: str, origin_id: int, topic_id: int) -> dict[str, Any]:
+    item = store.get_origin(source, account_id, origin_id, topic_id)
+    if item is None:
+        raise ValueError("origin was not persisted")
+    return item
 
 
-def _find_policy(store: ArchiveStore, account_id: str, origin_id: int, topic_id: int) -> dict[str, Any]:
-    for item in store.list_backup_policies(account_id=account_id):
-        if item["origin_id"] == origin_id and item["topic_id"] == topic_id:
-            return item
-    raise ValueError("backup policy was not persisted")
+def _find_policy(store: ArchiveStore, source: str, account_id: str, origin_id: int, topic_id: int) -> dict[str, Any]:
+    item = store.get_backup_policy(source, account_id, origin_id, topic_id)
+    if item is None:
+        raise ValueError("backup policy was not persisted")
+    return item
 
 
-def _find_participant(store: ArchiveStore, account_id: str, origin_id: int, user_id: int) -> dict[str, Any]:
-    for item in store.list_participants(account_id=account_id, origin_id=origin_id):
-        if item["user_id"] == user_id:
-            return item
-    raise ValueError("participant was not persisted")
+def _find_participant(store: ArchiveStore, source: str, account_id: str, origin_id: int, user_id: int) -> dict[str, Any]:
+    item = store.get_participant(source, account_id, origin_id, user_id)
+    if item is None:
+        raise ValueError("participant was not persisted")
+    return item
 
 
 def _source(payload: dict[str, Any]) -> str:

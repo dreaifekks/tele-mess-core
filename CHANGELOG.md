@@ -49,6 +49,10 @@ validation rules.
   image analysis and to the summary provider.
 - Daily packages no longer write the unused `normal-groups/` files; the
   groups stay in `package.json`.
+- Management writes for accounts, origins, backup policies, and participants
+  return the row they wrote by primary key instead of scanning the whole list.
+  Marking an archived origin important no longer fails with 400, and a source
+  other than `telegram` no longer gets the Telegram row with the same IDs back.
 
 ## 0.3.5 - 2026-10-13
 

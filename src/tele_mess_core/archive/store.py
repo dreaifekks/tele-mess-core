@@ -307,21 +307,32 @@ class ArchiveStore:
         return deleted
 
     def list_management_accounts(self) -> list[dict[str, Any]]:
+        return self._management_accounts("", ())
+
+    def get_management_account(self, source: str, account_id: str) -> dict[str, Any] | None:
+        items = self._management_accounts("WHERE source = ? AND account_id = ?", (source, account_id))
+        return items[0] if items else None
+
+    def _management_accounts(self, where: str, params: tuple[Any, ...]) -> list[dict[str, Any]]:
         with self._lock:
             account_rows = self._conn.execute(
-                """
+                f"""
                 SELECT source, account_id, display_name, kind, updated_at, raw_json
                 FROM accounts
+                {where}
                 ORDER BY source, account_id
-                """
+                """,
+                params,
             ).fetchall()
             auth_rows = self._conn.execute(
-                """
+                f"""
                 SELECT source, account_id, auth_state, phone, session_name, session_dir,
                        last_error, updated_at AS auth_updated_at, raw_json AS auth_raw_json
                 FROM account_auth
+                {where}
                 ORDER BY source, account_id
-                """
+                """,
+                params,
             ).fetchall()
 
         items: dict[tuple[str, str], dict[str, Any]] = {}
@@ -549,6 +560,24 @@ class ArchiveStore:
         return deleted
 
     def list_origins(self, account_id: str | None = None, include_archived: bool = False) -> list[dict[str, Any]]:
+        clauses: list[str] = []
+        params: list[Any] = []
+        if account_id is not None:
+            clauses.append("o.account_id = ?")
+            params.append(account_id)
+        if not include_archived:
+            clauses.append("o.archived_at IS NULL")
+            clauses.append("(o.topic_id = 0 OR parent.archived_at IS NULL)")
+        return self._origins(clauses, params)
+
+    def get_origin(self, source: str, account_id: str, origin_id: int, topic_id: int = 0) -> dict[str, Any] | None:
+        items = self._origins(
+            ["o.source = ?", "o.account_id = ?", "o.origin_id = ?", "o.topic_id = ?"],
+            [source, account_id, origin_id, topic_id],
+        )
+        return items[0] if items else None
+
+    def _origins(self, clauses: list[str], params: list[Any]) -> list[dict[str, Any]]:
         sql = """
             SELECT
               o.source, o.account_id, o.origin_id, o.topic_id, o.origin_type,
@@ -573,14 +602,6 @@ class ArchiveStore:
              AND p.origin_id = o.origin_id
              AND p.topic_id = o.topic_id
         """
-        clauses: list[str] = []
-        params: list[Any] = []
-        if account_id is not None:
-            clauses.append("o.account_id = ?")
-            params.append(account_id)
-        if not include_archived:
-            clauses.append("o.archived_at IS NULL")
-            clauses.append("(o.topic_id = 0 OR parent.archived_at IS NULL)")
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
         sql += " ORDER BY o.account_id, o.origin_type, o.title, o.origin_id, o.topic_id"
@@ -945,6 +966,21 @@ class ArchiveStore:
             )
             self._conn.commit()
             return max(cur.rowcount, 0)
+
+    def get_participant(self, source: str, account_id: str, origin_id: int, user_id: int) -> dict[str, Any] | None:
+        with self._lock:
+            row = self._conn.execute(
+                """
+                SELECT source, account_id, origin_id, user_id, username, display_name,
+                       is_bot, role, last_seen_at, updated_at, raw_json
+                FROM participants
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND user_id = ?
+                """,
+                (source, account_id, origin_id, user_id),
+            ).fetchone()
+        if row is None:
+            return None
+        return _row_to_dict(row, json_fields={"raw_json"}, bool_fields={"is_bot"})
 
     def list_participants(self, account_id: str | None = None, origin_id: int | None = None) -> list[dict[str, Any]]:
         sql = """

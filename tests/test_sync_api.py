@@ -1081,6 +1081,48 @@ class SyncApiTest(unittest.TestCase):
         self.assertFalse(restore["archived"])
         self.assertEqual(len(self.request_json("/manage/origins?account_id=main")["items"]), 2)
 
+    def test_management_writes_return_the_row_they_wrote(self) -> None:
+        self.request_json(
+            "/manage/origins",
+            method="POST",
+            payload={"account_id": "main", "origin_id": -3001, "origin_type": "group", "title": "Archived"},
+        )
+        self.request_json(
+            "/manage/origins/archive",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -3001, "archived": True},
+        )
+        important = self.request_json(
+            "/manage/origins/important",
+            method="PATCH",
+            payload={"account_id": "main", "origin_id": -3001, "important": True},
+        )["item"]
+        self.assertTrue(important["important"])
+        self.assertIsNotNone(important["archived_at"])
+
+        for source, title, enabled, display_name in (
+            ("telegram", "Alpha", True, "Telegram user"),
+            ("other", "Beta", False, "Other user"),
+        ):
+            origin = self.request_json(
+                "/manage/origins",
+                method="POST",
+                payload={"source": source, "account_id": "main", "origin_id": -3002, "origin_type": "group", "title": title},
+            )["item"]
+            policy = self.request_json(
+                "/manage/backup-policies",
+                method="POST",
+                payload={"source": source, "account_id": "main", "origin_id": -3002, "enabled": enabled},
+            )["item"]
+            participant = self.request_json(
+                "/manage/participants",
+                method="POST",
+                payload={"source": source, "account_id": "main", "origin_id": -3002, "user_id": 7, "display_name": display_name},
+            )["item"]
+            self.assertEqual((origin["source"], origin["title"]), (source, title))
+            self.assertEqual((policy["source"], policy["enabled"]), (source, enabled))
+            self.assertEqual((participant["source"], participant["display_name"]), (source, display_name))
+
     def test_account_auth_patch_merges_omitted_fields_and_clears_explicit_empty_values(self) -> None:
         created = self.request_json(
             "/manage/accounts/auth",
