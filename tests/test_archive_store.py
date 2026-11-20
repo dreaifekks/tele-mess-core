@@ -381,6 +381,23 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(self.store.search_messages("upgrade")[0]["message_id"], 16)
 
+    def test_current_archive_missing_full_text_triggers_is_repaired(self) -> None:
+        def message(message_id: int, text: str) -> MessageRecord:
+            now = utc_now_iso()
+            return MessageRecord(
+                source=SOURCE_TELEGRAM, chat_id=-1001, message_id=message_id, sent_at=now, ingested_at=now, text=text
+            )
+
+        with self.store._lock:
+            self.store._conn.execute("DROP TRIGGER messages_ai")
+            self.store._conn.commit()
+        self.store.upsert_message(message(17, "interrupted trigger replacement"), event_type="new")
+
+        self.store.initialize()
+        self.store.upsert_message(message(18, "after reopening interrupted archive"), event_type="new")
+
+        self.assertEqual(sorted(item["message_id"] for item in self.store.search_messages("interrupted")), [17, 18])
+
     def test_upgrade_repairs_existing_empty_fts_index(self) -> None:
         now = utc_now_iso()
         self.store.upsert_message(

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import functools
 import json
 import re
 import sqlite3
@@ -146,7 +147,11 @@ class ArchiveStore:
             try:
                 existing_schema_version = self._validate_existing_schema_version()
                 self._conn.execute("PRAGMA journal_mode = WAL")
-                if existing_schema_version == SCHEMA_VERSION and self.get_meta(UPGRADE_PENDING_META) is None:
+                if (
+                    existing_schema_version == SCHEMA_VERSION
+                    and self.get_meta(UPGRADE_PENDING_META) is None
+                    and self._has_schema_objects()
+                ):
                     return
                 if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
                     self._conn.executescript(_schema_sql())
@@ -190,6 +195,12 @@ class ArchiveStore:
             self._conn.execute(statement)
         if not message_fts_existed or not self._message_fts_integrity_is_valid():
             self._rebuild_message_fts()
+
+    def _has_schema_objects(self) -> bool:
+        """Whether every table, index, and trigger of the snapshot exists; an older
+        release recreated them on each open, so an interrupted open can leave one missing."""
+        existing = {str(row[0]) for row in self._conn.execute("SELECT name FROM sqlite_master")}
+        return _schema_object_names() <= existing
 
     def _rebuild_message_fts(self) -> None:
         self._conn.execute("INSERT INTO message_fts(message_fts) VALUES('rebuild')")
@@ -3525,6 +3536,17 @@ def _message_payload(message: MessageRecord) -> dict[str, Any]:
 
 def _schema_sql() -> str:
     return resources.files("tele_mess_core.archive").joinpath("schema.sql").read_text()
+
+
+@functools.cache
+def _schema_object_names() -> frozenset[str]:
+    return frozenset(
+        re.findall(
+            r"CREATE\s+(?:UNIQUE\s+)?(?:VIRTUAL\s+)?(?:TABLE|INDEX|TRIGGER)\s+(?:IF\s+NOT\s+EXISTS\s+)?(\w+)",
+            _schema_sql(),
+            flags=re.IGNORECASE,
+        )
+    )
 
 
 def _schema_sql_parts() -> tuple[str, list[str]]:
