@@ -962,7 +962,7 @@ def _update_account_auth(
 ) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
-    existing = _find_account(store, source, account_id) if partial else None
+    existing = store.get_management_account(source, account_id) if partial else None
     now = utc_now_iso()
     auth_state = str(
         payload.get("auth_state")

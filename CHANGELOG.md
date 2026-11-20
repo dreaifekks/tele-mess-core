@@ -8,7 +8,8 @@ validation rules.
 ## Unreleased
 
 - `PATCH /manage/backup-policies` and `PATCH /manage/accounts/auth` keep
-  fields the request omits instead of resetting them to defaults.
+  fields the request omits instead of resetting them to defaults; patching the
+  auth of an account that has no row yet still creates it.
 - Full-text search treats invalid FTS syntax as literal text.
 - An archive from a newer schema version is rejected before anything is
   written to it.

@@ -1123,6 +1123,17 @@ class SyncApiTest(unittest.TestCase):
             self.assertEqual((policy["source"], policy["enabled"]), (source, enabled))
             self.assertEqual((participant["source"], participant["display_name"]), (source, display_name))
 
+    def test_account_auth_patch_creates_a_missing_account(self) -> None:
+        created = self.request_json(
+            "/manage/accounts/auth",
+            method="PATCH",
+            payload={"account_id": "patched-first", "auth_state": "code_sent", "session_name": "patched-session"},
+        )["item"]
+
+        self.assertEqual(created["account_id"], "patched-first")
+        self.assertEqual(created["auth_state"], "code_sent")
+        self.assertEqual(created["session_name"], "patched-session")
+
     def test_account_auth_patch_merges_omitted_fields_and_clears_explicit_empty_values(self) -> None:
         created = self.request_json(
             "/manage/accounts/auth",
