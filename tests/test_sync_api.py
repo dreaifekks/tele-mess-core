@@ -987,9 +987,16 @@ class SyncApiTest(unittest.TestCase):
             payload={"account_id": "main", "origin_id": -1001, "enabled": True, "tags": "forum-tag"},
         )
         origins_response = self.request_json("/manage/origins?account_id=main")
-        from tele_mess_core.server.contracts import SCHEMAS, validate_schema_value
+        from tele_mess_core.server.contracts import SCHEMAS, openapi_document, validate_schema_value
 
         validate_schema_value(origins_response, SCHEMAS["OriginListResponse"], "response")
+        openapi_schemas = openapi_document()["components"]["schemas"]
+        validate_schema_value(
+            origins_response,
+            openapi_schemas["OriginListResponse"],
+            "response",
+            schemas=openapi_schemas,
+        )
         origins_after_parent = {
             (item["origin_id"], item["topic_id"]): item
             for item in origins_response["items"]

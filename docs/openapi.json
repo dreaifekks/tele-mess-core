@@ -7,48 +7,68 @@
             "type": "string"
           },
           "auth_state": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "auth_updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "display_name": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "kind": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "last_error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "phone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "session_dir": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_name": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source": {
             "default": "telegram",
             "type": "string"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -66,20 +86,28 @@
             "type": "string"
           },
           "last_error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "phone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_dir": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "session_name": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source": {
             "default": "telegram",
@@ -225,16 +253,22 @@
             "type": "boolean"
           },
           "message": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "phone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "phone_code_hash": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "requires_password": {
             "type": "boolean"
@@ -296,16 +330,20 @@
             "type": "string"
           },
           "tags": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "topic_id": {
             "default": 0,
             "type": "integer"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -378,8 +416,10 @@
             "type": "string"
           },
           "tags": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "topic_id": {
             "default": 0,
@@ -446,8 +486,10 @@
             "type": "string"
           },
           "tags": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "topic_id": {
             "default": 0,
@@ -500,31 +542,43 @@
             "type": "string"
           },
           "backfill_count": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "backfill_error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "backfill_head_message_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "backfill_status": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "history_scanned_through_id": {
             "type": "integer"
           },
           "last_backfill_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "last_message_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "last_message_id": {
             "type": "integer"
@@ -536,12 +590,16 @@
             "type": "integer"
           },
           "origin_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
@@ -550,8 +608,10 @@
             "type": "integer"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -585,27 +645,37 @@
             "type": "integer"
           },
           "kind": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
           },
           "title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "username": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -644,8 +714,10 @@
             "type": "string"
           },
           "importance_reason": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "importance_score": {
             "maximum": 5,
@@ -653,12 +725,16 @@
             "type": "integer"
           },
           "job_status": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "message_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "occurred_at": {
             "type": "string"
@@ -670,29 +746,37 @@
             "type": "boolean"
           },
           "origin_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "package_run_id": {
             "type": "string"
           },
           "permalink": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "point_id": {
             "type": "string"
           },
           "provider": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "run_id": {
             "type": "string"
           },
           "run_status": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
@@ -717,12 +801,16 @@
             "type": "array"
           },
           "tags_csv": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "telegram_deeplink": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "timezone": {
             "type": "string"
@@ -784,12 +872,16 @@
             "type": "string"
           },
           "error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "finished_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "important_origin_count": {
             "type": "integer"
@@ -804,16 +896,22 @@
             "type": "integer"
           },
           "output_dir": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "package_json_path": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "package_md_path": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress": {
             "type": "object"
@@ -822,8 +920,10 @@
             "type": "integer"
           },
           "progress_label": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress_total": {
             "type": "integer"
@@ -835,8 +935,10 @@
             "type": "object"
           },
           "started_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
@@ -923,12 +1025,16 @@
             "type": "boolean"
           },
           "last_error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "last_installed_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "scope": {
             "type": "object"
@@ -943,8 +1049,10 @@
             "type": "string"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1003,15 +1111,19 @@
       "DailySummaryDelivery": {
         "properties": {
           "account_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "enabled": {
             "type": "boolean"
           },
           "origin_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "source": {
             "enum": [
@@ -1025,8 +1137,10 @@
             "type": "integer"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1042,16 +1156,20 @@
         "additionalProperties": false,
         "properties": {
           "account_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "enabled": {
             "default": false,
             "type": "boolean"
           },
           "origin_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "topic_id": {
             "default": 0,
@@ -1077,39 +1195,55 @@
             "type": "integer"
           },
           "cancel_requested_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "date": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "dedupe_key": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "finished_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "heartbeat_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "job_id": {
             "type": "string"
           },
           "lease_until": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "package_run_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress": {
             "type": "object"
@@ -1118,22 +1252,28 @@
             "type": "integer"
           },
           "progress_label": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress_total": {
             "type": "integer"
           },
           "provider": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "request": {
             "type": "object"
           },
           "retry_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "retry_count": {
             "type": "integer"
@@ -1142,27 +1282,37 @@
             "type": "object"
           },
           "started_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
           },
           "summary_run_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "timezone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "worker_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1210,8 +1360,10 @@
       "DailySummaryRecord": {
         "properties": {
           "content_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "content_length": {
             "type": "integer"
@@ -1226,15 +1378,19 @@
             "type": "string"
           },
           "date": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "deleted": {
             "type": "boolean"
           },
           "deleted_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "group_count": {
             "type": "integer"
@@ -1249,12 +1405,16 @@
             "type": "integer"
           },
           "package_run_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "provider": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "record_type": {
             "type": "string"
@@ -1269,8 +1429,10 @@
             "type": "string"
           },
           "summary_path": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "tags": {
             "items": {
@@ -1279,16 +1441,22 @@
             "type": "array"
           },
           "tags_csv": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "timezone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
             "type": "string"
@@ -1387,16 +1555,22 @@
       "DailySummaryRun": {
         "properties": {
           "date": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "error": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "finished_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "group_count": {
             "type": "integer"
@@ -1408,12 +1582,16 @@
             "type": "integer"
           },
           "output_dir": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "package_run_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress": {
             "type": "object"
@@ -1422,15 +1600,19 @@
             "type": "integer"
           },
           "progress_label": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "progress_total": {
             "type": "integer"
           },
           "provider": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "run_id": {
             "type": "string"
@@ -1439,19 +1621,25 @@
             "type": "object"
           },
           "started_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "status": {
             "type": "string"
           },
           "summary_path": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "timezone": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -1655,8 +1843,10 @@
             "type": "integer"
           },
           "payload_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "seq": {
             "type": "integer"
@@ -1807,8 +1997,10 @@
             "type": "integer"
           },
           "chat_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "content_type": {
             "type": "string"
@@ -1817,8 +2009,10 @@
             "type": "string"
           },
           "downloaded_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "file_extension": {
             "description": "Case-folded final filename extension without a leading dot, or an empty string.",
@@ -1831,16 +2025,20 @@
             "type": "string"
           },
           "file_size": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "filename": {
             "description": "Lexical basename of file_path; resolving it never probes the local filesystem.",
             "type": "string"
           },
           "media_kind": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "media_type": {
             "description": "Normalized media classification shared with server-side filtering.",
@@ -1858,19 +2056,25 @@
             "type": "integer"
           },
           "mime_type": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "origin_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "preview_kind": {
             "type": "string"
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
@@ -1911,16 +2115,22 @@
             "type": "integer"
           },
           "chat_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "deleted_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "edited_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "event_seq": {
             "type": "integer"
@@ -1929,8 +2139,10 @@
             "type": "boolean"
           },
           "ingested_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "media_count": {
             "type": "integer"
@@ -1942,31 +2154,43 @@
             "type": "array"
           },
           "media_kind": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "message_id": {
             "type": "integer"
           },
           "origin_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "sender_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "sender_name": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sender_username": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "sent_at": {
             "type": "string"
@@ -1975,12 +2199,16 @@
             "type": "string"
           },
           "text": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "topic_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2033,41 +2261,55 @@
             "type": "string"
           },
           "auth_state": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "error": {
             "type": "object"
           },
           "error_code": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "error_type": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "id": {
             "type": "integer"
           },
           "message": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "occurred_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "operation": {
             "type": "string"
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "retry_after": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
@@ -2079,16 +2321,22 @@
             "type": "object"
           },
           "subject_id": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "subject_label": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "subject_type": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2163,16 +2411,26 @@
             "type": "string"
           },
           "archived_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "backup_policy": {
-            "$ref": "#/components/schemas/OriginBackupPolicy",
-            "nullable": true
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/OriginBackupPolicy"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "discovered_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "effective_backup_policy": {
             "$ref": "#/components/schemas/OriginBackupPolicy"
@@ -2184,8 +2442,10 @@
             "type": "boolean"
           },
           "last_message_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "origin_id": {
             "type": "integer"
@@ -2194,12 +2454,16 @@
             "type": "string"
           },
           "parent_origin_id": {
-            "nullable": true,
-            "type": "integer"
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "parent_title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "policy_source": {
             "enum": [
@@ -2211,27 +2475,35 @@
             "type": "string"
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
           },
           "title": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "topic_id": {
             "default": 0,
             "type": "integer"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "username": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2320,12 +2592,16 @@
             "type": "boolean"
           },
           "tags": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [
@@ -2470,40 +2746,52 @@
             "type": "string"
           },
           "display_name": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "is_bot": {
             "type": "boolean"
           },
           "last_seen_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "origin_id": {
             "type": "integer"
           },
           "raw_json": {
-            "nullable": true,
-            "type": "object"
+            "type": [
+              "object",
+              "null"
+            ]
           },
           "role": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "source": {
             "type": "string"
           },
           "updated_at": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           },
           "user_id": {
             "type": "integer"
           },
           "username": {
-            "nullable": true,
-            "type": "string"
+            "type": [
+              "string",
+              "null"
+            ]
           }
         },
         "required": [

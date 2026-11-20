@@ -9,7 +9,7 @@ import threading
 import uuid
 from importlib import resources
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any, Callable, Iterable
 
 from tele_mess_core.models import (
     DEFAULT_TIMEZONE,
@@ -1313,22 +1313,32 @@ class ArchiveStore:
             self._conn.commit()
             return event_seq
 
-    def upsert_message_if_policy_enabled(self, message: MessageRecord, event_type: str) -> int | None:
-        """Atomically re-verify effective backup policy and insert/update the message in one write transaction."""
-        payload = _message_payload(message)
-        now = message.ingested_at or utc_now_iso()
+    def upsert_message_if_policy_enabled(
+        self,
+        *,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        topic_id: int,
+        event_type: str,
+        build_record: Callable[[dict[str, Any]], MessageRecord],
+    ) -> tuple[int, dict[str, Any]] | None:
+        """Atomically resolve effective backup policy, build the message from it, and insert/update in one write transaction."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 effective_policy, _source = self._resolve_effective_backup_policy_unlocked(
-                    message.source,
-                    message.account_id,
-                    message.chat_id,
-                    topic_id=int(message.topic_id or 0),
+                    source,
+                    account_id,
+                    chat_id,
+                    topic_id=int(topic_id or 0),
                 )
                 if not effective_policy.get("enabled"):
                     self._conn.rollback()
                     return None
+                message = build_record(effective_policy)
+                payload = _message_payload(message)
+                now = message.ingested_at or utc_now_iso()
                 self._upsert_message_row_unlocked(message, event_type, now)
                 event_seq = self._insert_event(
                     source=message.source,
@@ -1340,9 +1350,10 @@ class ArchiveStore:
                     payload=payload,
                 )
                 self._conn.commit()
-                return event_seq
+                return event_seq, effective_policy
             except Exception:
-                self._conn.rollback()
+                if self._conn.in_transaction:
+                    self._conn.rollback()
                 raise
 
     def _upsert_message_row_unlocked(self, message: MessageRecord, event_type: str, now: str) -> None:
@@ -1504,55 +1515,87 @@ class ArchiveStore:
         message_ids: list[int],
         event_at: str | None = None,
         raw_payload: dict[str, Any] | None = None,
+        inflight_chat_ids_by_message: dict[int, set[int]] | None = None,
     ) -> list[int]:
         """Mark deleted non-channel messages (DM / basic group UpdateDeleteMessages with chat_id=None) when unique."""
+        seqs, _resolved = self.resolve_and_mark_deleted_without_chat(
+            source=source,
+            account_id=account_id,
+            message_ids=message_ids,
+            inflight_chat_ids_by_message=inflight_chat_ids_by_message,
+            event_at=event_at,
+            raw_payload=raw_payload,
+        )
+        return seqs
+
+    def resolve_and_mark_deleted_without_chat(
+        self,
+        source: str,
+        account_id: str,
+        message_ids: list[int],
+        *,
+        inflight_chat_ids_by_message: dict[int, set[int]] | None = None,
+        event_at: str | None = None,
+        raw_payload: dict[str, Any] | None = None,
+    ) -> tuple[list[int], dict[int, int]]:
+        """Atomically merge DB and in-flight non-channel candidates and mark/return only unique chats."""
         at = event_at or utc_now_iso()
         seqs: list[int] = []
+        resolved: dict[int, int] = {}
         with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 for message_id in message_ids:
                     matches = self._conn.execute(
                         """
-                        SELECT chat_id
+                        SELECT DISTINCT chat_id
                         FROM messages
                         WHERE source = ? AND account_id = ? AND message_id = ? AND chat_id > -1000000000000
                         LIMIT 2
                         """,
                         (source, account_id, message_id),
                     ).fetchall()
-                    if len(matches) != 1:
+                    db_chat_ids = {int(row["chat_id"]) for row in matches}
+                    mem_chat_ids = {
+                        int(cid)
+                        for cid in (inflight_chat_ids_by_message or {}).get(message_id, ())
+                        if int(cid) > -1000000000000
+                    }
+                    combined_chat_ids = db_chat_ids | mem_chat_ids
+                    if len(combined_chat_ids) != 1:
                         continue
-                    chat_id = int(matches[0]["chat_id"])
-                    cur = self._conn.execute(
-                        """
-                        UPDATE messages
-                        SET deleted_at = ?, ingested_at = ?, version = version + 1
-                        WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
-                        """,
-                        (at, at, source, account_id, chat_id, message_id),
-                    )
-                    if cur.rowcount == 0:
-                        continue
-                    seqs.append(
-                        self._insert_event(
-                            source=source,
-                            account_id=account_id,
-                            event_type="delete",
-                            chat_id=chat_id,
-                            message_id=message_id,
-                            event_at=at,
-                            payload=raw_payload or {"message_id": message_id},
+                    chat_id = next(iter(combined_chat_ids))
+                    resolved[message_id] = chat_id
+                    if chat_id in db_chat_ids:
+                        cur = self._conn.execute(
+                            """
+                            UPDATE messages
+                            SET deleted_at = ?, ingested_at = ?, version = version + 1
+                            WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                            """,
+                            (at, at, source, account_id, chat_id, message_id),
                         )
-                    )
+                        if cur.rowcount > 0:
+                            seqs.append(
+                                self._insert_event(
+                                    source=source,
+                                    account_id=account_id,
+                                    event_type="delete",
+                                    chat_id=chat_id,
+                                    message_id=message_id,
+                                    event_at=at,
+                                    payload=raw_payload or {"message_id": message_id},
+                                )
+                            )
                 if seqs:
                     self._conn.commit()
-                elif self._conn.in_transaction:
+                else:
                     self._conn.rollback()
             except Exception:
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
-        return seqs
+        return seqs, resolved
 
     def update_reactions(
         self,

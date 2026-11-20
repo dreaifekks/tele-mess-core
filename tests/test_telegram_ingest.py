@@ -1160,6 +1160,151 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone(by_id[10]["deleted_at"])
         self.assertIsNotNone(by_id[11]["deleted_at"])
 
+    async def test_backfill_page_delete_cancels_queued_message_before_its_turn(self) -> None:
+        handlers: list[tuple[object, object]] = []
+
+        class BackfillHandlerClient:
+            def __init__(self, messages: list[FakeMessage]) -> None:
+                self._messages = messages
+
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+            async def get_messages(self, chat_id: int, **kwargs):
+                if kwargs.get("limit") == 1:
+                    return [self._messages[-1]]
+                return list(self._messages)
+
+        entered_60 = asyncio.Event()
+        release_60 = asyncio.Event()
+
+        class PausingMessage(FakeMessage):
+            async def get_sender(self):
+                entered_60.set()
+                await release_60.wait()
+                return await super().get_sender()
+
+        channel_id = -1001234567890
+        msg60 = PausingMessage(60, channel_id, text="keep 60")
+        msg61 = FakeMessage(61, channel_id, text="delete 61 while 60 paused")
+        client = BackfillHandlerClient([msg60, msg61])
+        self.service.register_handlers(client)
+        on_delete = handlers[2][1]
+        assert callable(on_delete)
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", channel_id, enabled=True))
+
+        task = asyncio.create_task(self.service.refresh_capture_targets())
+        await asyncio.wait_for(entered_60.wait(), timeout=1.0)
+        await on_delete(SimpleNamespace(chat_id=channel_id, deleted_ids=[61]))
+        release_60.set()
+        await asyncio.wait_for(task, timeout=2.0)
+
+        items = self.store.list_latest_messages()["items"]
+        self.assertEqual([item["message_id"] for item in items], [60])
+        self.assertIsNone(items[0]["deleted_at"])
+
+    async def test_chatless_delete_merges_db_and_inflight_candidates_before_uniqueness_check(self) -> None:
+        handlers: list[tuple[object, object]] = []
+
+        class HandlerClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+        self.service.register_handlers(HandlerClient())
+        on_delete = handlers[2][1]
+        assert callable(on_delete)
+
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", 9001, enabled=True))
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", -501, enabled=True))
+        self.assertTrue(await self.service._store_message(FakeMessage(71, 9001, text="dm 71"), event_type="new"))
+
+        entered = asyncio.Event()
+        release = asyncio.Event()
+
+        class PausingMessage(FakeMessage):
+            async def get_sender(self):
+                entered.set()
+                await release.wait()
+                return await super().get_sender()
+
+        group_msg = PausingMessage(71, -501, text="group 71")
+        task = asyncio.create_task(self.service._store_message(group_msg, event_type="new"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        await on_delete(SimpleNamespace(chat_id=None, deleted_ids=[71]))
+        release.set()
+        self.assertTrue(await task)
+
+        by_chat = {item["chat_id"]: item for item in self.store.list_latest_messages()["items"]}
+        self.assertEqual(set(by_chat), {9001, -501})
+        self.assertIsNone(by_chat[9001]["deleted_at"])
+        self.assertIsNone(by_chat[-501]["deleted_at"])
+        self.assertFalse(self.store._conn.in_transaction)
+
+    async def test_inflight_policy_change_rebuilds_record_and_skips_media_download(self) -> None:
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                SOURCE_TELEGRAM,
+                "main",
+                -1099,
+                enabled=True,
+                capture_text=True,
+                capture_media_metadata=True,
+                download_media=True,
+            )
+        )
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        download_calls: list[str] = []
+
+        class PausingMediaMessage(FakeMessage):
+            async def get_sender(self):
+                entered.set()
+                await release.wait()
+                return await super().get_sender()
+
+            async def download_media(self, file: str) -> str:
+                download_calls.append(file)
+                path = Path(file) / "should-not-download.jpg"
+                path.write_bytes(b"img")
+                return str(path)
+
+        msg = PausingMediaMessage(
+            81,
+            -1099,
+            text="secret body",
+            media=MessageMediaDocument(),
+        )
+        task = asyncio.create_task(self.service._store_message(msg, event_type="new"))
+        await asyncio.wait_for(entered.wait(), timeout=1.0)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(
+                SOURCE_TELEGRAM,
+                "main",
+                -1099,
+                enabled=True,
+                capture_text=False,
+                capture_media_metadata=False,
+                download_media=False,
+            )
+        )
+        release.set()
+        self.assertTrue(await task)
+
+        items = self.store.list_latest_messages()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertIsNone(items[0]["text"])
+        self.assertFalse(items[0]["has_media"])
+        self.assertIsNone(items[0]["media_kind"])
+        self.assertIsNone(items[0]["raw_json"])
+        self.assertEqual(download_calls, [])
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=-1099), [])
+
 
 if __name__ == "__main__":
     unittest.main()

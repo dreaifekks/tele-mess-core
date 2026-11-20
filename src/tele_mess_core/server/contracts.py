@@ -1453,24 +1453,65 @@ def parse_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -> d
     return values
 
 
-def validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+def validate_schema_value(
+    value: Any,
+    schema: dict[str, Any],
+    path: str,
+    *,
+    schemas: dict[str, Any] | None = None,
+) -> None:
     """Validate a value against an inline schema with the request-body rules."""
-    _validate_schema_value(value, schema, path)
+    _validate_schema_value(value, schema, path, schemas=schemas or SCHEMAS)
 
 
-def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
+def _validate_schema_value(
+    value: Any,
+    schema: dict[str, Any],
+    path: str,
+    *,
+    schemas: dict[str, Any] = SCHEMAS,
+) -> None:
     if value is None and schema.get("nullable"):
         return
+    if "anyOf" in schema:
+        errors: list[str] = []
+        for branch in schema["anyOf"]:
+            try:
+                _validate_schema_value(value, branch, path, schemas=schemas)
+                return
+            except ValueError as exc:
+                errors.append(str(exc))
+        raise ValueError(errors[0] if errors else f"{path} did not match anyOf")
     reference = schema.get("$ref")
     if reference:
         name = str(reference).rsplit("/", 1)[-1]
-        target = SCHEMAS.get(name)
+        target = schemas.get(name)
         if target is None:
             raise RuntimeError(f"Unknown schema reference: {reference}")
-        _validate_schema_value(value, target, path)
+        _validate_schema_value(value, target, path, schemas=schemas)
         return
     value_type = schema.get("type")
-    if value_type == "object":
+    if isinstance(value_type, list):
+        if value is None:
+            if "null" in value_type:
+                return
+            raise ValueError(f"{path} must be one of {value_type}")
+        non_null_types = [item for item in value_type if item != "null"]
+        last_error: ValueError | None = None
+        for candidate_type in non_null_types:
+            candidate_schema = {**schema, "type": candidate_type}
+            try:
+                _validate_schema_value(value, candidate_schema, path, schemas=schemas)
+                return
+            except ValueError as exc:
+                last_error = exc
+        if last_error is not None:
+            raise last_error
+        raise ValueError(f"{path} must be one of {value_type}")
+    if value_type == "null":
+        if value is not None:
+            raise ValueError(f"{path} must be null")
+    elif value_type == "object":
         if not isinstance(value, dict):
             raise ValueError(f"{path} must be an object")
         for key in schema.get("required") or []:
@@ -1483,14 +1524,14 @@ def _validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> Non
                 raise ValueError(f"Unknown field: {path}.{unknown[0]}")
         for key, item in value.items():
             if key in properties:
-                _validate_schema_value(item, properties[key], f"{path}.{key}")
+                _validate_schema_value(item, properties[key], f"{path}.{key}", schemas=schemas)
     elif value_type == "array":
         if not isinstance(value, list):
             raise ValueError(f"{path} must be an array")
         item_schema = schema.get("items")
         if item_schema:
             for index, item in enumerate(value):
-                _validate_schema_value(item, item_schema, f"{path}[{index}]")
+                _validate_schema_value(item, item_schema, f"{path}[{index}]", schemas=schemas)
     elif value_type == "string":
         if not isinstance(value, str):
             raise ValueError(f"{path} must be a string")
@@ -1537,6 +1578,36 @@ def _endpoint_manifest(endpoint: ApiEndpoint) -> dict[str, Any]:
     }
 
 
+def _to_openapi_31_schema(node: Any) -> Any:
+    """Convert internal OpenAPI-3.0-style nullable markers to OpenAPI 3.1 / JSON Schema Draft 2020-12."""
+    if isinstance(node, list):
+        return [_to_openapi_31_schema(item) for item in node]
+    if not isinstance(node, dict):
+        return node
+    converted = {
+        key: _to_openapi_31_schema(value)
+        for key, value in node.items()
+        if key != "nullable"
+    }
+    if node.get("nullable") is not True:
+        return converted
+    if "$ref" in converted:
+        ref_value = converted.pop("$ref")
+        result: dict[str, Any] = {"anyOf": [{"$ref": ref_value}, {"type": "null"}]}
+        result.update(converted)
+        return result
+    if "type" in converted:
+        value_type = converted["type"]
+        if isinstance(value_type, str):
+            converted["type"] = [value_type, "null"]
+        elif isinstance(value_type, list) and "null" not in value_type:
+            converted["type"] = [*value_type, "null"]
+        if "enum" in converted and None not in converted["enum"]:
+            converted["enum"] = [*converted["enum"], None]
+        return converted
+    return {"anyOf": [converted, {"type": "null"}]}
+
+
 def openapi_document() -> dict[str, Any]:
     paths: dict[str, Any] = {}
     for endpoint in API_ENDPOINTS:
@@ -1556,7 +1627,7 @@ def openapi_document() -> dict[str, Any]:
                 "BearerAuth": {"type": "http", "scheme": "bearer"},
                 "ApiTokenAuth": {"type": "apiKey", "in": "header", "name": "X-Api-Token"},
             },
-            "schemas": SCHEMAS,
+            "schemas": {name: _to_openapi_31_schema(schema) for name, schema in SCHEMAS.items()},
         },
     }
 

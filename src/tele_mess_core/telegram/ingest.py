@@ -116,22 +116,21 @@ class TelegramArchiveService:
             at = utc_now_iso()
             raw = {"deleted_ids": list(deleted_ids)}
             if chat_id is None:
-                for deleted_id in deleted_ids:
-                    matches = [
-                        states
-                        for (cid, mid), states in self._inflight_fetches.items()
-                        if mid == deleted_id and cid > -1000000000000
-                    ]
-                    if len(matches) == 1:
-                        for state in matches[0]:
-                            state["deleted"] = True
-                self.store.mark_deleted_without_chat(
+                inflight_by_msg: dict[int, set[int]] = {}
+                for (cid, mid), states in self._inflight_fetches.items():
+                    if states and cid > -1000000000000 and mid in deleted_ids:
+                        inflight_by_msg.setdefault(mid, set()).add(cid)
+                _seqs, resolved_chat_ids = self.store.resolve_and_mark_deleted_without_chat(
                     source=SOURCE_TELEGRAM,
                     account_id=self.account_id,
                     message_ids=deleted_ids,
+                    inflight_chat_ids_by_message=inflight_by_msg,
                     event_at=at,
                     raw_payload=raw,
                 )
+                for deleted_id, resolved_chat_id in resolved_chat_ids.items():
+                    for state in self._inflight_fetches.get((resolved_chat_id, deleted_id), ()):
+                        state["deleted"] = True
                 return
             target_chat_id = int(chat_id)
             for deleted_id in deleted_ids:
@@ -259,37 +258,45 @@ class TelegramArchiveService:
             targets.append(CaptureTarget(origin_id, topic_id))
         return _dedupe_capture_targets(targets)
 
-    async def _store_message(self, message: Any, event_type: str) -> bool:
+    def _register_inflight_fetch(self, chat_id: int, message_id: int) -> dict[str, bool]:
+        state = {"deleted": False}
+        self._inflight_fetches.setdefault((chat_id, message_id), []).append(state)
+        return state
+
+    def _unregister_inflight_fetch(self, chat_id: int, message_id: int, state: dict[str, bool]) -> None:
+        fetch_key = (chat_id, message_id)
+        bucket = self._inflight_fetches.get(fetch_key)
+        if bucket is not None:
+            try:
+                bucket.remove(state)
+            except ValueError:
+                pass
+            if not bucket:
+                self._inflight_fetches.pop(fetch_key, None)
+
+    async def _store_message(
+        self,
+        message: Any,
+        event_type: str,
+        *,
+        fetch_state: dict[str, bool] | None = None,
+    ) -> bool:
         chat_id = int(message.chat_id)
         message_id = int(message.id)
         topic_id = _topic_id(message)
-        policy = self._policy_for(chat_id, topic_id)
-        if not policy.get("enabled", False):
-            return False
-
-        sent_at = to_iso(getattr(message, "date", None)) or utc_now_iso()
+        owned_state = fetch_state is None
+        active_state = self._register_inflight_fetch(chat_id, message_id) if owned_state else fetch_state
+        assert active_state is not None
+        built_record: MessageRecord | None = None
         is_sticker_like = _message_media_is_sticker_like(message)
-        capture_text = policy.get("capture_text", True)
-        capture_media_metadata = policy.get("capture_media_metadata", True)
-        download_media = policy.get("download_media", False)
-        download_stickers = policy.get("download_stickers", False)
-        message_text = getattr(message, "text", None) if capture_text else None
-        if is_sticker_like:
-            message_text = _sticker_archive_text(message, include_message_text=capture_text)
-
-        captures_media = (
-            bool(getattr(message, "media", None))
-            and (
-                download_stickers
-                if is_sticker_like
-                else capture_media_metadata or download_media
-            )
-        )
-
-        fetch_key = (chat_id, message_id)
-        fetch_state = {"deleted": False}
-        self._inflight_fetches.setdefault(fetch_key, []).append(fetch_state)
         try:
+            if active_state["deleted"]:
+                return False
+            policy = self._policy_for(chat_id, topic_id)
+            if not policy.get("enabled", False):
+                return False
+
+            sent_at = to_iso(getattr(message, "date", None)) or utc_now_iso()
             sender = None
             chat = None
             try:
@@ -301,55 +308,77 @@ class TelegramArchiveService:
             except Exception as exc:
                 self.logger.debug("Failed to fetch chat for %s: %s", getattr(message, "id", "?"), exc)
 
-            if fetch_state["deleted"]:
+            if active_state["deleted"]:
                 return False
 
-            record = MessageRecord(
+            def _build_record(effective: dict[str, Any]) -> MessageRecord:
+                nonlocal built_record
+                capture_text = bool(effective.get("capture_text", True))
+                capture_media_metadata = bool(effective.get("capture_media_metadata", True))
+                download_media = bool(effective.get("download_media", False))
+                download_stickers = bool(effective.get("download_stickers", False))
+                message_text = getattr(message, "text", None) if capture_text else None
+                if is_sticker_like:
+                    message_text = _sticker_archive_text(message, include_message_text=capture_text)
+                captures_media = (
+                    bool(getattr(message, "media", None))
+                    and (
+                        download_stickers
+                        if is_sticker_like
+                        else capture_media_metadata or download_media
+                    )
+                )
+                built_record = MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.account_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                    topic_id=topic_id,
+                    sender_id=getattr(sender, "id", None) if sender else getattr(message, "sender_id", None),
+                    sender_name=_display_name(sender),
+                    sender_username=getattr(sender, "username", None) if sender else None,
+                    sent_at=sent_at,
+                    edited_at=to_iso(getattr(message, "edit_date", None)),
+                    ingested_at=utc_now_iso(),
+                    text=message_text,
+                    has_media=captures_media,
+                    media_kind=type(message.media).__name__ if captures_media else None,
+                    grouped_id=str(message.grouped_id)
+                    if captures_media and getattr(message, "grouped_id", None)
+                    else None,
+                    reply_to_message_id=getattr(message, "reply_to_msg_id", None),
+                    forward_from_id=_forward_from_id(message),
+                    forward_from_name=_forward_from_name(message),
+                    permalink=_permalink(chat, message, chat_id=int(message.chat_id)),
+                    reactions_json=json.dumps(_message_reactions(message), ensure_ascii=False, default=str)
+                    if getattr(message, "reactions", None)
+                    else None,
+                    raw_json=json.dumps(_safe_dict(message), ensure_ascii=False, default=str)
+                    if capture_media_metadata and (not is_sticker_like or download_stickers)
+                    else None,
+                )
+                return built_record
+
+            result = self.store.upsert_message_if_policy_enabled(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
                 chat_id=chat_id,
-                message_id=message_id,
                 topic_id=topic_id,
-                sender_id=getattr(sender, "id", None) if sender else getattr(message, "sender_id", None),
-                sender_name=_display_name(sender),
-                sender_username=getattr(sender, "username", None) if sender else None,
-                sent_at=sent_at,
-                edited_at=to_iso(getattr(message, "edit_date", None)),
-                ingested_at=utc_now_iso(),
-                text=message_text,
-                has_media=captures_media,
-                media_kind=type(message.media).__name__ if captures_media else None,
-                grouped_id=str(message.grouped_id)
-                if captures_media and getattr(message, "grouped_id", None)
-                else None,
-                reply_to_message_id=getattr(message, "reply_to_msg_id", None),
-                forward_from_id=_forward_from_id(message),
-                forward_from_name=_forward_from_name(message),
-                permalink=_permalink(chat, message, chat_id=int(message.chat_id)),
-                reactions_json=json.dumps(_message_reactions(message), ensure_ascii=False, default=str)
-                if getattr(message, "reactions", None)
-                else None,
-                raw_json=json.dumps(_safe_dict(message), ensure_ascii=False, default=str)
-                if capture_media_metadata and (not is_sticker_like or download_stickers)
-                else None,
+                event_type=event_type,
+                build_record=_build_record,
             )
-            seq = self.store.upsert_message_if_policy_enabled(record, event_type=event_type)
-            if seq is None:
+            if result is None or built_record is None:
                 return False
             if chat:
                 self.store.upsert_chat(_chat_record(self.account_id, chat, chat_id=chat_id))
             if sender:
                 self.store.upsert_user(_user_record(self.account_id, sender))
         finally:
-            bucket = self._inflight_fetches.get(fetch_key)
-            if bucket is not None:
-                try:
-                    bucket.remove(fetch_state)
-                except ValueError:
-                    pass
-                if not bucket:
-                    self._inflight_fetches.pop(fetch_key, None)
+            self._unregister_inflight_fetch(chat_id, message_id, active_state)
 
+        download_policy = self._policy_for(chat_id, topic_id)
+        download_media = bool(download_policy.get("enabled")) and bool(download_policy.get("download_media", False))
+        download_stickers = bool(download_policy.get("enabled")) and bool(download_policy.get("download_stickers", False))
         should_download_media = download_stickers if is_sticker_like else download_media
         if should_download_media and _message_media_downloadable(
             message,
@@ -358,15 +387,15 @@ class TelegramArchiveService:
             existing_media = (
                 self.store.list_media_files(
                     account_id=self.account_id,
-                    chat_id=record.chat_id,
-                    message_id=record.message_id,
+                    chat_id=built_record.chat_id,
+                    message_id=built_record.message_id,
                 )
                 if event_type == "backfill"
                 else []
             )
             if not existing_media:
-                await self._download_message_media(message, record)
-        self._update_capture_cursor(chat_id, topic_id, message_id, record.sent_at)
+                await self._download_message_media(message, built_record)
+        self._update_capture_cursor(chat_id, topic_id, message_id, built_record.sent_at)
         return True
 
 
@@ -706,14 +735,28 @@ class TelegramArchiveService:
         page_high = 0
         stored_count = 0
         last_message_at: str | None = None
+        registered: list[tuple[Any, int, int, dict[str, bool]]] = []
         for message in messages:
             page_high = max(page_high, int(message.id))
             if isinstance(message, message_service_type):
                 continue
-            stored = await self._store_message(message, event_type="backfill")
-            if stored:
-                stored_count += 1
-                last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
+            chat_id = int(message.chat_id)
+            message_id = int(message.id)
+            fetch_state = self._register_inflight_fetch(chat_id, message_id)
+            registered.append((message, chat_id, message_id, fetch_state))
+        try:
+            for message, _chat_id, _message_id, fetch_state in registered:
+                stored = await self._store_message(
+                    message,
+                    event_type="backfill",
+                    fetch_state=fetch_state,
+                )
+                if stored:
+                    stored_count += 1
+                    last_message_at = to_iso(getattr(message, "date", None)) or last_message_at
+        finally:
+            for _message, chat_id, message_id, fetch_state in registered:
+                self._unregister_inflight_fetch(chat_id, message_id, fetch_state)
         return page_high, stored_count, last_message_at
 
     def _save_backfill_cursor(

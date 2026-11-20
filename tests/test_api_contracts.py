@@ -99,6 +99,15 @@ class ApiContractTest(unittest.TestCase):
 
         self.assertEqual(parsed["info"]["x-contract-hash"], API_CONTRACT_HASH)
         self.assertIn("/sync/messages", parsed["paths"])
+        self.assertNotIn('"nullable"', openapi_json())
+        origin_props = parsed["components"]["schemas"]["Origin"]["properties"]
+        self.assertEqual(
+            origin_props["backup_policy"],
+            {"anyOf": [{"$ref": "#/components/schemas/OriginBackupPolicy"}, {"type": "null"}]},
+        )
+        origin_policy_props = parsed["components"]["schemas"]["OriginBackupPolicy"]["properties"]
+        self.assertEqual(origin_policy_props["tags"]["type"], ["string", "null"])
+        self.assertEqual(origin_policy_props["updated_at"]["type"], ["string", "null"])
 
     def test_contract_validates_runtime_request_inputs(self) -> None:
         account_endpoint = next(
