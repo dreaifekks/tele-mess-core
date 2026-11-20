@@ -248,6 +248,35 @@ def build_daily_package(
     scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
     progress_state: dict[str, Any] = {"current": 0, "total": 0, "label": "starting"}
 
+    def run_record(
+        status: str,
+        progress: dict[str, Any],
+        *,
+        totals: dict[str, int] | None = None,
+        error: str | None = None,
+    ) -> DailyPackageRunRecord:
+        counts = totals or {}
+        return DailyPackageRunRecord(
+            run_id=run_id,
+            status=status,
+            date=package_date.isoformat(),
+            timezone=timezone_name,
+            scope_json=scope_json,
+            output_dir=str(output_root),
+            package_json_path=str(package_json_path),
+            package_md_path=str(package_md_path),
+            origin_count=counts.get("origin_count", 0),
+            message_count=counts.get("message_count", 0),
+            media_count=counts.get("media_count", 0),
+            important_origin_count=counts.get("important_origin_count", 0),
+            progress_total=int(progress.get("total") or 0),
+            progress_current=int(progress.get("current") or 0),
+            progress_label=str(progress["label"]),
+            progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
+            error=error,
+            finished_at=None if status == "running" else utc_now_iso(),
+        )
+
     def update_progress(
         current: int,
         total: int,
@@ -258,23 +287,7 @@ def build_daily_package(
             cancel_check()
         progress_state.clear()
         progress_state.update({"stage": "package", "current": current, "total": total, "label": label, **(extra or {})})
-        store.upsert_daily_package_run(
-            DailyPackageRunRecord(
-                run_id=run_id,
-                status="running",
-                date=package_date.isoformat(),
-                timezone=timezone_name,
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                package_json_path=str(package_json_path),
-                package_md_path=str(package_md_path),
-                progress_total=total,
-                progress_current=current,
-                progress_label=label,
-                progress_json=json.dumps(progress_state, ensure_ascii=False, sort_keys=True),
-                started_at=utc_now_iso(),
-            )
-        )
+        store.upsert_daily_package_run(run_record("running", progress_state))
         if progress_callback:
             progress_callback(dict(progress_state))
 
@@ -457,90 +470,34 @@ def build_daily_package(
         _write_json(package_json_path, package_payload)
         package_md_path.write_text(_package_markdown(package_payload), encoding="utf-8")
 
-        finished = utc_now_iso()
         return store.upsert_daily_package_run(
-            DailyPackageRunRecord(
-                run_id=run_id,
-                status="completed",
-                date=package_date.isoformat(),
-                timezone=timezone_name,
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                package_json_path=str(package_json_path),
-                package_md_path=str(package_md_path),
-                origin_count=totals["origin_count"],
-                message_count=totals["message_count"],
-                media_count=totals["media_count"],
-                important_origin_count=totals["important_origin_count"],
-                progress_total=package_units,
-                progress_current=package_units,
-                progress_label="completed",
-                progress_json=json.dumps(
-                    {
-                        "stage": "package",
-                        "current": package_units,
-                        "total": package_units,
-                        "label": "completed",
-                        "normal_group_count": len(grouped["groups"]),
-                        "important_origin_count": len(important_origins),
-                        "selected_origin_count": len(selected_origins),
-                        "unmatched_origin_count": len(grouped["unmatched"]),
-                        "point_origin_count": len(point_packages),
-                        "point_message_count": point_message_count,
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                finished_at=finished,
+            run_record(
+                "completed",
+                {
+                    "stage": "package",
+                    "current": package_units,
+                    "total": package_units,
+                    "label": "completed",
+                    "normal_group_count": len(grouped["groups"]),
+                    "important_origin_count": len(important_origins),
+                    "selected_origin_count": len(selected_origins),
+                    "unmatched_origin_count": len(grouped["unmatched"]),
+                    "point_origin_count": len(point_packages),
+                    "point_message_count": point_message_count,
+                },
+                totals=totals,
             )
         )
     except DailyJobInterrupted:
         raise
     except DailyJobCancelled as exc:
+        error = str(exc) or "canceled"
         return store.upsert_daily_package_run(
-            DailyPackageRunRecord(
-                run_id=run_id,
-                status="canceled",
-                date=package_date.isoformat(),
-                timezone=timezone_name,
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                package_json_path=str(package_json_path),
-                package_md_path=str(package_md_path),
-                progress_total=int(progress_state.get("total") or 0),
-                progress_current=int(progress_state.get("current") or 0),
-                progress_label="canceled",
-                progress_json=json.dumps(
-                    {**progress_state, "label": "canceled", "error": str(exc) or "canceled"},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                error=str(exc) or "canceled",
-                finished_at=utc_now_iso(),
-            )
+            run_record("canceled", {**progress_state, "label": "canceled", "error": error}, error=error)
         )
     except Exception as exc:
         return store.upsert_daily_package_run(
-            DailyPackageRunRecord(
-                run_id=run_id,
-                status="failed",
-                date=package_date.isoformat(),
-                timezone=timezone_name,
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                package_json_path=str(package_json_path),
-                package_md_path=str(package_md_path),
-                progress_total=int(progress_state.get("total") or 0),
-                progress_current=int(progress_state.get("current") or 0),
-                progress_label="failed",
-                progress_json=json.dumps(
-                    {**progress_state, "label": "failed", "error": str(exc)},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                error=str(exc),
-                finished_at=utc_now_iso(),
-            )
+            run_record("failed", {**progress_state, "label": "failed", "error": str(exc)}, error=str(exc))
         )
 
 
@@ -648,6 +605,36 @@ def run_daily_summary(
     scope_json = json.dumps(scope or package_run.get("scope") or {}, ensure_ascii=False, sort_keys=True)
     progress_state = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
     provider_state = AiProviderRuntimeState()
+    stats = package_payload.get("stats", {})
+
+    def run_record(
+        status: str,
+        progress: dict[str, Any],
+        *,
+        provider: str,
+        image_count: int = image_count_estimate,
+        error: str | None = None,
+    ) -> DailySummaryRunRecord:
+        return DailySummaryRunRecord(
+            run_id=run_id,
+            status=status,
+            package_run_id=str(package_run_id),
+            date=package_run.get("date"),
+            timezone=package_run.get("timezone"),
+            scope_json=scope_json,
+            output_dir=str(output_root),
+            summary_path=str(summary_path),
+            provider=provider,
+            origin_count=int(stats.get("point_origin_count") or stats.get("origin_count") or 0),
+            group_count=len(package_payload.get("normal_groups") or []),
+            image_count=image_count,
+            progress_total=int(progress_counts.get("total") or 0),
+            progress_current=int(progress.get("current") or 0),
+            progress_label=str(progress["label"]),
+            progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
+            error=error,
+            finished_at=None if status == "running" else utc_now_iso(),
+        )
 
     def update_progress(
         current: int,
@@ -668,29 +655,7 @@ def run_daily_summary(
             extra=progress_extra,
         )
         store.upsert_daily_summary_run(
-            DailySummaryRunRecord(
-                run_id=run_id,
-                status="running",
-                package_run_id=str(package_run_id),
-                date=package_run.get("date"),
-                timezone=package_run.get("timezone"),
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                summary_path=str(summary_path),
-                provider=str(progress_state["provider"]),
-                origin_count=int(
-                    package_payload.get("stats", {}).get("point_origin_count")
-                    or package_payload.get("stats", {}).get("origin_count")
-                    or 0
-                ),
-                group_count=len(package_payload.get("normal_groups") or []),
-                image_count=image_count_estimate,
-                progress_total=int(progress_counts.get("total") or 0),
-                progress_current=current,
-                progress_label=label,
-                progress_json=json.dumps(progress_state, ensure_ascii=False, sort_keys=True),
-                started_at=utc_now_iso(),
-            )
+            run_record("running", progress_state, provider=str(progress_state["provider"]))
         )
         if progress_callback:
             progress_callback(dict(progress_state))
@@ -870,71 +835,29 @@ def run_daily_summary(
                 {"delivery": delivery_result},
             )
         return store.upsert_daily_summary_run(
-            DailySummaryRunRecord(
-                run_id=run_id,
-                status="completed",
-                package_run_id=str(package_run_id),
-                date=package_run.get("date"),
-                timezone=package_run.get("timezone"),
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                summary_path=str(summary_path),
+            run_record(
+                "completed",
+                _summary_progress_payload(
+                    progress_counts,
+                    current=int(progress_counts.get("total") or 0),
+                    label="completed",
+                    phase="completed",
+                    extra={"provider": effective_provider},
+                ),
                 provider=effective_provider,
-                origin_count=int(
-                    package_payload.get("stats", {}).get("point_origin_count")
-                    or package_payload.get("stats", {}).get("origin_count")
-                    or 0
-                ),
-                group_count=len(package_payload.get("normal_groups") or []),
                 image_count=len(image_paths),
-                progress_total=int(progress_counts.get("total") or 0),
-                progress_current=int(progress_counts.get("total") or 0),
-                progress_label="completed",
-                progress_json=json.dumps(
-                    _summary_progress_payload(
-                        progress_counts,
-                        current=int(progress_counts.get("total") or 0),
-                        label="completed",
-                        phase="completed",
-                        extra={"provider": effective_provider},
-                    ),
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                finished_at=utc_now_iso(),
             )
         )
     except DailyJobInterrupted:
         raise
     except DailyJobCancelled as exc:
+        error = str(exc) or "canceled"
         return store.upsert_daily_summary_run(
-            DailySummaryRunRecord(
-                run_id=run_id,
-                status="canceled",
-                package_run_id=str(package_run_id),
-                date=package_run.get("date"),
-                timezone=package_run.get("timezone"),
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                summary_path=str(summary_path),
+            run_record(
+                "canceled",
+                {**progress_state, "label": "canceled", "phase": "canceled", "error": error},
                 provider=_effective_provider_label(config, provider_state),
-                origin_count=int(
-                    package_payload.get("stats", {}).get("point_origin_count")
-                    or package_payload.get("stats", {}).get("origin_count")
-                    or 0
-                ),
-                group_count=len(package_payload.get("normal_groups") or []),
-                image_count=image_count_estimate,
-                progress_total=int(progress_counts.get("total") or 0),
-                progress_current=int(progress_state.get("current") or 0),
-                progress_label="canceled",
-                progress_json=json.dumps(
-                    {**progress_state, "label": "canceled", "phase": "canceled", "error": str(exc) or "canceled"},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
-                error=str(exc) or "canceled",
-                finished_at=utc_now_iso(),
+                error=error,
             )
         )
     except Exception as exc:
@@ -946,39 +869,11 @@ def run_daily_summary(
                 "provider": exc.provider,
             }
         return store.upsert_daily_summary_run(
-            DailySummaryRunRecord(
-                run_id=run_id,
-                status="failed",
-                package_run_id=str(package_run_id),
-                date=package_run.get("date"),
-                timezone=package_run.get("timezone"),
-                scope_json=scope_json,
-                output_dir=str(output_root),
-                summary_path=str(summary_path),
+            run_record(
+                "failed",
+                {**progress_state, **error_progress, "label": "failed", "phase": "failed", "error": str(exc)},
                 provider=_effective_provider_label(config, provider_state),
-                origin_count=int(
-                    package_payload.get("stats", {}).get("point_origin_count")
-                    or package_payload.get("stats", {}).get("origin_count")
-                    or 0
-                ),
-                group_count=len(package_payload.get("normal_groups") or []),
-                image_count=image_count_estimate,
-                progress_total=int(progress_counts.get("total") or 0),
-                progress_current=int(progress_state.get("current") or 0),
-                progress_label="failed",
-                progress_json=json.dumps(
-                    {
-                        **progress_state,
-                        **error_progress,
-                        "label": "failed",
-                        "phase": "failed",
-                        "error": str(exc),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                ),
                 error=str(exc),
-                finished_at=utc_now_iso(),
             )
         )
 
