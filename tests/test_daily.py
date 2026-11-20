@@ -1099,6 +1099,128 @@ class DailyPackagingTest(unittest.TestCase):
             [(-2001, 13)],
         )
 
+    def test_daily_package_unified_topic_policy_excludes_disabled_archived_and_includes_important_only_topic(self) -> None:
+        self._origin(-4001, "Forum Parent", "web3,info")
+        for topic_id, title, important in (
+            (10, "Normal Inherited", False),
+            (11, "Important Only", True),
+            (12, "Disabled Topic", False),
+            (13, "Archived Topic", False),
+            (14, "AI Topic", False),
+        ):
+            self.store.upsert_origin(
+                OriginRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    origin_id=-4001,
+                    topic_id=topic_id,
+                    parent_origin_id=-4001,
+                    origin_type="topic",
+                    title=title,
+                    important=important,
+                )
+            )
+        # Topic 10 & 11 have NO own backup_policy (pure inheritance from parent).
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -4001, topic_id=12, enabled=False)
+        )
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -4001, topic_id=13, archived=True)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -4001, topic_id=14, enabled=True, tags="ai,info")
+        )
+        # Topic 15 has no origins row, only a disabled backup_policy row.
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -4001, topic_id=15, enabled=False)
+        )
+
+        for msg_id, tid, text in (
+            (1, None, "parent general"),
+            (10, 10, "inherited normal"),
+            (11, 11, "important only msg"),
+            (12, 12, "disabled topic msg"),
+            (13, 13, "archived topic msg"),
+            (14, 14, "ai topic msg"),
+            (15, 15, "policy-only disabled msg"),
+        ):
+            self.store.upsert_message(
+                MessageRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="main",
+                    chat_id=-4001,
+                    topic_id=tid,
+                    message_id=msg_id,
+                    sent_at="2026-07-03T02:00:00+00:00",
+                    ingested_at=utc_now_iso(),
+                    text=text,
+                ),
+                event_type="new",
+            )
+
+        package = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tag_groups": ["web3 info", "ai info"]},
+        )
+        payload = json.loads(Path(package["package_json_path"]).read_text(encoding="utf-8"))
+        groups = {group["name"]: group for group in payload["normal_groups"]}
+
+        # Parent rolls up general + normal inherited topic 10, and excludes topics 11, 12, 13, 14, 15.
+        parent_pkg = next(o for o in groups["web3 info"]["origins"] if o["origin"]["topic_id"] == 0)
+        self.assertEqual([m["message_id"] for m in parent_pkg["messages"]], [1, 10])
+        self.assertEqual(len(groups["web3 info"]["origins"]), 1)
+
+        # Important-only topic 11 (without its own backup_policy) is selected as important_origin.
+        self.assertEqual(
+            [(o["origin"]["origin_id"], o["origin"]["topic_id"]) for o in payload["important_origins"]],
+            [(-4001, 11)],
+        )
+        self.assertEqual([m["message_id"] for m in payload["important_origins"][0]["messages"]], [11])
+
+        # AI topic 14 is in ai info only.
+        ai_pkg = groups["ai info"]["origins"][0]
+        self.assertEqual(ai_pkg["origin"]["topic_id"], 14)
+        self.assertEqual([m["message_id"] for m in ai_pkg["messages"]], [14])
+
+        # Disabled/archived topics (12, 13, 15) must never appear in point_origins either.
+        all_point_msg_ids = {
+            m["message_id"]
+            for origin_pkg in payload["point_origins"]
+            for m in origin_pkg["messages"]
+        }
+        self.assertEqual(all_point_msg_ids, {1, 10, 11, 14})
+
+        # Tag-filtered scope for web3 must NOT leak topic 14 (ai) into parent.
+        web3_only = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "tags": "web3"},
+        )
+        web3_payload = json.loads(Path(web3_only["package_json_path"]).read_text(encoding="utf-8"))
+        web3_point_ids = {
+            m["message_id"]
+            for origin_pkg in web3_payload["point_origins"]
+            for m in origin_pkg["messages"]
+        }
+        self.assertEqual(web3_point_ids, {1, 10, 11})
+
+        # Explicit topic_id scope selects an inherited normal topic via its effective policy.
+        topic10_only = build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main", "origin_id": -4001, "topic_id": 10},
+        )
+        topic10_payload = json.loads(Path(topic10_only["package_json_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(
+            [m["message_id"] for o in topic10_payload["point_origins"] for m in o["messages"]],
+            [10],
+        )
+
     def test_cli_daily_package_and_summary_commands_run(self) -> None:
         self._origin(-3001, "CLI Daily", "cli,info")
         self.store.upsert_message(

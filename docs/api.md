@@ -3,7 +3,7 @@
 This file is generated from `tele_mess_core.server.contracts`.
 
 - Contract version: `2026-11-20.1`
-- Contract hash: `0657cc8c2ecd4084`
+- Contract hash: `d1af9f6c886d7e86`
 - Runtime manifest: `/manage/api-manifest`
 - OpenAPI: `/openapi.json`
 
@@ -1711,6 +1711,8 @@ JSON-RPC 2.0 response carrying either result or error.
 | `updated_at` | `string` | no |
 | `parent_title` | `string` | no |
 | `backup_policy` | `BackupPolicy` | no |
+| `effective_backup_policy` | `BackupPolicy` | no |
+| `policy_source` | `string` | no |
 | `raw_json` | `object` | no |
 
 ### OriginArchiveInput

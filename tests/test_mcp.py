@@ -358,7 +358,7 @@ class McpApiTest(unittest.TestCase):
         self.assertEqual(overview["accounts"], [{"account_id": "main", "display_name": "Main"}])
         self.assertEqual(overview["messages"]["count"], 6)
         self.assertTrue(overview["messages"]["first_sent_at"] < overview["messages"]["last_sent_at"])
-        self.assertEqual(overview["sources"], {"known": 5, "enabled": 3})
+        self.assertEqual(overview["sources"], {"known": 5, "enabled": 4})
         self.assertEqual(overview["tags"], ["ai", "dev", "news"])
         self.assertEqual(overview["daily_reports"]["count"], 4)
         self.assertEqual(overview["daily_reports"]["date_from"], "2026-07-03")
@@ -779,6 +779,29 @@ class McpApiTest(unittest.TestCase):
             },
         )
         self.assertEqual([item["message_id"] for item in context["messages"]], [1, 2])
+
+    def test_overview_and_list_sources_match_with_disabled_and_archived_topics(self) -> None:
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", FORUM, "topic", topic_id=8, parent_origin_id=FORUM, title="已禁用话题")
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", FORUM, topic_id=8, enabled=False, tags="disabled-only")
+        )
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", FORUM, "topic", topic_id=9, parent_origin_id=FORUM, title="已归档话题")
+        )
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", FORUM, topic_id=9, archived=True)
+
+        overview = self.call("overview")
+        enabled_sources = self.call("list_sources", {"enabled_only": True})
+        all_sources = self.call("list_sources", {"enabled_only": False})
+
+        self.assertEqual(overview["sources"]["enabled"], enabled_sources["total"])
+        self.assertEqual(overview["sources"]["known"], all_sources["total"])
+        self.assertEqual(overview["sources"], {"known": 6, "enabled": 4})
+        self.assertNotIn("disabled-only", overview["tags"])
+        disabled_entry = next(item for item in all_sources["sources"] if item.get("topic_id") == 8)
+        self.assertFalse(disabled_entry["enabled"])
 
 
 if __name__ == "__main__":

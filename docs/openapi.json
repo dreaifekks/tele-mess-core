@@ -2174,6 +2174,9 @@
             "nullable": true,
             "type": "string"
           },
+          "effective_backup_policy": {
+            "$ref": "#/components/schemas/BackupPolicy"
+          },
           "important": {
             "type": "boolean"
           },
@@ -2196,6 +2199,15 @@
           },
           "parent_title": {
             "nullable": true,
+            "type": "string"
+          },
+          "policy_source": {
+            "enum": [
+              "self",
+              "parent",
+              "archived",
+              "none"
+            ],
             "type": "string"
           },
           "raw_json": {
@@ -2713,7 +2725,7 @@
   "info": {
     "title": "tele-mess-core API",
     "version": "2026-11-20.1",
-    "x-contract-hash": "0657cc8c2ecd4084"
+    "x-contract-hash": "d1af9f6c886d7e86"
   },
   "openapi": "3.1.0",
   "paths": {

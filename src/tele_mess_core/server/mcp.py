@@ -121,7 +121,14 @@ def _overview(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any]:
     content = store.content_overview()
     origins = store.list_origins()
     reports = content["daily_reports"]
-    tags = parse_tags([tag for policy in store.list_backup_policies() for tag in parse_tags(policy["tags"])])
+    enabled_origins = [origin for origin in origins if (origin.get("effective_backup_policy") or {}).get("enabled")]
+    tags = parse_tags(
+        [
+            tag
+            for origin in enabled_origins
+            for tag in parse_tags((origin.get("effective_backup_policy") or {}).get("tags"))
+        ]
+    )
     return {
         "timezone": tz.key,
         "now": datetime.now(tz).isoformat(timespec="seconds"),
@@ -138,7 +145,7 @@ def _overview(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any]:
         ),
         "sources": {
             "known": len(origins),
-            "enabled": sum(1 for origin in origins if (origin["backup_policy"] or {}).get("enabled")),
+            "enabled": len(enabled_origins),
         },
         "tags": sorted(tags, key=str.lower),
         "daily_reports": _compact(
@@ -168,15 +175,11 @@ def _list_sources(store: ArchiveStore, args: dict[str, Any]) -> dict[str, Any]:
     matches: list[dict[str, Any]] = []
     for origin in origins:
         title = origin["title"]
-        policy = origin["backup_policy"]
         if origin["topic_id"]:
             parent = parents.get((origin["account_id"], origin["origin_id"]))
-            if parent is not None:
-                # A topic without its own policy is captured under its group's policy.
-                policy = policy or parent["backup_policy"]
-                if parent["title"]:
-                    title = f"{parent['title']} / {title or origin['topic_id']}"
-        policy = policy or {}
+            if parent is not None and parent["title"]:
+                title = f"{parent['title']} / {title or origin['topic_id']}"
+        policy = origin.get("effective_backup_policy") or {}
         tags = parse_tags(policy.get("tags"))
         if enabled_only and not policy.get("enabled"):
             continue

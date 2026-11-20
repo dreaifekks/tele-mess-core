@@ -481,7 +481,7 @@ function normalized(value) {
   return value === null || value === undefined ? '' : String(value).toLowerCase();
 }
 function originTags(item) {
-  return item.backup_policy?.tags || '';
+  return (item.effective_backup_policy ?? item.backup_policy)?.tags || '';
 }
 function splitTags(value) {
   return String(value || '').split(',').map(tag => tag.trim()).filter(Boolean);
@@ -515,7 +515,8 @@ function renderTags(value, removable=false) {
   return tags.map((tag, index) => `<span class="tag-chip" data-tag-index="${index}"><span>${text(tag)}</span>${removable ? `<button type="button" class="tag-remove" data-tag-remove="${index}" aria-label="Remove ${attr(tag)}">x</button>` : ''}</span>`).join('');
 }
 function originBackupState(item) {
-  return item.backup_policy?.enabled ? 'on' : 'off';
+  if (item.archived_at || item.policy_source === 'archived') return 'off';
+  return (item.effective_backup_policy ?? item.backup_policy)?.enabled ? 'on' : 'off';
 }
 function originLastMessageValue(item) {
   return item.last_message_at || '';
@@ -896,14 +897,17 @@ function renderOriginHead() {
   $('origins-head').innerHTML = `<tr>${state.manageOrigins ? '<th>Select</th>' : ''}<th>Account</th><th>Origin</th><th>Type</th><th>Title</th><th>Important</th><th>Last message</th><th>Tags</th><th>Backup</th><th>Actions</th></tr>`;
 }
 function originRow(item, childCount, isTopic) {
-  const policy = item.backup_policy;
+  const effectivePolicy = item.effective_backup_policy ?? item.backup_policy;
   const topicId = item.topic_id ?? 0;
   const parentKey = originKey(item.account_id, item.origin_id, 0);
   const rowKey = originKey(item.account_id, item.origin_id, topicId);
   const expanded = Boolean(state.expandedOrigins[parentKey]);
   const toggle = childCount ? `<button class="tree-toggle" data-action="toggle-origin" data-key="${attr(parentKey)}">${expanded ? '-' : '+'}</button>` : '<span class="tree-spacer"></span>';
-  const policyTags = policy?.tags || '';
-  const backup = item.archived_at ? pill('removed') : policy ? pill(policy.enabled ? 'on' : 'off') : pill('off');
+  const policyTags = originTags(item);
+  const inheritedTag = item.policy_source === 'parent' ? ' <span class="muted">inherited</span>' : '';
+  const backup = (item.archived_at || item.policy_source === 'archived')
+    ? pill('removed')
+    : `${pill(effectivePolicy?.enabled ? 'on' : 'off')}${inheritedTag}`;
   const removeLabel = item.archived_at ? 'Restore' : 'Remove';
   const removeAction = item.archived_at ? 'restore-origin' : 'remove-origin';
   const rowClass = [

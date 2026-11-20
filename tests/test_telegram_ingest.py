@@ -960,6 +960,81 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         await asyncio.gather(first, second)
         self.assertEqual(client.max_active_gets, 1)
 
+    async def test_archived_topic_and_archived_parent_are_not_ingested_or_backfilled(self) -> None:
+        from tele_mess_core.models import OriginRecord
+
+        self.store.upsert_origin(OriginRecord(SOURCE_TELEGRAM, "main", -2010, "group", title="Forum", is_forum=True))
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", -2010, "topic", topic_id=10, parent_origin_id=-2010, title="Active")
+        )
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", -2010, "topic", topic_id=11, parent_origin_id=-2010, title="Archived")
+        )
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", -2010, enabled=True))
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -2010, topic_id=11, archived=True)
+
+        stored_active = await self.service._store_message(
+            FakeMessage(1, -2010, text="active topic", reply_to=SimpleNamespace(reply_to_top_id=10)),
+            event_type="new",
+        )
+        stored_archived = await self.service._store_message(
+            FakeMessage(2, -2010, text="archived topic", reply_to=SimpleNamespace(reply_to_top_id=11)),
+            event_type="new",
+        )
+        self.assertTrue(stored_active)
+        self.assertFalse(stored_archived)
+
+        # Archiving parent blocks even a child topic that has an explicit enabled=True policy.
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", -2010, topic_id=10, enabled=True))
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -2010, topic_id=0, archived=True)
+        stored_under_archived_parent = await self.service._store_message(
+            FakeMessage(3, -2010, text="parent archived", reply_to=SimpleNamespace(reply_to_top_id=10)),
+            event_type="new",
+        )
+        self.assertFalse(stored_under_archived_parent)
+        self.assertEqual(self.service._capture_targets(), [])
+
+    async def test_delete_and_reaction_handlers_skip_unarchived_messages_and_update_archived_ones(self) -> None:
+        from telethon.tl.types import PeerChannel, ReactionCount, ReactionEmoji, MessageReactions, UpdateMessageReactions
+
+        handlers: list[tuple[object, object]] = []
+
+        class HandlerClient:
+            def on(self, event_builder: object):
+                def decorator(fn: object):
+                    handlers.append((event_builder, fn))
+                    return fn
+                return decorator
+
+        self.service.register_handlers(HandlerClient())
+        on_delete = handlers[2][1]
+        on_raw = handlers[3][1]
+        assert callable(on_delete) and callable(on_raw)
+
+        # Unarchived messages in an enabled chat must NOT produce tombstone/skeleton rows or orphan events.
+        chat_id = -1000000000555
+        self.store.set_backup_policy(BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True))
+        await on_delete(SimpleNamespace(chat_id=chat_id, deleted_ids=[777]))
+        reaction_update = UpdateMessageReactions(
+            peer=PeerChannel(channel_id=555),
+            msg_id=888,
+            reactions=MessageReactions(results=[ReactionCount(reaction=ReactionEmoji(emoticon="👍"), count=1)]),
+        )
+        await on_raw(reaction_update)
+        self.assertEqual(self.store.list_messages_after(after_event_seq=0)["items"], [])
+        self.assertEqual(self.store.list_events(after=0)["items"], [])
+
+        # Existing archived message IS updated by delete and reaction handlers.
+        stored = await self.service._store_message(FakeMessage(888, chat_id, text="real msg"), event_type="new")
+        self.assertTrue(stored)
+        await on_raw(reaction_update)
+        await on_delete(SimpleNamespace(chat_id=chat_id, deleted_ids=[888]))
+        items = self.store.list_latest_messages()["items"]
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["message_id"], 888)
+        self.assertIsNotNone(items[0]["deleted_at"])
+        self.assertIsNotNone(items[0]["reactions_json"])
+
 
 if __name__ == "__main__":
     unittest.main()

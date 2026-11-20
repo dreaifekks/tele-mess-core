@@ -230,13 +230,29 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(saved["origin_id"], -1001)
         self.assertEqual(saved["topic_id"], 42)
 
-    def test_delete_creates_tombstone(self) -> None:
+    def test_delete_skips_unarchived_message_without_creating_tombstone(self) -> None:
         seqs = self.store.mark_deleted(SOURCE_TELEGRAM, -1002, [99], event_at=utc_now_iso())
-        self.assertEqual(seqs, [1])
+        self.assertEqual(seqs, [])
+        self.assertEqual(self.store.list_messages_after(after_event_seq=0)["items"], [])
+        self.assertEqual(self.store.list_events(after=0)["items"], [])
 
-        messages = self.store.list_messages_after(after_event_seq=0)
-        self.assertEqual(messages["items"][0]["message_id"], 99)
-        self.assertIsNotNone(messages["items"][0]["deleted_at"])
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1002,
+                message_id=100,
+                sent_at=now,
+                ingested_at=now,
+                text="archived payload",
+            ),
+            event_type="new",
+        )
+        deleted_seqs = self.store.mark_deleted(SOURCE_TELEGRAM, -1002, [99, 100], event_at=now)
+        self.assertEqual(len(deleted_seqs), 1)
+        messages = self.store.list_latest_messages()["items"]
+        self.assertEqual([item["message_id"] for item in messages], [100])
+        self.assertIsNotNone(messages[0]["deleted_at"])
 
     def test_search_messages(self) -> None:
         now = utc_now_iso()
@@ -510,17 +526,96 @@ class ArchiveStoreTest(unittest.TestCase):
             0,
         )
 
-    def test_reaction_creates_minimal_message_if_missing(self) -> None:
-        self.store.update_reactions(
+    def test_reaction_skips_unarchived_message_without_creating_skeleton(self) -> None:
+        seq = self.store.update_reactions(
             SOURCE_TELEGRAM,
             -1003,
             12,
             reactions={"results": [{"reaction": "like", "count": 1}]},
             event_at=utc_now_iso(),
         )
-        messages = self.store.list_messages_after(after_event_seq=0)
-        self.assertEqual(messages["items"][0]["message_id"], 12)
-        self.assertEqual(messages["items"][0]["reactions_json"]["results"][0]["reaction"], "like")
+        self.assertIsNone(seq)
+        self.assertEqual(self.store.list_messages_after(after_event_seq=0)["items"], [])
+        self.assertEqual(self.store.list_events(after=0)["items"], [])
+
+        now = utc_now_iso()
+        self.store.upsert_message(
+            MessageRecord(
+                source=SOURCE_TELEGRAM,
+                chat_id=-1003,
+                message_id=13,
+                sent_at=now,
+                ingested_at=now,
+                text="archived msg",
+            ),
+            event_type="new",
+        )
+        updated_seq = self.store.update_reactions(
+            SOURCE_TELEGRAM,
+            -1003,
+            13,
+            reactions={"results": [{"reaction": "like", "count": 1}]},
+            event_at=now,
+        )
+        self.assertIsNotNone(updated_seq)
+        messages = self.store.list_latest_messages()["items"]
+        self.assertEqual([item["message_id"] for item in messages], [13])
+        self.assertEqual(messages[0]["reactions_json"]["results"][0]["reaction"], "like")
+
+    def test_effective_backup_policy_precedence_archived_self_parent_none(self) -> None:
+        self.store.upsert_origin(
+            OriginRecord(SOURCE_TELEGRAM, "main", -5001, "group", title="Forum", is_forum=True)
+        )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -5001, enabled=True, download_media=True, tags="parent-tag")
+        )
+        for topic_id, title in ((10, "Inherited"), (11, "Disabled"), (12, "Archived")):
+            self.store.upsert_origin(
+                OriginRecord(SOURCE_TELEGRAM, "main", -5001, "topic", topic_id=topic_id, parent_origin_id=-5001, title=title)
+            )
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -5001, topic_id=11, enabled=False, tags="off-tag")
+        )
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -5001, topic_id=12, archived=True)
+
+        items = {
+            item["topic_id"]: item
+            for item in self.store.list_origins(account_id="main", include_archived=True)
+            if item["origin_id"] == -5001
+        }
+        self.assertEqual(items[0]["policy_source"], "self")
+        self.assertTrue(items[0]["effective_backup_policy"]["enabled"])
+        self.assertIsNone(items[10]["backup_policy"])
+        self.assertEqual(items[10]["policy_source"], "parent")
+        self.assertTrue(items[10]["effective_backup_policy"]["enabled"])
+        self.assertEqual(items[10]["effective_backup_policy"]["tags"], "parent-tag")
+        self.assertEqual(items[11]["policy_source"], "self")
+        self.assertFalse(items[11]["effective_backup_policy"]["enabled"])
+        self.assertEqual(items[12]["policy_source"], "archived")
+        self.assertFalse(items[12]["effective_backup_policy"]["enabled"])
+
+        # Unknown topic under active parent inherits parent; unknown origin without policy resolves to none.
+        unknown_topic, unknown_source = self.store.resolve_effective_backup_policy_with_source(
+            SOURCE_TELEGRAM, "main", -5001, topic_id=999
+        )
+        self.assertEqual(unknown_source, "parent")
+        self.assertTrue(unknown_topic["enabled"])
+        unwatched, unwatched_source = self.store.resolve_effective_backup_policy_with_source(
+            SOURCE_TELEGRAM, "main", -5999, topic_id=0
+        )
+        self.assertEqual(unwatched_source, "none")
+        self.assertFalse(unwatched["enabled"])
+
+        # Archiving the parent overrides even a child topic that has its own enabled=True policy.
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", -5001, topic_id=10, enabled=True, tags="child-on")
+        )
+        self.store.archive_origin(SOURCE_TELEGRAM, "main", -5001, topic_id=0, archived=True)
+        archived_child, archived_source = self.store.resolve_effective_backup_policy_with_source(
+            SOURCE_TELEGRAM, "main", -5001, topic_id=10
+        )
+        self.assertEqual(archived_source, "archived")
+        self.assertFalse(archived_child["enabled"])
 
     def test_same_chat_message_can_exist_in_multiple_accounts(self) -> None:
         now = utc_now_iso()

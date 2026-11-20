@@ -2269,34 +2269,70 @@ def read_run_content(store: ArchiveStore, run_type: str, run_id: str, content_fo
 
 def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[dict[str, Any]]:
     account_id = scope.get("account_id")
-    origins = store.list_origins(account_id=str(account_id) if account_id else None, include_archived=False)
+    scoped_account = str(account_id) if account_id else None
+    all_origins = store.list_origins(account_id=scoped_account, include_archived=True)
     parent_lookup = {
         _parent_lookup_key(origin): origin
-        for origin in origins
+        for origin in all_origins
         if int(origin.get("topic_id") or 0) == 0
     }
+    excluded_topics_by_parent: dict[tuple[str, str, int], set[int]] = {}
+    for origin in all_origins:
+        if origin.get("source") != SOURCE_TELEGRAM:
+            continue
+        tid = int(origin.get("topic_id") or 0)
+        if tid == 0:
+            continue
+        pkey = _parent_lookup_key(origin)
+        effective_policy = origin.get("effective_backup_policy") or {}
+        if not effective_policy.get("enabled"):
+            excluded_topics_by_parent.setdefault(pkey, set()).add(tid)
+        elif origin.get("backup_policy") is not None or bool(origin.get("important")):
+            excluded_topics_by_parent.setdefault(pkey, set()).add(tid)
+    for policy in store.list_backup_policies(account_id=scoped_account):
+        if policy.get("source") != SOURCE_TELEGRAM:
+            continue
+        tid = int(policy.get("topic_id") or 0)
+        if tid == 0 or policy.get("enabled"):
+            continue
+        pkey = (
+            str(policy.get("source") or SOURCE_TELEGRAM),
+            str(policy.get("account_id") or ""),
+            int(policy.get("origin_id") or 0),
+        )
+        excluded_topics_by_parent.setdefault(pkey, set()).add(tid)
+
     selected: list[dict[str, Any]] = []
     required_tags = {normalize_tag(tag) for tag in parse_tags(scope.get("tags"))}
     origin_id = scope.get("origin_id")
     topic_id = scope.get("topic_id")
-    for origin in origins:
-        policy = origin.get("backup_policy")
-        if not policy or not policy.get("enabled"):
+    explicit_topic_filter = topic_id not in (None, "")
+    for origin in all_origins:
+        effective_policy = origin.get("effective_backup_policy") or {}
+        if not effective_policy.get("enabled"):
             continue
         if origin.get("source") != SOURCE_TELEGRAM:
             continue
         if origin_id not in (None, "") and int(origin["origin_id"]) != int(origin_id):
             continue
-        if topic_id not in (None, "") and int(origin.get("topic_id") or 0) != int(topic_id):
+        tid = int(origin.get("topic_id") or 0)
+        if explicit_topic_filter and tid != int(topic_id):
             continue
-        local_tags = parse_tags(policy.get("tags"))
-        tags = local_tags
+        raw_policy = origin.get("backup_policy")
+        if tid != 0 and raw_policy is None and not bool(origin.get("important")) and not explicit_topic_filter:
+            # Purely inherited normal topics stay rolled up under their active parent forum package
+            # unless the caller explicitly scopes to that topic_id.
+            parent = parent_lookup.get(_parent_lookup_key(origin))
+            if parent is not None and (parent.get("effective_backup_policy") or {}).get("enabled"):
+                continue
+        local_tags = parse_tags((raw_policy or {}).get("tags"))
+        tags = parse_tags(effective_policy.get("tags")) if raw_policy is None else local_tags
         topic_grouping = "origin"
         parent_tags: list[str] = []
         parent_important = False
-        if int(origin.get("topic_id") or 0):
+        if tid != 0:
             parent = parent_lookup.get(_parent_lookup_key(origin))
-            parent_policy = (parent or {}).get("backup_policy") or {}
+            parent_policy = (parent or {}).get("effective_backup_policy") or {}
             parent_tags = parse_tags(parent_policy.get("tags"))
             parent_important = bool((parent or {}).get("important"))
             local_normalized = _normalized_tag_set(local_tags)
@@ -2322,6 +2358,10 @@ def _select_package_origins(store: ArchiveStore, scope: dict[str, Any]) -> list[
         if parent_important and topic_grouping == "parent":
             item["important"] = True
             item["parent_important"] = True
+        if tid == 0:
+            excluded = excluded_topics_by_parent.get(_parent_lookup_key(origin))
+            if excluded:
+                item["_exclude_topic_ids"] = sorted(excluded)
         selected.append(item)
     return selected
 
@@ -2413,6 +2453,7 @@ def _origin_has_messages(
             window_start=window_start_utc.isoformat(),
             window_end=window_end_utc.isoformat(),
             limit=1,
+            exclude_topic_ids=origin.get("_exclude_topic_ids"),
         )
     )
 
@@ -2426,6 +2467,7 @@ def _package_origin(
 ) -> dict[str, Any]:
     messages: list[dict[str, Any]] = []
     offset = 0
+    exclude_topic_ids = origin.get("_exclude_topic_ids")
     while True:
         page = store.list_messages_for_origin_window(
             str(origin.get("source") or SOURCE_TELEGRAM),
@@ -2436,6 +2478,7 @@ def _package_origin(
             window_end=window_end_utc.isoformat(),
             limit=PACKAGE_MESSAGE_PAGE_SIZE,
             offset=offset,
+            exclude_topic_ids=exclude_topic_ids,
         )
         messages.extend(page)
         if len(page) < PACKAGE_MESSAGE_PAGE_SIZE:
@@ -2479,7 +2522,10 @@ def _origin_summary(origin: dict[str, Any]) -> dict[str, Any]:
         "origin_type": origin.get("origin_type"),
         "title": origin.get("title"),
         "username": origin.get("username"),
-        "tags": parse_tags(origin.get("tags") or (origin.get("backup_policy") or {}).get("tags")),
+        "tags": parse_tags(
+            origin.get("tags")
+            or (origin.get("effective_backup_policy") or origin.get("backup_policy") or {}).get("tags")
+        ),
         "important": bool(origin.get("important")),
         "last_message_at": origin.get("last_message_at"),
     }

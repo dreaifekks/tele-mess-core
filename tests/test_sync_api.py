@@ -976,6 +976,25 @@ class SyncApiTest(unittest.TestCase):
             },
         )["item"]
         self.assertEqual(topic["origin_type"], "topic")
+        self.assertIsNone(topic["backup_policy"])
+        self.assertEqual(topic["policy_source"], "none")
+        self.assertFalse(topic["effective_backup_policy"]["enabled"])
+
+        # Parent policy is inherited in effective_backup_policy while raw backup_policy stays null on topic.
+        self.request_json(
+            "/manage/backup-policies",
+            method="POST",
+            payload={"account_id": "main", "origin_id": -1001, "enabled": True, "tags": "forum-tag"},
+        )
+        origins_after_parent = {
+            (item["origin_id"], item["topic_id"]): item
+            for item in self.request_json("/manage/origins?account_id=main")["items"]
+        }
+        inherited_topic = origins_after_parent[(-1001, 123)]
+        self.assertIsNone(inherited_topic["backup_policy"])
+        self.assertEqual(inherited_topic["policy_source"], "parent")
+        self.assertTrue(inherited_topic["effective_backup_policy"]["enabled"])
+        self.assertEqual(inherited_topic["effective_backup_policy"]["tags"], "forum-tag")
 
         policy = self.request_json(
             "/manage/backup-policies",

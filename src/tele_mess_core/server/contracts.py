@@ -267,6 +267,8 @@ SCHEMAS: dict[str, dict[str, Any]] = {
             "updated_at": {"type": "string", "nullable": True},
             "parent_title": {"type": "string", "nullable": True},
             "backup_policy": {"$ref": "#/components/schemas/BackupPolicy", "nullable": True},
+            "effective_backup_policy": {"$ref": "#/components/schemas/BackupPolicy"},
+            "policy_source": {"type": "string", "enum": ["self", "parent", "archived", "none"]},
             "raw_json": {"type": "object", "nullable": True},
         },
         required=["source", "account_id", "origin_id", "topic_id", "origin_type"],

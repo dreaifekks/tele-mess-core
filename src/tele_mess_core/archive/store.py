@@ -9,7 +9,7 @@ import threading
 import uuid
 from importlib import resources
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 
 from tele_mess_core.models import (
     DEFAULT_TIMEZONE,
@@ -728,13 +728,21 @@ class ArchiveStore:
               o.source, o.account_id, o.origin_id, o.topic_id, o.origin_type,
               o.parent_origin_id, o.title, o.username, o.is_forum,
               o.important, o.archived_at, o.last_message_at, o.discovered_at, o.updated_at, o.raw_json,
+              parent.archived_at AS parent_archived_at,
               p.enabled AS backup_enabled,
               p.capture_text,
               p.capture_media_metadata,
               p.download_media,
               p.download_stickers,
               p.tags,
-              p.updated_at AS policy_updated_at
+              p.updated_at AS policy_updated_at,
+              pp.enabled AS parent_backup_enabled,
+              pp.capture_text AS parent_capture_text,
+              pp.capture_media_metadata AS parent_capture_media_metadata,
+              pp.download_media AS parent_download_media,
+              pp.download_stickers AS parent_download_stickers,
+              pp.tags AS parent_tags,
+              pp.updated_at AS parent_policy_updated_at
             FROM origins o
             LEFT JOIN origins parent
               ON parent.source = o.source
@@ -746,6 +754,12 @@ class ArchiveStore:
              AND p.account_id = o.account_id
              AND p.origin_id = o.origin_id
              AND p.topic_id = o.topic_id
+            LEFT JOIN backup_policies pp
+              ON o.topic_id != 0
+             AND pp.source = o.source
+             AND pp.account_id = o.account_id
+             AND pp.origin_id = o.origin_id
+             AND pp.topic_id = 0
         """
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
@@ -765,11 +779,17 @@ class ArchiveStore:
                     "capture_media_metadata",
                     "download_media",
                     "download_stickers",
+                    "parent_backup_enabled",
+                    "parent_capture_text",
+                    "parent_capture_media_metadata",
+                    "parent_download_media",
+                    "parent_download_stickers",
                 },
             )
+            parent_archived_at = data.pop("parent_archived_at", None)
             backup_enabled = data.pop("backup_enabled")
             if backup_enabled is None:
-                data["backup_policy"] = None
+                self_policy: dict[str, Any] | None = None
                 data.pop("capture_text", None)
                 data.pop("capture_media_metadata", None)
                 data.pop("download_media", None)
@@ -777,7 +797,7 @@ class ArchiveStore:
                 data.pop("tags", None)
                 data.pop("policy_updated_at", None)
             else:
-                data["backup_policy"] = {
+                self_policy = {
                     "enabled": backup_enabled,
                     "capture_text": data.pop("capture_text"),
                     "capture_media_metadata": data.pop("capture_media_metadata"),
@@ -786,8 +806,119 @@ class ArchiveStore:
                     "tags": data.pop("tags"),
                     "updated_at": data.pop("policy_updated_at"),
                 }
+            parent_backup_enabled = data.pop("parent_backup_enabled")
+            if parent_backup_enabled is None:
+                parent_policy: dict[str, Any] | None = None
+                data.pop("parent_capture_text", None)
+                data.pop("parent_capture_media_metadata", None)
+                data.pop("parent_download_media", None)
+                data.pop("parent_download_stickers", None)
+                data.pop("parent_tags", None)
+                data.pop("parent_policy_updated_at", None)
+            else:
+                parent_policy = {
+                    "enabled": parent_backup_enabled,
+                    "capture_text": data.pop("parent_capture_text"),
+                    "capture_media_metadata": data.pop("parent_capture_media_metadata"),
+                    "download_media": data.pop("parent_download_media"),
+                    "download_stickers": data.pop("parent_download_stickers"),
+                    "tags": data.pop("parent_tags"),
+                    "updated_at": data.pop("parent_policy_updated_at"),
+                }
+            data["backup_policy"] = self_policy
+            effective_policy, policy_source = resolve_effective_policy(
+                self_policy,
+                parent_policy,
+                topic_id=int(data.get("topic_id") or 0),
+                self_archived=data.get("archived_at") is not None,
+                parent_archived=parent_archived_at is not None,
+            )
+            data["effective_backup_policy"] = effective_policy
+            data["policy_source"] = policy_source
             items.append(data)
         return items
+
+    def resolve_effective_backup_policy_with_source(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+    ) -> tuple[dict[str, Any], str]:
+        tid = int(topic_id or 0)
+        oid = int(origin_id)
+        with self._lock:
+            if tid:
+                origin_rows = self._conn.execute(
+                    """
+                    SELECT topic_id, archived_at
+                    FROM origins
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
+                    """,
+                    (source, account_id, oid, tid),
+                ).fetchall()
+                policy_rows = self._conn.execute(
+                    """
+                    SELECT topic_id, enabled, capture_text, capture_media_metadata,
+                           download_media, download_stickers, tags, updated_at
+                    FROM backup_policies
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id IN (0, ?)
+                    """,
+                    (source, account_id, oid, tid),
+                ).fetchall()
+            else:
+                origin_rows = self._conn.execute(
+                    """
+                    SELECT topic_id, archived_at
+                    FROM origins
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
+                    """,
+                    (source, account_id, oid),
+                ).fetchall()
+                policy_rows = self._conn.execute(
+                    """
+                    SELECT topic_id, enabled, capture_text, capture_media_metadata,
+                           download_media, download_stickers, tags, updated_at
+                    FROM backup_policies
+                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = 0
+                    """,
+                    (source, account_id, oid),
+                ).fetchall()
+        archived_by_topic = {int(row["topic_id"]): row["archived_at"] is not None for row in origin_rows}
+        policy_by_topic: dict[int, dict[str, Any]] = {}
+        for row in policy_rows:
+            row_tid = int(row["topic_id"])
+            policy_by_topic[row_tid] = {
+                "enabled": bool(row["enabled"]),
+                "capture_text": bool(row["capture_text"]),
+                "capture_media_metadata": bool(row["capture_media_metadata"]),
+                "download_media": bool(row["download_media"]),
+                "download_stickers": bool(row["download_stickers"]),
+                "tags": row["tags"],
+                "updated_at": row["updated_at"],
+            }
+        return resolve_effective_policy(
+            policy_by_topic.get(tid),
+            policy_by_topic.get(0) if tid else None,
+            topic_id=tid,
+            self_archived=archived_by_topic.get(tid, False),
+            parent_archived=archived_by_topic.get(0, False) if tid else False,
+        )
+
+    def resolve_effective_backup_policy(
+        self,
+        source: str,
+        account_id: str,
+        origin_id: int,
+        topic_id: int = 0,
+    ) -> dict[str, Any]:
+        policy, _policy_source = self.resolve_effective_backup_policy_with_source(
+            source,
+            account_id,
+            origin_id,
+            topic_id=topic_id,
+        )
+        return policy
 
     def set_origin_important(
         self,
@@ -1285,27 +1416,16 @@ class ArchiveStore:
         seqs: list[int] = []
         with self._lock:
             for message_id in message_ids:
-                existing = self._conn.execute(
-                    "SELECT source FROM messages WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?",
-                    (source, account_id, chat_id, message_id),
-                ).fetchone()
-                if existing:
-                    self._conn.execute(
-                        """
-                        UPDATE messages
-                        SET deleted_at = ?, ingested_at = ?, version = version + 1
-                        WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
-                        """,
-                        (at, at, source, account_id, chat_id, message_id),
-                    )
-                else:
-                    self._conn.execute(
-                        """
-                        INSERT INTO messages(source, account_id, chat_id, message_id, sent_at, ingested_at, deleted_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?)
-                        """,
-                        (source, account_id, chat_id, message_id, at, at, at),
-                    )
+                cur = self._conn.execute(
+                    """
+                    UPDATE messages
+                    SET deleted_at = ?, ingested_at = ?, version = version + 1
+                    WHERE source = ? AND account_id = ? AND chat_id = ? AND message_id = ?
+                    """,
+                    (at, at, source, account_id, chat_id, message_id),
+                )
+                if cur.rowcount == 0:
+                    continue
                 seqs.append(
                     self._insert_event(
                         source=source,
@@ -1317,7 +1437,8 @@ class ArchiveStore:
                         payload=raw_payload or {"message_id": message_id},
                     )
                 )
-            self._conn.commit()
+            if seqs:
+                self._conn.commit()
         return seqs
 
     def update_reactions(
@@ -1329,7 +1450,7 @@ class ArchiveStore:
         event_at: str | None = None,
         raw_payload: dict[str, Any] | None = None,
         account_id: str = "default",
-    ) -> int:
+    ) -> int | None:
         at = event_at or utc_now_iso()
         reactions_json = json.dumps(reactions, ensure_ascii=False, default=str)
         with self._lock:
@@ -1342,13 +1463,7 @@ class ArchiveStore:
                 (reactions_json, at, source, account_id, chat_id, message_id),
             )
             if cur.rowcount == 0:
-                self._conn.execute(
-                    """
-                    INSERT INTO messages(source, account_id, chat_id, message_id, sent_at, ingested_at, reactions_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?)
-                    """,
-                    (source, account_id, chat_id, message_id, at, at, reactions_json),
-                )
+                return None
             seq = self._insert_event(
                 source=source,
                 account_id=account_id,
@@ -1564,6 +1679,7 @@ class ArchiveStore:
         window_end: str = "",
         limit: int = 10000,
         offset: int = 0,
+        exclude_topic_ids: Iterable[int] | None = None,
     ) -> list[dict[str, Any]]:
         clauses = [
             "m.source = ?",
@@ -1576,6 +1692,12 @@ class ArchiveStore:
         if topic_id:
             clauses.append("COALESCE(m.topic_id, 0) = ?")
             params.append(topic_id)
+        elif exclude_topic_ids:
+            excluded = sorted({int(tid) for tid in exclude_topic_ids if int(tid) != 0})
+            if excluded:
+                placeholders = ", ".join("?" for _ in excluded)
+                clauses.append(f"COALESCE(m.topic_id, 0) NOT IN ({placeholders})")
+                params.extend(excluded)
         sql = f"""
             SELECT
               m.source, m.account_id, m.chat_id, m.message_id, m.topic_id, m.sender_id, m.sender_name,
@@ -4411,6 +4533,36 @@ def _fts_literal_query(query: str) -> str:
         escaped = token.replace('"', '""')
         quoted.append(f'"{escaped}"')
     return " ".join(quoted) or '""'
+
+
+def default_disabled_backup_policy() -> dict[str, Any]:
+    return {
+        "enabled": False,
+        "capture_text": True,
+        "capture_media_metadata": True,
+        "download_media": False,
+        "download_stickers": False,
+        "tags": None,
+        "updated_at": None,
+    }
+
+
+def resolve_effective_policy(
+    self_policy: dict[str, Any] | None,
+    parent_policy: dict[str, Any] | None,
+    *,
+    topic_id: int,
+    self_archived: bool,
+    parent_archived: bool,
+) -> tuple[dict[str, Any], str]:
+    """Resolve one canonical effective backup policy across ingest, daily, MCP, and management API."""
+    if self_archived or (topic_id != 0 and parent_archived):
+        return (default_disabled_backup_policy(), "archived")
+    if self_policy is not None:
+        return (dict(self_policy), "self")
+    if topic_id != 0 and parent_policy is not None:
+        return (dict(parent_policy), "parent")
+    return (default_disabled_backup_policy(), "none")
 
 
 def _parse_auth_state_meta(raw: str | None) -> tuple[int, str, int]:

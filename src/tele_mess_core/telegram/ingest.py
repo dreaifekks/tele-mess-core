@@ -109,34 +109,44 @@ class TelegramArchiveService:
         @client.on(events.MessageDeleted())
         async def on_delete(event: Any) -> None:
             chat_id = getattr(event, "chat_id", None)
-            if chat_id is None or not self._has_enabled_policy_for_chat(int(chat_id)):
+            if chat_id is None:
                 return
-            self.store.mark_deleted(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                chat_id=int(chat_id),
-                message_ids=[int(mid) for mid in event.deleted_ids],
-                event_at=utc_now_iso(),
-                raw_payload={"deleted_ids": list(event.deleted_ids)},
-            )
+            deleted_ids = [int(mid) for mid in event.deleted_ids]
+            if not deleted_ids:
+                return
+            at = utc_now_iso()
+            raw = {"deleted_ids": list(event.deleted_ids)}
+            for candidate_chat_id in _candidate_chat_ids(int(chat_id)):
+                if self.store.mark_deleted(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.account_id,
+                    chat_id=candidate_chat_id,
+                    message_ids=deleted_ids,
+                    event_at=at,
+                    raw_payload=raw,
+                ):
+                    break
 
         @client.on(events.Raw)
         async def on_raw(event: Any) -> None:
             if not isinstance(event, UpdateMessageReactions):
                 return
             peer_id = utils.get_peer_id(event.peer)
-            chat_id = self._chat_id_for_reaction_peer(peer_id)
-            if chat_id is None:
-                return
-            self.store.update_reactions(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                chat_id=chat_id,
-                message_id=int(event.msg_id),
-                reactions=_reaction_payload(event),
-                event_at=utc_now_iso(),
-                raw_payload=_safe_dict(event),
-            )
+            reactions = _reaction_payload(event)
+            at = utc_now_iso()
+            raw = _safe_dict(event)
+            for candidate_chat_id in _candidate_chat_ids(peer_id):
+                seq = self.store.update_reactions(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.account_id,
+                    chat_id=candidate_chat_id,
+                    message_id=int(event.msg_id),
+                    reactions=reactions,
+                    event_at=at,
+                    raw_payload=raw,
+                )
+                if seq is not None:
+                    break
 
         self._handlers_registered = True
 
@@ -220,33 +230,21 @@ class TelegramArchiveService:
 
     def _capture_targets(self) -> list[CaptureTarget]:
         targets: list[CaptureTarget] = []
-        active_origins = self.store.list_origins(account_id=self.account_id)
-        known_origins = self.store.list_origins(account_id=self.account_id, include_archived=True)
-        active_keys = {
-            (int(item["origin_id"]), int(item.get("topic_id") or 0))
-            for item in active_origins
-            if item.get("source") == SOURCE_TELEGRAM
-        }
-        known_keys = {
-            (int(item["origin_id"]), int(item.get("topic_id") or 0))
-            for item in known_origins
-            if item.get("source") == SOURCE_TELEGRAM
-        }
         for policy in self.store.list_backup_policies(account_id=self.account_id):
             if policy.get("source") != SOURCE_TELEGRAM or not policy.get("enabled"):
                 continue
             origin_id = int(policy["origin_id"])
             topic_id = int(policy.get("topic_id") or 0)
-            if not _origin_is_active(origin_id, topic_id, active_keys, known_keys):
+            effective = self.store.resolve_effective_backup_policy(
+                SOURCE_TELEGRAM,
+                self.account_id,
+                origin_id,
+                topic_id,
+            )
+            if not effective.get("enabled"):
                 continue
             targets.append(CaptureTarget(origin_id, topic_id))
         return _dedupe_capture_targets(targets)
-
-    def _chat_id_for_reaction_peer(self, peer_id: int) -> int | None:
-        for chat_id in _candidate_chat_ids(peer_id):
-            if self._has_enabled_policy_for_chat(chat_id):
-                return chat_id
-        return None
 
     async def _store_message(self, message: Any, event_type: str) -> bool:
         chat_id = int(message.chat_id)
@@ -720,42 +718,12 @@ class TelegramArchiveService:
         )
 
     def _policy_for(self, chat_id: int, topic_id: int | None = None) -> dict[str, Any]:
-        if topic_id:
-            topic_policy = self.store.get_backup_policy(SOURCE_TELEGRAM, self.account_id, chat_id, topic_id)
-            if topic_policy is not None:
-                return topic_policy
-        origin_policy = self.store.get_backup_policy(SOURCE_TELEGRAM, self.account_id, chat_id, 0)
-        if origin_policy is not None:
-            return origin_policy
-        return {
-            "enabled": False,
-            "capture_text": True,
-            "capture_media_metadata": True,
-            "download_media": False,
-            "download_stickers": False,
-        }
-
-    def _has_enabled_policy_for_chat(self, chat_id: int) -> bool:
-        active_origins = self.store.list_origins(account_id=self.account_id)
-        known_origins = self.store.list_origins(account_id=self.account_id, include_archived=True)
-        active_keys = {
-            (int(item["origin_id"]), int(item.get("topic_id") or 0))
-            for item in active_origins
-            if item.get("source") == SOURCE_TELEGRAM
-        }
-        known_keys = {
-            (int(item["origin_id"]), int(item.get("topic_id") or 0))
-            for item in known_origins
-            if item.get("source") == SOURCE_TELEGRAM
-        }
-        for policy in self.store.list_backup_policies(account_id=self.account_id):
-            if policy.get("source") != SOURCE_TELEGRAM or not policy.get("enabled"):
-                continue
-            origin_id = int(policy["origin_id"])
-            topic_id = int(policy.get("topic_id") or 0)
-            if origin_id == chat_id and _origin_is_active(origin_id, topic_id, active_keys, known_keys):
-                return True
-        return False
+        return self.store.resolve_effective_backup_policy(
+            SOURCE_TELEGRAM,
+            self.account_id,
+            int(chat_id),
+            int(topic_id or 0),
+        )
 
     def _update_capture_cursor(
         self,
@@ -853,21 +821,6 @@ def _candidate_chat_ids(peer_id: int) -> list[int]:
     if peer_id > 0:
         candidates.append(int(f"-100{peer_id}"))
     return candidates
-
-
-def _origin_is_active(
-    origin_id: int,
-    topic_id: int,
-    active_keys: set[tuple[int, int]],
-    known_keys: set[tuple[int, int]],
-) -> bool:
-    key = (origin_id, topic_id)
-    parent_key = (origin_id, 0)
-    if key in known_keys and key not in active_keys:
-        return False
-    if topic_id and parent_key in known_keys and parent_key not in active_keys:
-        return False
-    return True
 
 
 def _dedupe_capture_targets(targets: list[CaptureTarget]) -> list[CaptureTarget]:
