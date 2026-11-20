@@ -176,6 +176,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                store_write_runner=self._run_store_write,
             ).status(client=client)
             if result.get("authorized"):
                 self._schedule_ingestion(client)
@@ -187,6 +188,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                store_write_runner=self._run_store_write,
             ).request_code(
                 str(kwargs["phone"]),
                 client=client,
@@ -198,6 +200,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
+                store_write_runner=self._run_store_write,
             ).submit_code(
                 str(kwargs["phone"]),
                 str(kwargs["code"]),
@@ -213,6 +216,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                store_write_runner=self._run_store_write,
             ).discover_origins(
                 include_topics=bool(kwargs.get("include_topics", True)),
                 topic_limit=int(kwargs.get("topic_limit", 100)),
@@ -225,6 +229,7 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
+                store_write_runner=self._run_store_write,
             ).refresh_participants(
                 int(kwargs["origin_id"]),
                 int(kwargs.get("limit", 500)),
@@ -332,6 +337,48 @@ class TelegramAccountRuntime:
         if operation == "refresh_capture":
             return {"account_id": self.config.account_id, "status": "offline"}
         raise ValueError(f"Unknown Telegram runtime operation: {operation}")
+
+    async def _run_store_write(self, writer: Callable[[], Any]) -> Any:
+        """Run a SQLite write off the shared event loop so management timeouts stay responsive."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[Any] = loop.create_future()
+
+        def run() -> None:
+            try:
+                conn = getattr(self.store, "_conn", None)
+                if conn is not None:
+                    conn.execute("PRAGMA busy_timeout = 200")
+                value = writer()
+            except BaseException as exc:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(
+                        lambda f=future, err=exc: None if f.done() else f.set_exception(err)
+                    )
+            else:
+                if not loop.is_closed():
+                    loop.call_soon_threadsafe(
+                        lambda f=future, val=value: None if f.done() else f.set_result(val)
+                    )
+            finally:
+                close_thread = getattr(self.store, "close_thread_connection", None)
+                if callable(close_thread):
+                    try:
+                        close_thread()
+                    except Exception:
+                        pass
+                with self._diagnostic_lock:
+                    self._diagnostic_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=run,
+            name=f"telegram-store-write-{self.config.account_id}",
+            daemon=True,
+        )
+        with self._diagnostic_lock:
+            self._diagnostic_threads = {item for item in self._diagnostic_threads if item.is_alive()}
+            self._diagnostic_threads.add(thread)
+        thread.start()
+        return await future
 
     def _schedule_offline_diagnostic(self, writer: Callable[[], Any]) -> None:
         """Persist offline diagnostic state off the HTTP response path so SQLite contention never blocks or fails it."""

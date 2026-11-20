@@ -528,8 +528,25 @@ daily:
                 stderr=subprocess.PIPE,
             )
             try:
-                # Wait briefly so the child enters the waiting loop before sending real SIGTERM.
-                time.sleep(0.4)
+                # Wait until the child has initialized the DB, enqueued its job, and entered the wait loop.
+                import sqlite3
+
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if config.storage.database.exists():
+                        conn = None
+                        try:
+                            conn = sqlite3.connect(str(config.storage.database), timeout=0.2)
+                            row = conn.execute("SELECT COUNT(*) FROM daily_summary_jobs").fetchone()
+                            if row and row[0] > 0:
+                                break
+                        except sqlite3.Error:
+                            pass
+                        finally:
+                            if conn is not None:
+                                conn.close()
+                    time.sleep(0.05)
+                time.sleep(0.1)
                 proc.send_signal(signal.SIGTERM)
                 exit_code = proc.wait(timeout=5.0)
                 self.assertEqual(exit_code, 128 + int(signal.SIGTERM))

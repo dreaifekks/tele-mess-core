@@ -2242,6 +2242,153 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_management_writes_off_event_loop_respect_budget_and_committed_counts(self) -> None:
+        import asyncio
+        import sqlite3
+        import threading
+        import time
+        from types import SimpleNamespace
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "archive.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+
+            class FirstPageThenDisconnectClient:
+                async def connect(self) -> None:
+                    return None
+
+                async def disconnect(self) -> None:
+                    return None
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def iter_dialogs(self):
+                    yield SimpleNamespace(
+                        id=-1001,
+                        title="Group 1",
+                        is_user=False,
+                        is_group=True,
+                        is_channel=False,
+                        date=None,
+                        entity=SimpleNamespace(megagroup=True, broadcast=False, forum=False, username="g1"),
+                    )
+                    raise ConnectionError("page 2 disconnect")
+
+                async def iter_participants(self, origin_id: int, limit: int = 500):
+                    yield SimpleNamespace(id=42, username="alice", first_name="Alice", last_name=None, bot=False)
+                    raise ConnectionError("page 2 disconnect")
+
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=db_path),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: FirstPageThenDisconnectClient(),
+                ingest=False,
+                connect_wait_seconds=0.5,
+                management_timeout_seconds=0.06,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            for _ in range(50):
+                if runtime.statuses() and runtime.statuses()[0]["connected"]:
+                    break
+                time.sleep(0.01)
+
+            blocker = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+            blocker.execute("BEGIN IMMEDIATE")
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                # 1) All three management operations hit a locked SQLite write after receiving cached/first-page data;
+                #    all must stay within the 60ms management budget (well under the 200ms SQLite busy_timeout) and
+                #    never count uncommitted rows.
+                for path, payload, count_key in (
+                    ("/manage/accounts/auth/status", {"account_id": "main"}, None),
+                    ("/manage/discover-origins", {"account_id": "main", "include_topics": False}, "origins"),
+                    ("/manage/participants/refresh", {"account_id": "main", "origin_id": -1001}, "participants"),
+                ):
+                    for _ in range(50):
+                        if runtime.statuses() and runtime.statuses()[0]["connected"]:
+                            break
+                        time.sleep(0.01)
+                    req = Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=json.dumps(payload).encode("utf-8"),
+                        method="POST",
+                    )
+                    req.add_header("Authorization", "Bearer secret")
+                    req.add_header("Content-Type", "application/json")
+                    t0 = time.monotonic()
+                    with urlopen(req, timeout=2) as resp:
+                        elapsed = time.monotonic() - t0
+                        body = json.loads(resp.read().decode("utf-8"))
+                    self.assertLess(elapsed, 0.18, f"{path} exceeded budget: {elapsed:.3f}s")
+                    if count_key is not None:
+                        self.assertEqual(body["item"][count_key], 0)
+                        self.assertEqual(body["item"]["status"], "failed")
+                    else:
+                        self.assertEqual(body["item"]["error"]["code"], "auth_status_failed")
+
+                # 2) With a larger budget (>200ms busy_timeout), first-item DB lock fails cleanly without incrementing
+                #    committed counts, and the subsequent page-2 disconnect is also captured.
+                runtime._runtimes["main"]._management_timeout_seconds = 1.0
+                for _ in range(50):
+                    if runtime.statuses() and runtime.statuses()[0]["connected"]:
+                        break
+                    time.sleep(0.01)
+                req_disc = Request(
+                    f"http://127.0.0.1:{port}/manage/discover-origins",
+                    data=json.dumps({"account_id": "main", "include_topics": False}).encode("utf-8"),
+                    method="POST",
+                )
+                req_disc.add_header("Authorization", "Bearer secret")
+                req_disc.add_header("Content-Type", "application/json")
+                with urlopen(req_disc, timeout=2) as resp_disc:
+                    disc_body = json.loads(resp_disc.read().decode("utf-8"))
+                self.assertEqual(disc_body["item"]["origins"], 0)
+                self.assertEqual(disc_body["item"]["status"], "failed")
+                codes = [err["code"] for err in disc_body["item"]["errors"]]
+                self.assertIn("origin_discovery_failed", codes)
+                self.assertIn("dialog_discovery_failed", codes)
+            finally:
+                blocker.execute("ROLLBACK")
+                blocker.close()
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

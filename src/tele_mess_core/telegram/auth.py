@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import TelegramAccountConfig
@@ -19,6 +19,7 @@ class TelegramAuthService:
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
         auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
         auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
+        store_write_runner: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ):
         self.config = config
         self.account_id = config.account_id
@@ -26,14 +27,20 @@ class TelegramAuthService:
         self._error_persister = error_persister
         self._auth_probe_provider = auth_probe_provider
         self._auth_owner_provider = auth_owner_provider
+        self._store_write_runner = store_write_runner
         self.logger = logging.getLogger(__name__)
+
+    async def _run_write(self, writer: Callable[[], Any]) -> Any:
+        if self._store_write_runner is not None:
+            return await self._store_write_runner(writer)
+        return writer()
 
     async def status(self, client: Any) -> dict[str, Any]:
         probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
         try:
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
-            self._record_state(state, probe=probe)
+            await self._run_write(lambda st=state, pr=probe: self._record_state(st, probe=pr))
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
         except Exception as exc:
             return self._handle_rpc_error(
@@ -71,13 +78,17 @@ class TelegramAuthService:
         try:
             result = await client.send_code_request(phone)
             phone_code_hash = getattr(result, "phone_code_hash", None)
-            if phone_code_hash:
-                self.store.set_meta(_phone_code_hash_key(self.account_id), str(phone_code_hash))
-            self._record_state(
-                "code_sent",
-                phone=phone,
-                raw={"phone": phone, "phone_code_hash_set": bool(phone_code_hash)},
-            )
+
+            def persist_sent() -> None:
+                if phone_code_hash:
+                    self.store.set_meta(_phone_code_hash_key(self.account_id), str(phone_code_hash))
+                self._record_state(
+                    "code_sent",
+                    phone=phone,
+                    raw={"phone": phone, "phone_code_hash_set": bool(phone_code_hash)},
+                )
+
+            await self._run_write(persist_sent)
             return {"account_id": self.account_id, "auth_state": "code_sent", "phone": phone}
         except Exception as exc:
             return self._handle_rpc_error(
@@ -132,8 +143,11 @@ class TelegramAuthService:
         except Exception as exc:
             if _is_password_needed(exc):
                 if not password:
-                    self._record_state("password_needed", phone=phone)
-                    self._record_operation("submit_code", "password_needed")
+                    def persist_password_needed() -> None:
+                        self._record_state("password_needed", phone=phone)
+                        self._record_operation("submit_code", "password_needed")
+
+                    await self._run_write(persist_password_needed)
                     return {"account_id": self.account_id, "auth_state": "password_needed", "authorized": False}
                 try:
                     await client.sign_in(password=password)
@@ -156,8 +170,11 @@ class TelegramAuthService:
                     )
                 )
 
-        self.store.set_meta(_phone_code_hash_key(self.account_id), "")
-        self._record_state("authorized", phone=phone)
+        def persist_authorized() -> None:
+            self.store.set_meta(_phone_code_hash_key(self.account_id), "")
+            self._record_state("authorized", phone=phone)
+
+        await self._run_write(persist_authorized)
         return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
 
     def submit_code_error_result(

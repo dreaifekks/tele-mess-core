@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import logging
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Awaitable, Callable
 
 from telethon import functions
 
@@ -33,13 +33,20 @@ class TelegramDiscoveryService:
         *,
         error_persister: Callable[[Callable[[], Any]], None] | None = None,
         auth_probe_provider: Callable[[], tuple[int, str, int]] | None = None,
+        store_write_runner: Callable[[Callable[[], Any]], Awaitable[Any]] | None = None,
     ):
         self.config = config
         self.account_id = config.account_id
         self.store = store
         self._error_persister = error_persister
         self._auth_probe_provider = auth_probe_provider
+        self._store_write_runner = store_write_runner
         self.logger = logging.getLogger(__name__)
+
+    async def _run_write(self, writer: Callable[[], Any]) -> Any:
+        if self._store_write_runner is not None:
+            return await self._store_write_runner(writer)
+        return writer()
 
     async def discover_origins(
         self,
@@ -72,20 +79,19 @@ class TelegramDiscoveryService:
                             private_skipped += 1
                             continue
                         is_forum = bool(getattr(entity, "forum", False))
-                        self.store.upsert_origin(
-                            OriginRecord(
-                                source=SOURCE_TELEGRAM,
-                                account_id=self.account_id,
-                                origin_id=origin_id,
-                                origin_type=origin_type,
-                                title=getattr(dialog, "title", None) or _display_name(entity),
-                                username=getattr(entity, "username", None),
-                                is_forum=is_forum,
-                                last_message_at=_dialog_last_message_at(dialog),
-                                updated_at=utc_now_iso(),
-                                raw_json=json.dumps(_safe_dict(entity), ensure_ascii=False, default=str),
-                            )
+                        origin_record = OriginRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id=self.account_id,
+                            origin_id=origin_id,
+                            origin_type=origin_type,
+                            title=getattr(dialog, "title", None) or _display_name(entity),
+                            username=getattr(entity, "username", None),
+                            is_forum=is_forum,
+                            last_message_at=_dialog_last_message_at(dialog),
+                            updated_at=utc_now_iso(),
+                            raw_json=json.dumps(_safe_dict(entity), ensure_ascii=False, default=str),
                         )
+                        await self._run_write(lambda rec=origin_record: self.store.upsert_origin(rec))
                         origin_count += 1
                         if include_topics and is_forum:
                             topic_result = await self._discover_topics(client, entity, origin_id, effective_topic_limit)
@@ -179,19 +185,18 @@ class TelegramDiscoveryService:
             try:
                 async for user in client.iter_participants(origin_id, limit=effective_limit):
                     try:
-                        self.store.upsert_participant(
-                            ParticipantRecord(
-                                source=SOURCE_TELEGRAM,
-                                account_id=self.account_id,
-                                origin_id=origin_id,
-                                user_id=int(getattr(user, "id")),
-                                username=getattr(user, "username", None),
-                                display_name=_display_name(user),
-                                is_bot=bool(getattr(user, "bot", False)),
-                                updated_at=utc_now_iso(),
-                                raw_json=json.dumps(_safe_dict(user), ensure_ascii=False, default=str),
-                            )
+                        participant_record = ParticipantRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id=self.account_id,
+                            origin_id=origin_id,
+                            user_id=int(getattr(user, "id")),
+                            username=getattr(user, "username", None),
+                            display_name=_display_name(user),
+                            is_bot=bool(getattr(user, "bot", False)),
+                            updated_at=utc_now_iso(),
+                            raw_json=json.dumps(_safe_dict(user), ensure_ascii=False, default=str),
                         )
+                        await self._run_write(lambda rec=participant_record: self.store.upsert_participant(rec))
                         count += 1
                     except Exception as exc:
                         error = classify_telegram_exception(exc, default_code="participant_persist_failed")
@@ -312,20 +317,19 @@ class TelegramDiscoveryService:
                 break
             for topic in topics:
                 topic_id = int(getattr(topic, "id"))
-                self.store.upsert_origin(
-                    OriginRecord(
-                        source=SOURCE_TELEGRAM,
-                        account_id=self.account_id,
-                        origin_id=origin_id,
-                        topic_id=topic_id,
-                        origin_type="topic",
-                        parent_origin_id=origin_id,
-                        title=getattr(topic, "title", None),
-                        last_message_at=_topic_last_message_at(topic),
-                        updated_at=utc_now_iso(),
-                        raw_json=json.dumps(_safe_dict(topic), ensure_ascii=False, default=str),
-                    )
+                topic_record = OriginRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.account_id,
+                    origin_id=origin_id,
+                    topic_id=topic_id,
+                    origin_type="topic",
+                    parent_origin_id=origin_id,
+                    title=getattr(topic, "title", None),
+                    last_message_at=_topic_last_message_at(topic),
+                    updated_at=utc_now_iso(),
+                    raw_json=json.dumps(_safe_dict(topic), ensure_ascii=False, default=str),
                 )
+                await self._run_write(lambda rec=topic_record: self.store.upsert_origin(rec))
                 count += 1
             last_topic = topics[-1]
             next_offset_topic = int(getattr(last_topic, "id", 0) or 0)
