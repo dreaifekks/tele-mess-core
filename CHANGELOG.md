@@ -19,6 +19,11 @@ validation rules.
 - Media responses send RFC 5987 filenames and only header-safe MIME types.
 - Codex batches run in a read-only sandbox from `storage.data_dir/ai-work`
   unless `daily.ai.work_dir` is set.
+- Opening an archive that is already at the current schema version no longer
+  runs DDL or recreates the full-text triggers, so messages written by a
+  concurrent process are always indexed. `schema.sql` is now the complete
+  current schema, and the full-text index is checked and rebuilt only during
+  upgrades.
 
 ## 0.3.5 - 2026-10-13
 

@@ -1,6 +1,3 @@
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
-
 CREATE TABLE IF NOT EXISTS meta (
   key TEXT PRIMARY KEY,
   value TEXT NOT NULL
@@ -372,9 +369,16 @@ CREATE INDEX IF NOT EXISTS idx_backup_policies_enabled ON backup_policies(enable
 CREATE INDEX IF NOT EXISTS idx_participants_account_origin ON participants(source, account_id, origin_id);
 CREATE INDEX IF NOT EXISTS idx_daily_package_runs_date ON daily_package_runs(date, started_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_runs_package ON daily_summary_runs(package_run_id, started_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_daily_summary_jobs_active_dedupe
+ON daily_summary_jobs(dedupe_key)
+WHERE dedupe_key IS NOT NULL
+  AND status IN ('queued', 'running', 'cancel_requested');
+CREATE INDEX IF NOT EXISTS idx_daily_summary_jobs_claim ON daily_summary_jobs(status, retry_at, lease_until, started_at);
+CREATE INDEX IF NOT EXISTS idx_delivery_outbox_pending ON delivery_outbox(status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_date ON daily_summary_records(date, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_package ON daily_summary_records(package_run_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_summary_records_important ON daily_summary_records(important, created_at);
+CREATE INDEX IF NOT EXISTS idx_daily_summary_records_type_date ON daily_summary_records(record_type, date, created_at);
 CREATE INDEX IF NOT EXISTS idx_daily_message_points_run ON daily_message_points(run_id, occurred_at, point_id);
 CREATE INDEX IF NOT EXISTS idx_daily_message_points_lookup ON daily_message_points(date, source, account_id, origin_id, topic_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_daily_message_points_importance ON daily_message_points(date, importance_score, occurred_at);
@@ -408,4 +412,48 @@ BEGIN
   VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
   INSERT INTO message_fts(rowid, text, sender_name)
   VALUES (new.rowid, COALESCE(new.text, ''), COALESCE(new.sender_name, ''));
+END;
+
+CREATE TRIGGER IF NOT EXISTS daily_summary_jobs_validate_insert
+BEFORE INSERT ON daily_summary_jobs
+WHEN NEW.status NOT IN ('queued', 'running', 'cancel_requested', 'completed', 'failed', 'canceled')
+  OR NEW.progress_total < 0
+  OR NEW.progress_current < 0
+  OR (NEW.progress_total > 0 AND NEW.progress_current > NEW.progress_total)
+  OR NEW.attempt < 0
+BEGIN
+  SELECT RAISE(ABORT, 'invalid daily summary job state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS daily_summary_jobs_validate_update
+BEFORE UPDATE ON daily_summary_jobs
+WHEN NEW.status NOT IN ('queued', 'running', 'cancel_requested', 'completed', 'failed', 'canceled')
+  OR NEW.progress_total < 0
+  OR NEW.progress_current < 0
+  OR (NEW.progress_total > 0 AND NEW.progress_current > NEW.progress_total)
+  OR NEW.attempt < 0
+BEGIN
+  SELECT RAISE(ABORT, 'invalid daily summary job state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS delivery_outbox_validate_insert
+BEFORE INSERT ON delivery_outbox
+WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent')
+  OR NEW.chunk_index <= 0
+  OR NEW.chunk_count <= 0
+  OR NEW.chunk_index > NEW.chunk_count
+  OR NEW.attempts < 0
+BEGIN
+  SELECT RAISE(ABORT, 'invalid delivery outbox state');
+END;
+
+CREATE TRIGGER IF NOT EXISTS delivery_outbox_validate_update
+BEFORE UPDATE ON delivery_outbox
+WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent')
+  OR NEW.chunk_index <= 0
+  OR NEW.chunk_count <= 0
+  OR NEW.chunk_index > NEW.chunk_count
+  OR NEW.attempts < 0
+BEGIN
+  SELECT RAISE(ABORT, 'invalid delivery outbox state');
 END;

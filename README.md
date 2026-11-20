@@ -467,8 +467,10 @@ turning an already completed summary into a failed run.
   untracked daemon thread.
 - `ArchiveStore` uses WAL, busy timeouts, explicit short transactions, and one
   SQLite connection per worker/request thread.
-- Numbered, transactional migrations upgrade the archive schema. Job and
-  outbox state transitions have database-level validation triggers.
+- `archive/schema.sql` is the complete current schema: new archives are created
+  from it, and opening an archive that is already current runs no DDL.
+  Numbered, transactional migrations upgrade older archives. Job and outbox
+  state transitions have database-level validation triggers.
 - The HTTP route/auth registry and request validation are driven by
   `server/contracts.py`; generated Markdown/OpenAPI files and runtime docs share
   the same contract hash.

@@ -275,7 +275,7 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(self.store.search_messages("*"), [])
         self.assertEqual(self.store.search_messages("\x00"), [])
 
-    def test_initialize_rebuilds_fts_index_when_virtual_table_was_missing(self) -> None:
+    def test_upgrade_rebuilds_fts_index_when_virtual_table_was_missing(self) -> None:
         now = utc_now_iso()
         self.store.upsert_message(
             MessageRecord(
@@ -298,12 +298,15 @@ class ArchiveStoreTest(unittest.TestCase):
                 DROP TABLE message_fts;
                 """
             )
+            self.store.set_meta("schema_version", str(SCHEMA_VERSION - 1))
+            self.store._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+            self.store._conn.commit()
 
         self.store.initialize()
 
         self.assertEqual(self.store.search_messages("historical")[0]["message_id"], 13)
 
-    def test_initialize_repairs_existing_empty_fts_index_once(self) -> None:
+    def test_upgrade_repairs_existing_empty_fts_index(self) -> None:
         now = utc_now_iso()
         self.store.upsert_message(
             MessageRecord(
@@ -329,9 +332,11 @@ class ArchiveStoreTest(unittest.TestCase):
                   content='messages',
                   content_rowid='rowid'
                 );
-                DELETE FROM meta WHERE key = 'message_fts_integrity_version';
                 """
             )
+            self.store.set_meta("schema_version", str(SCHEMA_VERSION - 1))
+            self.store._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+            self.store._conn.commit()
         self.assertEqual(self.store.search_messages("legacy"), [])
 
         self.store.initialize()
@@ -1384,7 +1389,77 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNone(current["retry_at"])
 
 
+def _schema_shape(conn: sqlite3.Connection) -> dict[str, object]:
+    shape: dict[str, object] = {}
+    rows = conn.execute(
+        "SELECT type, name, tbl_name, sql FROM sqlite_master WHERE name NOT LIKE 'sqlite_%' ORDER BY name"
+    ).fetchall()
+    for kind, name, table, sql in rows:
+        if kind == "table" and not name.startswith("message_fts_"):
+            columns = sorted(tuple(row[1:]) for row in conn.execute(f"PRAGMA table_info({name})"))
+            indexes = sorted(
+                (
+                    tuple(row[2:]),
+                    tuple(info[2] for info in conn.execute(f"PRAGMA index_info('{row[1]}')")),
+                )
+                for row in conn.execute(f"PRAGMA index_list({name})")
+            )
+            shape[name] = (kind, columns, indexes)
+        elif kind in {"index", "trigger"}:
+            shape[name] = (kind, table, " ".join(str(sql).split()))
+    return shape
+
+
 class ArchiveMigrationTest(unittest.TestCase):
+    def test_schema_snapshot_matches_migrated_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "archive.db"
+            store = ArchiveStore(database_path)
+            store.initialize()
+            store.close()
+            conn = sqlite3.connect(database_path)
+            conn.executescript(
+                """
+                UPDATE meta SET value = '12' WHERE key = 'schema_version';
+                PRAGMA user_version = 12;
+                """
+            )
+            conn.close()
+            upgraded = ArchiveStore(database_path)
+            upgraded.initialize()
+            upgraded.close()
+
+            snapshot = sqlite3.connect(":memory:")
+            migrated = sqlite3.connect(database_path)
+            try:
+                snapshot.executescript(
+                    (Path(__file__).parents[1] / "src/tele_mess_core/archive/schema.sql").read_text()
+                )
+                self.assertEqual(_schema_shape(snapshot), _schema_shape(migrated))
+            finally:
+                snapshot.close()
+                migrated.close()
+
+    def test_initialize_on_current_database_changes_no_schema(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            database_path = Path(tmp) / "archive.db"
+            store = ArchiveStore(database_path)
+            store.initialize()
+            store.close()
+            conn = sqlite3.connect(database_path)
+            cookie = conn.execute("PRAGMA schema_version").fetchone()[0]
+            conn.close()
+
+            reopened = ArchiveStore(database_path)
+            reopened.initialize()
+            reopened.close()
+
+            conn = sqlite3.connect(database_path)
+            try:
+                self.assertEqual(conn.execute("PRAGMA schema_version").fetchone()[0], cookie)
+            finally:
+                conn.close()
+
     def test_initialize_rejects_newer_database_before_schema_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "future.db"
@@ -1424,15 +1499,15 @@ class ArchiveMigrationTest(unittest.TestCase):
             finally:
                 conn.close()
 
-    def test_v19_initialize_repairs_missing_sticker_download_column(self) -> None:
+    def test_previous_version_initialize_repairs_missing_sticker_download_column(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "archive.db"
             conn = sqlite3.connect(database_path)
             conn.executescript(
-                """
+                f"""
                 CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
-                INSERT INTO meta(key, value) VALUES('schema_version', '19');
-                PRAGMA user_version = 19;
+                INSERT INTO meta(key, value) VALUES('schema_version', '{SCHEMA_VERSION - 1}');
+                PRAGMA user_version = {SCHEMA_VERSION - 1};
                 CREATE TABLE backup_policies (
                   source TEXT NOT NULL,
                   account_id TEXT NOT NULL,
@@ -1463,11 +1538,11 @@ class ArchiveMigrationTest(unittest.TestCase):
                 policy = store.get_backup_policy(SOURCE_TELEGRAM, "main", -1001)
                 assert policy is not None
                 self.assertFalse(policy["download_stickers"])
-                self.assertEqual(store.state()["schema_version"], 19)
+                self.assertEqual(store.state()["schema_version"], SCHEMA_VERSION)
             finally:
                 store.close()
 
-    def test_v18_upgrade_with_healthy_fts_and_no_integrity_marker(self) -> None:
+    def test_upgrade_keeps_healthy_fts_index(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             database_path = Path(tmp) / "archive.db"
             store = ArchiveStore(database_path)
@@ -1488,10 +1563,9 @@ class ArchiveMigrationTest(unittest.TestCase):
 
             conn = sqlite3.connect(database_path)
             conn.executescript(
-                """
-                UPDATE meta SET value = '18' WHERE key = 'schema_version';
-                DELETE FROM meta WHERE key = 'message_fts_integrity_version';
-                PRAGMA user_version = 18;
+                f"""
+                UPDATE meta SET value = '{SCHEMA_VERSION - 1}' WHERE key = 'schema_version';
+                PRAGMA user_version = {SCHEMA_VERSION - 1};
                 """
             )
             conn.close()
@@ -1499,9 +1573,8 @@ class ArchiveMigrationTest(unittest.TestCase):
             upgraded = ArchiveStore(database_path)
             try:
                 upgraded.initialize()
-                self.assertEqual(upgraded.state()["schema_version"], 19)
+                self.assertEqual(upgraded.state()["schema_version"], SCHEMA_VERSION)
                 self.assertEqual(len(upgraded.search_messages("healthy")), 1)
-                self.assertEqual(upgraded.get_meta("message_fts_integrity_version"), "1")
             finally:
                 upgraded.close()
 
@@ -1707,7 +1780,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 19)
+                self.assertEqual(store.state()["schema_version"], SCHEMA_VERSION)
                 messages = store.list_messages_after(after_event_seq=0)
                 self.assertEqual(messages["items"][0]["account_id"], "default")
                 self.assertEqual(store.list_accounts()[0]["account_id"], "default")
@@ -1852,7 +1925,7 @@ class ArchiveMigrationTest(unittest.TestCase):
             store = ArchiveStore(db_path)
             try:
                 store.initialize()
-                self.assertEqual(store.state()["schema_version"], 19)
+                self.assertEqual(store.state()["schema_version"], SCHEMA_VERSION)
                 record = store.get_daily_summary_record(summary_id="legacy_v15")
                 assert record is not None
                 self.assertEqual(record["record_type"], "important_origin")

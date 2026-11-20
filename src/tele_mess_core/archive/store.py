@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
@@ -43,7 +44,6 @@ from tele_mess_core.media import (
 
 SCHEMA_VERSION = 19
 LEGACY_SCHEMA_BASELINE = 12
-MESSAGE_FTS_INTEGRITY_VERSION = "1"
 
 # Compact message projection shared by the read-only message queries; a topic's
 # origin_title is prefixed with its parent group title.
@@ -139,40 +139,48 @@ class ArchiveStore:
                 self._connections.discard(connection)
 
     def initialize(self) -> None:
+        """Create or upgrade the archive schema; a current database is left untouched."""
         with self._lock:
             try:
                 existing_schema_version = self._validate_existing_schema_version()
                 self._conn.execute("PRAGMA journal_mode = WAL")
-                message_fts_existed = self._has_table("message_fts")
-                message_fts_integrity_verified = (
-                    self._has_table("meta")
-                    and self.get_meta("message_fts_integrity_version")
-                    == MESSAGE_FTS_INTEGRITY_VERSION
-                )
-                rebuild_message_fts = not message_fts_existed
-                if message_fts_existed and not message_fts_integrity_verified:
-                    rebuild_message_fts = not self._message_fts_integrity_is_valid()
-                if self._has_table("messages") and not self._has_column("messages", "account_id"):
-                    self._migrate_v1_to_v2()
-                else:
+                if existing_schema_version == SCHEMA_VERSION:
+                    return
+                if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
                     self._conn.executescript(_schema_sql())
-                self._ensure_current_schema(
-                    rebuild_message_fts=rebuild_message_fts,
-                )
-                meta_version = self.get_meta("schema_version")
-                current_version = int(meta_version) if meta_version else existing_schema_version
-                current_version = current_version or LEGACY_SCHEMA_BASELINE
-                current_version = max(current_version, LEGACY_SCHEMA_BASELINE)
-                apply_migrations(self._conn, current_version, SCHEMA_VERSION)
+                else:
+                    self._upgrade_schema(existing_schema_version)
                 if self.get_meta("database_id") is None:
                     self.set_meta("database_id", str(uuid.uuid4()))
-                self.set_meta("message_fts_integrity_version", MESSAGE_FTS_INTEGRITY_VERSION)
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
                 self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _upgrade_schema(self, existing_schema_version: int) -> None:
+        tables_sql, objects_sql = _schema_sql_parts()
+        message_fts_existed = self._has_table("message_fts")
+        if self._has_table("messages") and not self._has_column("messages", "account_id"):
+            self._migrate_v1_to_v2()
+        else:
+            self._conn.executescript(tables_sql)
+        rebuild_message_fts = not message_fts_existed or not self._message_fts_integrity_is_valid()
+        self._ensure_current_schema()
+        current_version = self.get_meta("schema_version")
+        apply_migrations(
+            self._conn,
+            max(int(current_version) if current_version else existing_schema_version, LEGACY_SCHEMA_BASELINE),
+            SCHEMA_VERSION,
+        )
+        self._conn.executescript(
+            "DROP TRIGGER IF EXISTS messages_ai;\n"
+            "DROP TRIGGER IF EXISTS messages_ad;\n"
+            "DROP TRIGGER IF EXISTS messages_au;\n" + objects_sql
+        )
+        if rebuild_message_fts:
+            self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
 
     def _validate_existing_schema_version(self) -> int:
         user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -3250,11 +3258,7 @@ class ArchiveStore:
         rows = self._conn.execute(f"PRAGMA table_info({table})").fetchall()
         return any(row["name"] == column for row in rows)
 
-    def _ensure_current_schema(
-        self,
-        *,
-        rebuild_message_fts: bool = False,
-    ) -> None:
+    def _ensure_current_schema(self) -> None:
         if self._has_table("origins") and not self._has_column("origins", "archived_at"):
             self._conn.execute("ALTER TABLE origins ADD COLUMN archived_at TEXT")
         if self._has_table("origins") and not self._has_column("origins", "last_message_at"):
@@ -3315,15 +3319,6 @@ class ArchiveStore:
                 """
             )
         self._ensure_column("daily_summary_records", "deleted_at", "TEXT")
-        if self._has_column("daily_summary_records", "record_type"):
-            self._conn.execute(
-                "CREATE INDEX IF NOT EXISTS idx_daily_summary_records_type_date "
-                "ON daily_summary_records(record_type, date, created_at)"
-            )
-        if self._has_table("messages"):
-            self._ensure_message_fts_triggers(
-                rebuild=rebuild_message_fts,
-            )
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         if self._has_table(table) and not self._has_column(table, column):
@@ -3400,43 +3395,6 @@ class ArchiveStore:
             COMMIT;
             """
         )
-
-    def _ensure_message_fts_triggers(
-        self,
-        *,
-        rebuild: bool = False,
-    ) -> None:
-        self._conn.executescript(
-            """
-            CREATE VIRTUAL TABLE IF NOT EXISTS message_fts USING fts5(
-              text,
-              sender_name,
-              content='messages',
-              content_rowid='rowid'
-            );
-            DROP TRIGGER IF EXISTS messages_ai;
-            DROP TRIGGER IF EXISTS messages_ad;
-            DROP TRIGGER IF EXISTS messages_au;
-            CREATE TRIGGER messages_ai AFTER INSERT ON messages BEGIN
-              INSERT INTO message_fts(rowid, text, sender_name)
-              VALUES (new.rowid, COALESCE(new.text, ''), COALESCE(new.sender_name, ''));
-            END;
-            CREATE TRIGGER messages_ad AFTER DELETE ON messages BEGIN
-              INSERT INTO message_fts(message_fts, rowid, text, sender_name)
-              VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
-            END;
-            CREATE TRIGGER messages_au AFTER UPDATE ON messages
-            WHEN old.text IS NOT new.text OR old.sender_name IS NOT new.sender_name
-            BEGIN
-              INSERT INTO message_fts(message_fts, rowid, text, sender_name)
-              VALUES ('delete', old.rowid, COALESCE(old.text, ''), COALESCE(old.sender_name, ''));
-              INSERT INTO message_fts(rowid, text, sender_name)
-              VALUES (new.rowid, COALESCE(new.text, ''), COALESCE(new.sender_name, ''));
-            END;
-            """
-        )
-        if rebuild:
-            self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
 
     def _migrate_v1_to_v2(self) -> None:
         self._conn.executescript(
@@ -3521,6 +3479,20 @@ def _message_payload(message: MessageRecord) -> dict[str, Any]:
 
 def _schema_sql() -> str:
     return resources.files("tele_mess_core.archive").joinpath("schema.sql").read_text()
+
+
+def _schema_sql_parts() -> tuple[str, str]:
+    """Split the schema snapshot into table statements and the indexes and triggers built on them."""
+    tables: list[str] = []
+    objects: list[str] = []
+    statement = ""
+    for line in _schema_sql().splitlines(keepends=True):
+        statement += line
+        if sqlite3.complete_statement(statement):
+            target = tables if re.match(r"\s*CREATE\s+(VIRTUAL\s+)?TABLE\b", statement) else objects
+            target.append(statement.strip())
+            statement = ""
+    return "\n".join(tables), "\n".join(objects)
 
 
 def _row_to_dict(
