@@ -591,6 +591,119 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
         self.assertEqual(accounts["main"]["auth_state"], "code_sent")
 
+    async def test_stale_supervisor_probe_failure_cannot_overwrite_code_sent(self) -> None:
+        probe_entered = asyncio.Event()
+        release_probe = asyncio.Event()
+
+        class FailingSlowProbeClient(FakeClient):
+            async def is_user_authorized(self) -> bool:
+                probe_entered.set()
+                await release_probe.wait()
+                raise ConnectionError("stale probe disconnect")
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: FailingSlowProbeClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            await asyncio.wait_for(probe_entered.wait(), timeout=2.0)
+            sent = await manager.execute("main", "request_code", phone="+1000")
+            self.assertEqual(sent["auth_state"], "code_sent")
+            release_probe.set()
+            await asyncio.sleep(0.08)
+        finally:
+            release_probe.set()
+            await manager.stop()
+
+        accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+        self.assertEqual(accounts["main"]["auth_state"], "code_sent")
+
+    async def test_auth_seq_survives_restart_and_clock_rollback(self) -> None:
+        # Simulate a prior process that persisted a very high auth_state_seq (e.g. before clock rollback).
+        self.store.upsert_account_auth(
+            AccountAuthRecord(
+                source=SOURCE_TELEGRAM,
+                account_id="main",
+                auth_state="needs_login",
+            ),
+            monotonic_seq=10000000000000000000,
+        )
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: FakeClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            sent = await manager.execute("main", "request_code", phone="+1000")
+            self.assertEqual(sent["auth_state"], "code_sent")
+        finally:
+            await manager.stop()
+
+        accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+        self.assertEqual(accounts["main"]["auth_state"], "code_sent")
+        self.assertGreater(self.store.get_auth_state_seq(SOURCE_TELEGRAM, "main"), 10000000000000000000)
+
+    async def test_auth_rpc_error_persister_callbacks_run_without_name_error(self) -> None:
+        from tele_mess_core.telegram.auth import TelegramAuthService
+
+        queued: list[object] = []
+
+        class SessionPasswordNeededError(Exception):
+            pass
+
+        class FailingAuthClient:
+            async def is_user_authorized(self) -> bool:
+                raise ConnectionError("status offline")
+
+            async def send_code_request(self, phone: str) -> object:
+                raise ConnectionError("request offline")
+
+            async def sign_in(self, **kwargs: object) -> None:
+                if "password" in kwargs:
+                    raise ConnectionError("password offline")
+                if kwargs.get("code") == "need-pw":
+                    raise SessionPasswordNeededError("2fa required")
+                raise ConnectionError("submit offline")
+
+        service = TelegramAuthService(
+            self.account,
+            self.store,
+            error_persister=lambda fn: queued.append(fn),
+        )
+        client = FailingAuthClient()
+
+        r1 = await service.status(client=client)
+        r2 = await service.request_code("+1000", client=client)
+        r3 = await service.submit_code("+1000", "12345", client=client)
+        r4 = await service.submit_code("+1000", "need-pw", password="pw", client=client)
+
+        self.assertEqual(r1["error"]["code"], "auth_status_failed")
+        self.assertEqual(r2["error"]["code"], "request_code_failed")
+        self.assertEqual(r3["error"]["code"], "submit_code_failed")
+        self.assertEqual(r4["error"]["code"], "submit_code_failed")
+        self.assertEqual(len(queued), 4)
+
+        # Executing the deferred callbacks after all except blocks have exited must not raise NameError.
+        for callback in queued:
+            assert callable(callback)
+            callback()
+
+        events = self.store.list_operation_events(account_id="main", limit=10)
+        ops = [event["operation"] for event in events]
+        self.assertEqual(ops.count("auth_status"), 1)
+        self.assertEqual(ops.count("request_code"), 1)
+        self.assertEqual(ops.count("submit_code"), 2)
+
 
 class ConfiguredAccountSyncTest(unittest.TestCase):
     def test_bootstrap_preserves_observed_auth_state(self) -> None:

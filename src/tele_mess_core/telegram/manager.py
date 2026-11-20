@@ -73,8 +73,12 @@ class TelegramAccountRuntime:
         self._auth_state_epoch = 0
 
     def _next_auth_state_epoch(self) -> int:
+        try:
+            db_seq = self.store.get_auth_state_seq(SOURCE_TELEGRAM, self.config.account_id)
+        except Exception:
+            db_seq = 0
         with self._diagnostic_lock:
-            self._auth_state_epoch = max(self._auth_state_epoch + 1, time.time_ns())
+            self._auth_state_epoch = max(self._auth_state_epoch, db_seq) + 1
             return self._auth_state_epoch
 
     async def start(self) -> None:
@@ -362,7 +366,9 @@ class TelegramAccountRuntime:
         try:
             while not self._stopping.is_set():
                 client = None
+                probe_epoch: int | None = None
                 try:
+                    probe_epoch = self._next_auth_state_epoch()
                     client = self.client_factory(self.config)
                     if inspect.isawaitable(client):
                         client = await client
@@ -392,6 +398,7 @@ class TelegramAccountRuntime:
                     )
                     if authorized:
                         self._schedule_ingestion(client)
+                    probe_epoch = None
                     await self._wait_until_disconnected(client)
                     if not self._stopping.is_set():
                         if self._force_disconnect.is_set():
@@ -403,7 +410,7 @@ class TelegramAccountRuntime:
                 except Exception as exc:
                     self._last_connect_error = exc
                     await self._notify_attempt()
-                    fail_epoch = self._next_auth_state_epoch()
+                    fail_epoch = probe_epoch if probe_epoch is not None else self._next_auth_state_epoch()
                     self._schedule_offline_diagnostic(
                         lambda err=exc, ep=fail_epoch: self._record_runtime_failure(err, epoch=ep)
                     )
@@ -416,7 +423,7 @@ class TelegramAccountRuntime:
                     try:
                         await self._stop_ingestion()
                     except Exception as exc:
-                        stop_epoch = self._next_auth_state_epoch()
+                        stop_epoch = probe_epoch if probe_epoch is not None else self._next_auth_state_epoch()
                         self._schedule_offline_diagnostic(
                             lambda err=exc, ep=stop_epoch: self._record_runtime_failure(
                                 err,
@@ -747,6 +754,12 @@ class TelegramRuntimeManager:
 
     def statuses(self) -> list[dict[str, Any]]:
         return [runtime.status() for runtime in self._runtimes.values()]
+
+    def next_auth_state_seq(self, account_id: str) -> int | None:
+        runtime = self._runtimes.get(account_id)
+        if runtime is None:
+            return None
+        return runtime._next_auth_state_epoch()
 
     async def _register_account(self, config: TelegramAccountConfig) -> TelegramAccountRuntime:
         existing = self._runtimes.get(config.account_id)

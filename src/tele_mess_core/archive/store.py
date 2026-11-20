@@ -331,6 +331,11 @@ class ArchiveStore:
             self._conn.commit()
 
 
+    def get_auth_state_seq(self, source: str, account_id: str) -> int:
+        seq_key = f"auth_state_seq:{source}:{account_id}"
+        raw = self.get_meta(seq_key)
+        return int(raw) if raw is not None and str(raw).isdigit() else 0
+
     def upsert_account_auth(
         self,
         auth: AccountAuthRecord,
@@ -338,20 +343,29 @@ class ArchiveStore:
         monotonic_seq: int | None = None,
     ) -> bool:
         now = auth.updated_at or utc_now_iso()
+        seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                row = self._conn.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (seq_key,),
+                ).fetchone()
+                existing_seq = int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
                 if monotonic_seq is not None:
-                    seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
-                    row = self._conn.execute(
-                        "SELECT value FROM meta WHERE key = ?",
-                        (seq_key,),
-                    ).fetchone()
-                    existing_seq = int(row["value"]) if row is not None and str(row["value"]).isdigit() else 0
-                    if existing_seq >= int(monotonic_seq):
+                    target_seq = int(monotonic_seq)
+                    if target_seq <= existing_seq:
                         self._conn.rollback()
                         return False
-                    self.set_meta(seq_key, str(int(monotonic_seq)))
+                else:
+                    target_seq = existing_seq + 1
+                self._conn.execute(
+                    """
+                    INSERT INTO meta(key, value) VALUES (?, ?)
+                    ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                    """,
+                    (seq_key, str(target_seq)),
+                )
                 self._conn.execute(
                     """
                     INSERT INTO account_auth(

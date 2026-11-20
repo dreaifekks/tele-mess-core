@@ -1892,6 +1892,234 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_discover_and_refresh_mid_pagination_disconnect_not_blocked_by_sqlite_write_lock(self) -> None:
+        import asyncio
+        import sqlite3
+        import threading
+        import time
+        from types import SimpleNamespace
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "archive.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            blocker = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+
+            def lock_db() -> None:
+                blocker.execute("BEGIN IMMEDIATE")
+
+            def unlock_db() -> None:
+                if blocker.in_transaction:
+                    blocker.execute("ROLLBACK")
+
+            class MidPageDisconnectClient:
+                async def connect(self) -> None:
+                    return None
+
+                async def disconnect(self) -> None:
+                    return None
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def iter_dialogs(self):
+                    yield SimpleNamespace(
+                        id=-1001,
+                        title="Group 1",
+                        is_user=False,
+                        is_group=True,
+                        is_channel=False,
+                        date=None,
+                        entity=SimpleNamespace(megagroup=True, broadcast=False, forum=False, username="g1"),
+                    )
+                    lock_db()
+                    raise ConnectionError("dialog page 2 disconnect")
+
+                async def iter_participants(self, origin_id: int, limit: int = 500):
+                    yield SimpleNamespace(id=42, username="alice", first_name="Alice", last_name=None, bot=False)
+                    lock_db()
+                    raise ConnectionError("participant page 2 disconnect")
+
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=db_path),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: MidPageDisconnectClient(),
+                ingest=False,
+                connect_wait_seconds=0.5,
+                management_timeout_seconds=1.0,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            for _ in range(50):
+                if runtime.statuses() and runtime.statuses()[0]["connected"]:
+                    break
+                time.sleep(0.01)
+
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                req1 = Request(
+                    f"http://127.0.0.1:{port}/manage/discover-origins",
+                    data=json.dumps({"account_id": "main", "include_topics": False}).encode("utf-8"),
+                    method="POST",
+                )
+                req1.add_header("Authorization", "Bearer secret")
+                req1.add_header("Content-Type", "application/json")
+                t0 = time.monotonic()
+                with urlopen(req1, timeout=2) as resp1:
+                    elapsed1 = time.monotonic() - t0
+                    body1 = json.loads(resp1.read().decode("utf-8"))
+                unlock_db()
+                self.assertEqual(body1["item"]["status"], "partial")
+                self.assertEqual(body1["item"]["origins"], 1)
+                self.assertEqual(body1["item"]["errors"][0]["code"], "dialog_discovery_failed")
+                self.assertLess(elapsed1, 0.25)
+
+                req2 = Request(
+                    f"http://127.0.0.1:{port}/manage/participants/refresh",
+                    data=json.dumps({"account_id": "main", "origin_id": -1001}).encode("utf-8"),
+                    method="POST",
+                )
+                req2.add_header("Authorization", "Bearer secret")
+                req2.add_header("Content-Type", "application/json")
+                t1 = time.monotonic()
+                with urlopen(req2, timeout=2) as resp2:
+                    elapsed2 = time.monotonic() - t1
+                    body2 = json.loads(resp2.read().decode("utf-8"))
+                unlock_db()
+                self.assertEqual(body2["item"]["status"], "partial")
+                self.assertEqual(body2["item"]["participants"], 1)
+                self.assertEqual(body2["item"]["errors"][0]["code"], "participant_refresh_failed")
+                self.assertLess(elapsed2, 0.25)
+            finally:
+                unlock_db()
+                blocker.close()
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
+    def test_patch_account_auth_advances_seq_and_blocks_stale_supervisor_probe(self) -> None:
+        import asyncio
+        import threading
+        import time
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            db_path = root / "archive.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            probe_entered = threading.Event()
+            release_probe = threading.Event()
+
+            class BlockingProbeClient:
+                async def connect(self) -> None:
+                    return None
+
+                async def disconnect(self) -> None:
+                    return None
+
+                async def is_user_authorized(self) -> bool:
+                    probe_entered.set()
+                    while not release_probe.is_set():
+                        await asyncio.sleep(0.01)
+                    return False
+
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=db_path),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: BlockingProbeClient(),
+                ingest=False,
+                connect_wait_seconds=0.5,
+                management_timeout_seconds=2.0,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            self.assertTrue(probe_entered.wait(2))
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+                req = Request(
+                    f"http://127.0.0.1:{port}/manage/accounts/auth",
+                    data=json.dumps({"account_id": "main", "auth_state": "authorized"}).encode("utf-8"),
+                    method="PATCH",
+                )
+                req.add_header("Authorization", "Bearer secret")
+                req.add_header("Content-Type", "application/json")
+                with urlopen(req, timeout=2) as resp:
+                    self.assertEqual(resp.status, 200)
+                    body = json.loads(resp.read().decode("utf-8"))
+                    self.assertEqual(body["item"]["auth_state"], "authorized")
+
+                release_probe.set()
+                time.sleep(0.08)
+                accounts = {item["account_id"]: item for item in store.list_management_accounts()}
+                self.assertEqual(accounts["main"]["auth_state"], "authorized")
+            finally:
+                release_probe.set()
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

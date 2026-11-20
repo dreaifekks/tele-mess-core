@@ -95,7 +95,7 @@ class TelegramDiscoveryService:
                         error = classify_telegram_exception(exc, default_code="origin_discovery_failed")
                         payload = error.to_public_dict()
                         errors.append(payload)
-                        self._record_operation(
+                        self._record_operation_diagnostic(
                             "discover_origins",
                             "failed",
                             subject_type="origin",
@@ -106,7 +106,7 @@ class TelegramDiscoveryService:
                 error = classify_telegram_exception(exc, default_code="dialog_discovery_failed")
                 payload = error.to_public_dict()
                 errors.append(payload)
-                self._record_operation("discover_origins", "failed", error=payload)
+                self._record_operation_diagnostic("discover_origins", "failed", error=payload)
             if requested_topic_limit > effective_topic_limit:
                 topics_truncated = True
             status = "ok" if not errors else "partial" if origin_count else "failed"
@@ -195,7 +195,7 @@ class TelegramDiscoveryService:
                         error = classify_telegram_exception(exc, default_code="participant_persist_failed")
                         payload = error.to_public_dict()
                         errors.append(payload)
-                        self._record_operation(
+                        self._record_operation_diagnostic(
                             "refresh_participants",
                             "failed",
                             subject_type="participant",
@@ -206,7 +206,7 @@ class TelegramDiscoveryService:
                 error = classify_telegram_exception(exc, default_code="participant_refresh_failed")
                 payload = error.to_public_dict()
                 errors.append(payload)
-                self._record_operation(
+                self._record_operation_diagnostic(
                     "refresh_participants",
                     "failed",
                     subject_type="origin",
@@ -296,7 +296,13 @@ class TelegramDiscoveryService:
                 )
                 payload = error.to_public_dict()
                 errors.append(payload)
-                self._record_operation("discover_topics", "failed", subject_type="origin", subject_id=str(origin_id), error=payload)
+                self._record_operation_diagnostic(
+                    "discover_topics",
+                    "failed",
+                    subject_type="origin",
+                    subject_id=str(origin_id),
+                    error=payload,
+                )
                 break
 
             topics = list(getattr(result, "topics", []) or [])[: max_topics - count]
@@ -374,6 +380,34 @@ class TelegramDiscoveryService:
             self.store.upsert_account_auth(record, monotonic_seq=self._auth_seq_provider())
         else:
             self.store.upsert_account_auth(record)
+
+    def _record_operation_diagnostic(
+        self,
+        operation: str,
+        status: str,
+        subject_type: str | None = None,
+        subject_id: str | None = None,
+        error: dict[str, Any] | None = None,
+    ) -> None:
+        error_copy = dict(error) if error is not None else None
+        if self._error_persister is not None:
+            self._error_persister(
+                lambda op=operation, st=status, stype=subject_type, sid=subject_id, err=error_copy: self._record_operation(
+                    op,
+                    st,
+                    subject_type=stype,
+                    subject_id=sid,
+                    error=err,
+                )
+            )
+            return
+        self._record_operation(
+            operation,
+            status,
+            subject_type=subject_type,
+            subject_id=subject_id,
+            error=error_copy,
+        )
 
     def _record_operation(
         self,

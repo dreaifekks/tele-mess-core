@@ -27,17 +27,20 @@ class TelegramAuthService:
         self.logger = logging.getLogger(__name__)
 
     async def status(self, client: Any) -> dict[str, Any]:
+        probe_seq = self._auth_seq_provider() if self._auth_seq_provider is not None else None
         try:
             authorized = await client.is_user_authorized()
             state = "authorized" if authorized else "needs_login"
-            self._record_state(state)
+            self._record_state(state, monotonic_seq=probe_seq)
             return {"account_id": self.account_id, "auth_state": state, "authorized": authorized}
         except Exception as exc:
-            return self._handle_rpc_error(lambda persist, persist_auth: self.status_error_result(
-                exc,
-                persist=persist,
-                persist_auth_state=persist_auth,
-            ))
+            return self._handle_rpc_error(
+                lambda persist, persist_auth, err=exc: self.status_error_result(
+                    err,
+                    persist=persist,
+                    persist_auth_state=persist_auth,
+                )
+            )
 
     def status_error_result(
         self,
@@ -75,12 +78,14 @@ class TelegramAuthService:
             )
             return {"account_id": self.account_id, "auth_state": "code_sent", "phone": phone}
         except Exception as exc:
-            return self._handle_rpc_error(lambda persist, persist_auth: self.request_code_error_result(
-                phone,
-                exc,
-                persist=persist,
-                persist_auth_state=persist_auth,
-            ))
+            return self._handle_rpc_error(
+                lambda persist, persist_auth, p=phone, err=exc: self.request_code_error_result(
+                    p,
+                    err,
+                    persist=persist,
+                    persist_auth_state=persist_auth,
+                )
+            )
 
     def request_code_error_result(
         self,
@@ -131,19 +136,23 @@ class TelegramAuthService:
                 try:
                     await client.sign_in(password=password)
                 except Exception as password_exc:
-                    return self._handle_rpc_error(lambda persist, persist_auth: self.submit_code_error_result(
-                        phone,
-                        password_exc,
+                    return self._handle_rpc_error(
+                        lambda persist, persist_auth, p=phone, err=password_exc: self.submit_code_error_result(
+                            p,
+                            err,
+                            persist=persist,
+                            persist_auth_state=persist_auth,
+                        )
+                    )
+            else:
+                return self._handle_rpc_error(
+                    lambda persist, persist_auth, p=phone, err=exc: self.submit_code_error_result(
+                        p,
+                        err,
                         persist=persist,
                         persist_auth_state=persist_auth,
-                    ))
-            else:
-                return self._handle_rpc_error(lambda persist, persist_auth: self.submit_code_error_result(
-                    phone,
-                    exc,
-                    persist=persist,
-                    persist_auth_state=persist_auth,
-                ))
+                    )
+                )
 
         self.store.set_meta(_phone_code_hash_key(self.account_id), "")
         self._record_state("authorized", phone=phone)
@@ -207,7 +216,7 @@ class TelegramAuthService:
         if self._error_persister is None:
             return builder(True, True)
         result = builder(False, False)
-        self._error_persister(lambda: builder(True, False))
+        self._error_persister(lambda fn=builder: fn(True, False))
         return result
 
     def _record_state(
@@ -216,6 +225,8 @@ class TelegramAuthService:
         phone: str | None = None,
         last_error: str | None = None,
         raw: dict[str, Any] | None = None,
+        *,
+        monotonic_seq: int | None = None,
     ) -> None:
         now = utc_now_iso()
         self.store.upsert_account(
@@ -238,8 +249,11 @@ class TelegramAuthService:
             updated_at=now,
             raw_json=json.dumps(raw or {"auth_state": state}, ensure_ascii=False),
         )
-        if self._auth_seq_provider is not None:
-            self.store.upsert_account_auth(auth_record, monotonic_seq=self._auth_seq_provider())
+        seq = monotonic_seq
+        if seq is None and self._auth_seq_provider is not None:
+            seq = self._auth_seq_provider()
+        if seq is not None:
+            self.store.upsert_account_auth(auth_record, monotonic_seq=seq)
         else:
             self.store.upsert_account_auth(auth_record)
 
