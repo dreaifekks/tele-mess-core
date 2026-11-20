@@ -32,6 +32,10 @@ validation rules.
   management account of another source, and enabling delivery to an account
   managed in SQLite now fails at configuration time when no configured account
   can lend it API credentials.
+- Importing the HTTP API, MCP endpoint, daily worker, or CLI no longer loads
+  Telethon; only the Telegram runtime and services do. A missing Telethon in
+  origin discovery now raises instead of being reported as a partial topic
+  discovery result.
 
 ## 0.3.5 - 2026-10-13
 

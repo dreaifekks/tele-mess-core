@@ -697,7 +697,7 @@ class DailyJobWorkerTest(unittest.TestCase):
             scope={"account_id": "main"},
         )
         with patch(
-            "tele_mess_core.daily_jobs.TelegramSummaryDeliveryService",
+            "tele_mess_core.telegram.delivery.TelegramSummaryDeliveryService",
             FakeDeliveryService,
         ):
             completed = worker.run_once()
@@ -814,7 +814,7 @@ class DailyJobWorkerTest(unittest.TestCase):
             scope={"account_id": "main"},
         )
         with patch(
-            "tele_mess_core.daily_jobs.TelegramSummaryDeliveryService",
+            "tele_mess_core.telegram.delivery.TelegramSummaryDeliveryService",
             BlockingDeliveryService,
         ):
             worker.start()

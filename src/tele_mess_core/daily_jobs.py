@@ -25,7 +25,6 @@ from tele_mess_core.daily import (
     run_daily_summary,
 )
 from tele_mess_core.models import DailySummaryJobRecord, utc_now_iso
-from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
 
 TERMINAL_JOB_STATUSES = {"completed", "failed", "canceled"}
@@ -515,6 +514,8 @@ class DailyJobWorker:
                     content=str(item["content"]),
                 )
             else:
+                from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
+
                 account = resolve_account_config(self.config, self.store, delivery.account_id)
                 result = self._run_delivery_coroutine(
                     TelegramSummaryDeliveryService(account, self.store).send_summary(

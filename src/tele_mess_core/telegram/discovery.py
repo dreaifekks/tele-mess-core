@@ -5,6 +5,8 @@ import logging
 from pathlib import Path
 from typing import Any
 
+from telethon import functions
+
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.config import TelegramAccountConfig
 from tele_mess_core.models import (
@@ -237,13 +239,6 @@ class TelegramDiscoveryService:
 
     async def _discover_topics(self, client: Any, entity: Any, origin_id: int, topic_limit: int) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []
-        try:
-            from telethon import functions
-        except Exception as exc:
-            error = classify_telegram_exception(exc, default_code="topic_request_import_failed")
-            payload = error.to_public_dict()
-            self._record_operation("discover_topics", "failed", subject_type="origin", subject_id=str(origin_id), error=payload)
-            return {"topics": 0, "errors": [payload], "truncated": False}
 
         count = 0
         offset_id = 0
