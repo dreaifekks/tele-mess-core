@@ -1336,7 +1336,7 @@ class ArchiveStoreTest(unittest.TestCase):
                 timezone="UTC",
             )
         )
-        self.store.upsert_daily_summary_job(
+        self.store.insert_daily_summary_job(
             DailySummaryJobRecord(
                 job_id="job_canceled_points",
                 status="canceled",
@@ -1369,7 +1369,7 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertEqual(canceled[0]["job_status"], "canceled")
 
     def test_daily_summary_jobs_track_progress_and_cancel_request(self) -> None:
-        self.store.upsert_daily_summary_job(
+        self.store.insert_daily_summary_job(
             DailySummaryJobRecord(
                 job_id="job_a",
                 status="running",
@@ -1396,7 +1396,7 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNotNone(canceled["cancel_requested_at"])
 
     def test_daily_summary_job_retry_is_not_claimed_before_retry_at(self) -> None:
-        self.store.upsert_daily_summary_job(
+        self.store.insert_daily_summary_job(
             DailySummaryJobRecord(
                 job_id="job_retry",
                 status="running",
@@ -1411,6 +1411,7 @@ class ArchiveStoreTest(unittest.TestCase):
         scheduled = self.store.schedule_daily_summary_job_retry(
             "job_retry",
             "worker_a",
+            1,
             retry_at="2026-07-03T00:20:00+00:00",
             max_retries=1,
             progress_label="retry scheduled",
@@ -1449,11 +1450,12 @@ class ArchiveStoreTest(unittest.TestCase):
         self.assertIsNone(claimed["retry_at"])
 
     def test_retry_schedule_does_not_overwrite_cancel_request(self) -> None:
-        self.store.upsert_daily_summary_job(
+        self.store.insert_daily_summary_job(
             DailySummaryJobRecord(
                 job_id="job_retry_cancel",
                 status="running",
                 worker_id="worker_a",
+                attempt=1,
                 progress_label="running",
                 progress_json='{"stage":"summary"}',
             )
@@ -1465,6 +1467,7 @@ class ArchiveStoreTest(unittest.TestCase):
         scheduled = self.store.schedule_daily_summary_job_retry(
             "job_retry_cancel",
             "worker_a",
+            1,
             retry_at="2026-07-03T00:20:00+00:00",
             max_retries=1,
             progress_label="retry scheduled",
@@ -2074,6 +2077,130 @@ class ArchiveMigrationTest(unittest.TestCase):
             )
         finally:
             conn.close()
+
+    def test_migration_20_rebuilds_delivery_outbox_with_content_kind_and_failed_status(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v19.db"
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(
+                """
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '19');
+                CREATE TABLE delivery_outbox (
+                  outbox_id TEXT PRIMARY KEY,
+                  summary_run_id TEXT NOT NULL,
+                  job_id TEXT,
+                  account_id TEXT NOT NULL,
+                  origin_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  chunk_index INTEGER NOT NULL,
+                  chunk_count INTEGER NOT NULL,
+                  content TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  message_id INTEGER,
+                  last_error TEXT,
+                  next_attempt_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  sent_at TEXT,
+                  UNIQUE(summary_run_id, account_id, origin_id, topic_id, chunk_index)
+                );
+                INSERT INTO delivery_outbox(
+                  outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+                  chunk_index, chunk_count, content, status, attempts, created_at, updated_at
+                ) VALUES (
+                  'out_v19_1', 'sum_v19', 'job_v19', 'main', -9001, 0,
+                  1, 2, 'legacy chunk', 'sent', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                );
+                PRAGMA user_version = 19;
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            store = ArchiveStore(db_path)
+            try:
+                store.initialize()
+                self.assertEqual(store.state()["schema_version"], SCHEMA_VERSION)
+                rows = store.list_delivery_outbox(summary_run_id="sum_v19")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["content_kind"], "summary")
+                self.assertEqual(rows[0]["status"], "sent")
+
+                store.persist_daily_summary_batch(
+                    [],
+                    [
+                        {
+                            "outbox_id": "out_new_imp_1",
+                            "summary_run_id": "sum_v20",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "important_summary",
+                            "chunk_index": 1,
+                            "chunk_count": 2,
+                            "content": "imp 1",
+                        },
+                        {
+                            "outbox_id": "out_new_imp_2",
+                            "summary_run_id": "sum_v20",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "important_summary",
+                            "chunk_index": 2,
+                            "chunk_count": 2,
+                            "content": "imp 2",
+                        },
+                        {
+                            "outbox_id": "out_new_pt_1",
+                            "summary_run_id": "sum_v20",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "point_summary",
+                            "chunk_index": 1,
+                            "chunk_count": 1,
+                            "content": "pt 1",
+                        },
+                    ],
+                )
+                claimed = store.claim_delivery_outbox(
+                    now="2026-07-03T01:00:00+00:00",
+                    stale_before="2026-07-03T00:55:00+00:00",
+                    summary_run_id="sum_v20",
+                )
+                assert claimed is not None
+                self.assertEqual(claimed["outbox_id"], "out_new_imp_1")
+                self.assertTrue(
+                    store.fail_delivery_outbox(
+                        "out_new_imp_1",
+                        error="permanent",
+                        now="2026-07-03T01:00:01+00:00",
+                        expected_attempt=claimed["attempts"],
+                    )
+                )
+                # Stale attempt update after fail is rejected
+                self.assertFalse(
+                    store.complete_delivery_outbox(
+                        "out_new_imp_1",
+                        message_id=99,
+                        now="2026-07-03T01:00:02+00:00",
+                        expected_attempt=claimed["attempts"],
+                    )
+                )
+                by_id = {row["outbox_id"]: row for row in store.list_delivery_outbox(summary_run_id="sum_v20")}
+                self.assertEqual(by_id["out_new_imp_1"]["status"], "failed")
+                self.assertEqual(by_id["out_new_imp_2"]["status"], "failed")
+                self.assertEqual(by_id["out_new_pt_1"]["status"], "pending")
+
+                next_claimed = store.claim_delivery_outbox(
+                    now="2026-07-03T01:00:05+00:00",
+                    stale_before="2026-07-03T00:55:00+00:00",
+                    summary_run_id="sum_v20",
+                )
+                assert next_claimed is not None
+                self.assertEqual(next_claimed["outbox_id"], "out_new_pt_1")
+            finally:
+                store.close()
 
 
 if __name__ == "__main__":

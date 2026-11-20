@@ -54,15 +54,6 @@ class FakeClient:
         return None
 
 
-class FakeAuthService(TelegramAuthService):
-    def __init__(self, config, store, client):
-        super().__init__(config, store)
-        self.client = client
-
-    async def _connected_client(self):
-        return self.client
-
-
 class TelegramAuthTest(unittest.IsolatedAsyncioTestCase):
     def setUp(self) -> None:
         self.tmp = tempfile.TemporaryDirectory()
@@ -75,40 +66,40 @@ class TelegramAuthTest(unittest.IsolatedAsyncioTestCase):
             session_name="main",
         )
         self.client = FakeClient()
-        self.service = FakeAuthService(self.config, self.store, self.client)
+        self.service = TelegramAuthService(self.config, self.store)
 
     def tearDown(self) -> None:
         self.store.close()
         self.tmp.cleanup()
 
     async def test_request_and_submit_code_updates_auth_state(self) -> None:
-        requested = await self.service.request_code("+10000000000")
+        requested = await self.service.request_code("+10000000000", client=self.client)
         self.assertEqual(requested["auth_state"], "code_sent")
         accounts = self.store.list_management_accounts()
         self.assertEqual(accounts[0]["auth_state"], "code_sent")
         self.assertEqual(self.store.get_meta("telegram_auth:main:phone_code_hash"), "hash123")
 
-        submitted = await self.service.submit_code("+10000000000", "12345")
+        submitted = await self.service.submit_code("+10000000000", "12345", client=self.client)
         self.assertTrue(submitted["authorized"])
         accounts = self.store.list_management_accounts()
         self.assertEqual(accounts[0]["auth_state"], "authorized")
         self.assertEqual(self.store.get_meta("telegram_auth:main:phone_code_hash"), "")
 
     async def test_submit_code_reports_password_needed_and_accepts_password(self) -> None:
-        await self.service.request_code("+10000000000")
+        await self.service.request_code("+10000000000", client=self.client)
         self.client.password_needed = True
-        result = await self.service.submit_code("+10000000000", "12345")
+        result = await self.service.submit_code("+10000000000", "12345", client=self.client)
         self.assertEqual(result["auth_state"], "password_needed")
 
         self.client.password_needed = True
-        result = await self.service.submit_code("+10000000000", "12345", password="secret")
+        result = await self.service.submit_code("+10000000000", "12345", password="secret", client=self.client)
         self.assertTrue(result["authorized"])
         self.assertTrue(any("password" in call for call in self.client.sign_in_calls))
 
     async def test_request_code_records_expected_telegram_error(self) -> None:
         self.client.send_code_error = PhoneNumberInvalidError("bad phone")
 
-        result = await self.service.request_code("+10000000000")
+        result = await self.service.request_code("+10000000000", client=self.client)
 
         self.assertEqual(result["auth_state"], "auth_failed")
         self.assertEqual(result["error"]["code"], "invalid_phone")

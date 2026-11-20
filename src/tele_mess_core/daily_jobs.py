@@ -4,19 +4,27 @@ import asyncio
 import hashlib
 import json
 import logging
+import os
 import sqlite3
 import subprocess
 import threading
 import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Any, Callable
 
+try:
+    import fcntl
+except ImportError:  # pragma: no cover - Windows fallback
+    fcntl = None  # type: ignore[assignment]
+
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig, DailyDeliveryConfig, resolve_account_config
+from tele_mess_core.config import AppConfig, DailyDeliveryConfig
 from tele_mess_core.daily import (
     DailyJobCancelled,
     DailyJobInterrupted,
+    DailyJobLeaseLost,
     _resolve_package_date,
     _terminate_process,
     _zoneinfo,
@@ -28,11 +36,122 @@ from tele_mess_core.models import DEFAULT_TIMEZONE, DailySummaryJobRecord, utc_n
 
 
 TERMINAL_JOB_STATUSES = {"completed", "failed", "canceled"}
+DELIVERY_MAX_ATTEMPTS = 30
+DAILY_WORKER_LOCK_FILENAME = ".daily-worker.lock"
 LOGGER = logging.getLogger(__name__)
 
 
 class DailyJobWorkerStopping(DailyJobInterrupted):
     pass
+
+
+class DailyWorkerLock:
+    """Process-level advisory file lock ensuring at most one daily job executor."""
+
+    def __init__(self, path: Path, *, owner: str = "") -> None:
+        self.path = path
+        self.owner = owner
+        self._fd: int | None = None
+
+    def try_acquire(self) -> bool:
+        if self._fd is not None:
+            return True
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(str(self.path), os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            os.ftruncate(fd, 0)
+            os.lseek(fd, 0, os.SEEK_SET)
+            payload = json.dumps(
+                {"pid": os.getpid(), "owner": self.owner, "acquired_at": utc_now_iso()},
+                ensure_ascii=False,
+            )
+            os.write(fd, payload.encode("utf-8"))
+            self._fd = fd
+            return True
+        except BlockingIOError:
+            os.close(fd)
+            return False
+        except Exception:
+            os.close(fd)
+            raise
+
+    def release(self) -> None:
+        fd = self._fd
+        self._fd = None
+        if fd is None:
+            return
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
+
+
+class _ScopedTelegramRuntime:
+    """Short-lived TelegramRuntimeManager(ingest=False) for standalone CLI delivery."""
+
+    def __init__(self, config: AppConfig, store: ArchiveStore, account_ids: set[str]) -> None:
+        self._config = config
+        self._store = store
+        self._account_ids = set(account_ids)
+        self._loop: asyncio.AbstractEventLoop | None = None
+        self._thread: threading.Thread | None = None
+        self._runtime: Any | None = None
+
+    def __enter__(self) -> Any:
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        ready = threading.Event()
+        errors: list[BaseException] = []
+        runtime = TelegramRuntimeManager(
+            self._config,
+            self._store,
+            ingest=False,
+            account_ids=self._account_ids,
+        )
+        self._runtime = runtime
+
+        def run_loop() -> None:
+            loop = asyncio.new_event_loop()
+            self._loop = loop
+            asyncio.set_event_loop(loop)
+            try:
+                loop.run_until_complete(runtime.start())
+                ready.set()
+                loop.run_forever()
+            except BaseException as exc:
+                errors.append(exc)
+                ready.set()
+            finally:
+                try:
+                    loop.run_until_complete(runtime.stop())
+                finally:
+                    loop.run_until_complete(loop.shutdown_asyncgens())
+                    loop.close()
+
+        self._thread = threading.Thread(target=run_loop, name="cli-daily-delivery-runtime", daemon=True)
+        self._thread.start()
+        ready.wait(timeout=15.0)
+        if errors:
+            self.__exit__(None, None, None)
+            raise errors[0]
+        return runtime
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        loop = self._loop
+        thread = self._thread
+        if loop is not None and not loop.is_closed():
+            try:
+                loop.call_soon_threadsafe(loop.stop)
+            except RuntimeError:
+                pass
+        if thread is not None:
+            thread.join(timeout=15.0)
+        self._loop = None
+        self._thread = None
+        self._runtime = None
 
 
 def enqueue_daily_summary_job(
@@ -112,12 +231,77 @@ def enqueue_daily_summary_job(
         updated_at=now,
     )
     try:
-        return store.upsert_daily_summary_job(job)
+        return store.insert_daily_summary_job(job)
     except sqlite3.IntegrityError:
         raced = store.find_active_daily_summary_job(dedupe_key)
         if raced is None:
             raise
         return raced
+
+
+def wait_for_daily_summary_job(
+    store: ArchiveStore,
+    job_id: str,
+    *,
+    timeout: float | None = None,
+    poll_interval: float = 0.05,
+) -> dict[str, Any]:
+    deadline = None if timeout is None else time.monotonic() + timeout
+    interval = max(0.01, float(poll_interval))
+    while True:
+        item = store.get_daily_summary_job(job_id)
+        if item is None:
+            raise ValueError("Unknown daily summary job")
+        if item["status"] in TERMINAL_JOB_STATUSES:
+            return item
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError(f"Timed out waiting for daily summary job {job_id}")
+        time.sleep(interval)
+
+
+def run_daily_summary_job_from_cli(
+    store: ArchiveStore,
+    config: AppConfig,
+    job_id: str,
+    *,
+    timeout: float | None = None,
+    delivery_runtime_factory: Callable[[AppConfig, ArchiveStore, set[str]], Any] | None = None,
+) -> dict[str, Any]:
+    """Wait for the running core service, or execute only this job locally when no service runs."""
+    current = store.get_daily_summary_job(job_id)
+    if current is None:
+        raise ValueError("Unknown daily summary job")
+    if current["status"] in TERMINAL_JOB_STATUSES:
+        return current
+
+    lock = DailyWorkerLock(config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME, owner=f"cli:{job_id}")
+    if not lock.try_acquire():
+        return wait_for_daily_summary_job(store, job_id, timeout=timeout)
+
+    runtime_factory = delivery_runtime_factory or _ScopedTelegramRuntime
+    try:
+        worker = DailyJobWorker(
+            store,
+            config,
+            telegram_runtime=None,
+            use_process_lock=False,
+            standalone_delivery_factory=runtime_factory,
+        )
+        deadline = None if timeout is None else time.monotonic() + timeout
+        while True:
+            item = store.get_daily_summary_job(job_id)
+            if item is None:
+                raise ValueError("Unknown daily summary job")
+            if item["status"] in TERMINAL_JOB_STATUSES:
+                return item
+            ran = worker.run_once(job_id=job_id)
+            if ran is not None and ran["status"] in TERMINAL_JOB_STATUSES:
+                return ran
+            if deadline is not None and time.monotonic() >= deadline:
+                raise TimeoutError(f"Timed out waiting for daily summary job {job_id}")
+            time.sleep(0.1)
+    finally:
+        lock.release()
 
 
 class DailyJobWorker:
@@ -129,21 +313,33 @@ class DailyJobWorker:
         telegram_runtime: Any | None = None,
         poll_interval: float = 0.5,
         worker_id: str | None = None,
+        use_process_lock: bool = True,
+        heartbeat_interval: float | None = None,
+        standalone_delivery_factory: Callable[[AppConfig, ArchiveStore, set[str]], Any] | None = None,
     ) -> None:
         self.store = store
         self.config = config
         self.telegram_runtime = telegram_runtime
         self.poll_interval = max(0.05, poll_interval)
         self.worker_id = worker_id or f"worker_{uuid.uuid4().hex[:12]}"
+        self.use_process_lock = use_process_lock
+        self._standalone_delivery_factory = standalone_delivery_factory
         self._stop_event = threading.Event()
         self._wake_event = threading.Event()
         self._thread: threading.Thread | None = None
         self._process_lock = threading.RLock()
         self._current_job_id: str | None = None
         self._current_process: subprocess.Popen[str] | None = None
-        self._current_delivery_loop: asyncio.AbstractEventLoop | None = None
-        self._current_delivery_task: asyncio.Task[Any] | None = None
         self._lease_seconds = max(300, int(config.daily.ai.timeout_seconds) + 120)
+        self._heartbeat_interval = (
+            max(0.05, float(heartbeat_interval))
+            if heartbeat_interval is not None
+            else max(5.0, min(60.0, self._lease_seconds / 3.0))
+        )
+        self._worker_lock = DailyWorkerLock(
+            config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME,
+            owner=self.worker_id,
+        )
 
     def start(self) -> None:
         if self._thread is not None and self._thread.is_alive():
@@ -159,7 +355,6 @@ class DailyJobWorker:
             process = self._current_process
         if process is not None and process.poll() is None:
             _terminate_process(process)
-        self._cancel_current_delivery()
         thread = self._thread
         if thread is not None:
             thread.join(timeout=timeout)
@@ -196,36 +391,36 @@ class DailyJobWorker:
             process = self._current_process if self._current_job_id == job_id else None
         if process is not None and process.poll() is None:
             _terminate_process(process)
-        self._cancel_current_delivery(job_id=job_id)
         self._wake_event.set()
         return self.store.get_daily_summary_job(job_id) or item
 
-    def run_once(self) -> dict[str, Any] | None:
+    def run_once(self, *, job_id: str | None = None) -> dict[str, Any] | None:
         now, lease_until = self._lease_window()
-        job = self.store.claim_daily_summary_job(self.worker_id, now=now, lease_until=lease_until)
+        job = self.store.claim_daily_summary_job(
+            self.worker_id,
+            now=now,
+            lease_until=lease_until,
+            job_id=job_id,
+        )
         if job is None:
             return None
         self._execute(job)
         return self.store.get_daily_summary_job(str(job["job_id"]))
 
     def wait_for_terminal(self, job_id: str, timeout: float | None = None) -> dict[str, Any]:
-        deadline = None if timeout is None else time.monotonic() + timeout
-        while True:
-            item = self.store.get_daily_summary_job(job_id)
-            if item is None:
-                raise ValueError("Unknown daily summary job")
-            if item["status"] in TERMINAL_JOB_STATUSES:
-                return item
-            if self._thread is None or not self._thread.is_alive():
-                self.run_once()
-            if deadline is not None and time.monotonic() >= deadline:
-                raise TimeoutError(f"Timed out waiting for daily summary job {job_id}")
-            time.sleep(0.05)
+        return wait_for_daily_summary_job(self.store, job_id, timeout=timeout)
 
     def _run_loop(self) -> None:
         retry_delay = max(0.25, self.poll_interval)
+        lock_acquired = False
         try:
             while not self._stop_event.is_set():
+                if self.use_process_lock and not lock_acquired:
+                    lock_acquired = self._worker_lock.try_acquire()
+                    if not lock_acquired:
+                        self._wake_event.wait(self.poll_interval)
+                        self._wake_event.clear()
+                        continue
                 try:
                     item = self.run_once()
                     delivered = self._deliver_pending_once() if item is None else False
@@ -254,91 +449,151 @@ class DailyJobWorker:
                     self._wake_event.clear()
                     retry_delay = min(30.0, max(0.5, retry_delay * 2))
         finally:
+            if lock_acquired:
+                self._worker_lock.release()
             self.store.close_thread_connection()
 
     def _execute(self, job: dict[str, Any]) -> None:
         job_id = str(job["job_id"])
+        attempt = int(job.get("attempt") or 1)
+        job_owner = (job_id, self.worker_id, attempt)
         request = dict(job.get("request") or {})
         scope = dict(request.get("scope") or job.get("scope") or {})
-        package_run_id = request.get("package_run_id") or job.get("package_run_id")
+        requested_package_id = request.get("package_run_id")
+        package_run_id = requested_package_id or job.get("package_run_id")
         run_date = request.get("date") or job.get("date")
         timezone_name = request.get("timezone") or job.get("timezone")
         package: dict[str, Any] | None = None
         summary: dict[str, Any] | None = None
+        lease_lost = threading.Event()
+        heartbeat_stop = threading.Event()
+
         with self._process_lock:
             self._current_job_id = job_id
+
+        def terminate_current_process() -> None:
+            with self._process_lock:
+                process = self._current_process if self._current_job_id == job_id else None
+            if process is not None and process.poll() is None:
+                _terminate_process(process)
+
+        def heartbeat_loop() -> None:
+            try:
+                while not heartbeat_stop.wait(self._heartbeat_interval):
+                    if self._stop_event.is_set() or lease_lost.is_set():
+                        return
+                    now, lease_until = self._lease_window()
+                    try:
+                        renewed = self.store.renew_daily_summary_job_lease(
+                            job_id,
+                            self.worker_id,
+                            attempt,
+                            now=now,
+                            lease_until=lease_until,
+                        )
+                    except sqlite3.OperationalError:
+                        continue
+                    except Exception:
+                        LOGGER.exception("Failed to renew lease for daily summary job %s", job_id)
+                        continue
+                    if not renewed:
+                        lease_lost.set()
+                        terminate_current_process()
+                        return
+            finally:
+                self.store.close_thread_connection()
+
+        heartbeat_thread = threading.Thread(
+            target=heartbeat_loop,
+            name=f"daily-job-heartbeat-{job_id}",
+            daemon=True,
+        )
+        heartbeat_thread.start()
 
         def check_cancel() -> None:
             if self._stop_event.is_set():
                 raise DailyJobWorkerStopping("worker stopping")
+            if lease_lost.is_set():
+                raise DailyJobLeaseLost(f"lost lease for job {job_id}")
             if self.store.daily_summary_job_cancel_requested(job_id):
                 raise DailyJobCancelled("canceled")
 
-        def write_job(
+        def update_job_progress(
+            progress: dict[str, Any],
+            *,
+            package_id: str | None = None,
+            summary_id: str | None = None,
+        ) -> None:
+            now, lease_until = self._lease_window()
+            updated = self.store.update_daily_summary_job_progress(
+                job_id,
+                self.worker_id,
+                attempt,
+                progress=progress,
+                lease_until=lease_until,
+                now=now,
+                package_run_id=package_id,
+                summary_run_id=summary_id,
+                date=str(progress.get("date") or run_date or "") or None,
+                timezone=str(progress.get("timezone") or timezone_name or "") or None,
+                provider=str(progress.get("provider") or "") or None,
+            )
+            if not updated:
+                lease_lost.set()
+                raise DailyJobLeaseLost(f"lost lease for job {job_id}")
+
+        def finish_job(
             status: str,
             progress: dict[str, Any],
             *,
             package_id: str | None = None,
             summary_id: str | None = None,
             error: str | None = None,
-            finished_at: str | None = None,
-        ) -> dict[str, Any]:
-            current = self.store.get_daily_summary_job(job_id) or job
-            now, lease_until = self._lease_window()
-            return self.store.upsert_daily_summary_job(
-                DailySummaryJobRecord(
-                    job_id=job_id,
-                    status=status,
-                    date=str(progress.get("date") or run_date or current.get("date") or "") or None,
-                    timezone=str(progress.get("timezone") or timezone_name or current.get("timezone") or "") or None,
-                    scope_json=json.dumps(scope, ensure_ascii=False, sort_keys=True),
-                    package_run_id=package_id or current.get("package_run_id"),
-                    summary_run_id=summary_id or current.get("summary_run_id"),
-                    provider=str(
-                        progress.get("provider")
-                        or current.get("provider")
-                        or self.config.daily.ai.provider
-                    ),
-                    progress_total=int(progress.get("total") or 0),
-                    progress_current=int(progress.get("current") or 0),
-                    progress_label=str(progress.get("label") or status),
-                    progress_json=json.dumps(progress, ensure_ascii=False, sort_keys=True),
-                    request_json=json.dumps(request, ensure_ascii=False, sort_keys=True),
-                    dedupe_key=current.get("dedupe_key"),
-                    worker_id=self.worker_id,
-                    lease_until=lease_until,
-                    heartbeat_at=now,
-                    attempt=int(current.get("attempt") or 0),
-                    retry_at=current.get("retry_at"),
-                    retry_count=int(current.get("retry_count") or 0),
-                    cancel_requested_at=current.get("cancel_requested_at"),
-                    error=error,
-                    started_at=current.get("started_at"),
-                    finished_at=finished_at,
-                    updated_at=now,
-                )
+            discard_unsent_outbox: bool = False,
+        ) -> bool:
+            updated = self.store.finish_daily_summary_job(
+                job_id,
+                self.worker_id,
+                attempt,
+                status=status,
+                progress=progress,
+                now=utc_now_iso(),
+                package_run_id=package_id,
+                summary_run_id=summary_id,
+                date=str(progress.get("date") or run_date or "") or None,
+                timezone=str(progress.get("timezone") or timezone_name or "") or None,
+                provider=str(progress.get("provider") or "") or None,
+                error=error,
+                discard_unsent_outbox=discard_unsent_outbox,
             )
+            if not updated:
+                lease_lost.set()
+            return updated
 
         def progress_callback(progress: dict[str, Any]) -> None:
             check_cancel()
-            write_job("running", progress)
+            update_job_progress(progress)
 
         def process_callback(process: subprocess.Popen[str] | None, task_name: str) -> None:
             with self._process_lock:
                 self._current_process = process
+            if process is None and (self._stop_event.is_set() or lease_lost.is_set()):
+                return
             current_progress = (self.store.get_daily_summary_job(job_id) or {}).get("progress") or {}
-            write_job(
-                "running",
-                {**current_progress, "task": task_name, "pid": process.pid if process is not None else None},
+            update_job_progress(
+                {**current_progress, "task": task_name, "pid": process.pid if process is not None else None}
             )
 
         try:
             check_cancel()
             package = self.store.get_daily_package_run(str(package_run_id)) if package_run_id else None
-            if package is None:
-                planned_package_id = f"pkg_{uuid.uuid4().hex[:12]}"
-                write_job(
-                    "running",
+            if package is None or (not requested_package_id and package.get("status") != "completed"):
+                planned_package_id = (
+                    str(package_run_id)
+                    if (not requested_package_id and package_run_id)
+                    else f"pkg_{uuid.uuid4().hex[:12]}"
+                )
+                update_job_progress(
                     {"stage": "package", "phase": "queued", "current": 0, "total": 0, "label": "package queued"},
                     package_id=planned_package_id,
                 )
@@ -351,6 +606,7 @@ class DailyJobWorker:
                     run_id=planned_package_id,
                     progress_callback=progress_callback,
                     cancel_check=check_cancel,
+                    job_owner=job_owner,
                 )
             if package.get("status") != "completed":
                 if package.get("status") == "canceled":
@@ -360,8 +616,7 @@ class DailyJobWorker:
             planned_summary_id = str(job.get("summary_run_id") or f"sum_{uuid.uuid4().hex[:12]}")
             summary = self.store.get_daily_summary_run(planned_summary_id)
             if summary is None or summary.get("status") != "completed":
-                write_job(
-                    "running",
+                update_job_progress(
                     {
                         "stage": "summary",
                         "phase": "queued",
@@ -383,9 +638,7 @@ class DailyJobWorker:
                     progress_callback=progress_callback,
                     cancel_check=check_cancel,
                     process_callback=process_callback,
-                    telegram_runtime=self.telegram_runtime,
-                    defer_delivery=True,
-                    job_id=job_id,
+                    job_owner=job_owner,
                 )
             if summary.get("status") != "completed":
                 if summary.get("status") == "canceled":
@@ -414,6 +667,7 @@ class DailyJobWorker:
                     scheduled = self.store.schedule_daily_summary_job_retry(
                         job_id,
                         self.worker_id,
+                        attempt,
                         retry_at=retry_at,
                         max_retries=max_retries,
                         progress_label=str(retry_progress["label"]),
@@ -425,11 +679,12 @@ class DailyJobWorker:
                         return
                     if self.store.daily_summary_job_cancel_requested(job_id):
                         raise DailyJobCancelled("canceled")
+                    raise DailyJobLeaseLost(f"lost lease for job {job_id}")
                 raise RuntimeError(summary.get("error") or "Daily summary did not complete")
             check_cancel()
             self._drain_summary_delivery(str(summary["run_id"]), cancel_check=check_cancel)
             check_cancel()
-            write_job(
+            completed = finish_job(
                 "completed",
                 {
                     "stage": "summary",
@@ -443,32 +698,35 @@ class DailyJobWorker:
                 },
                 package_id=str(package["run_id"]),
                 summary_id=str(summary["run_id"]),
-                finished_at=utc_now_iso(),
             )
+            if not completed and self.store.daily_summary_job_cancel_requested(job_id):
+                raise DailyJobCancelled("canceled")
+        except DailyJobLeaseLost:
+            LOGGER.warning("Daily job %s attempt %s lost its lease; stopping stale worker", job_id, attempt)
         except DailyJobInterrupted:
-            self.store.requeue_daily_summary_job(job_id, self.worker_id, now=utc_now_iso())
+            self.store.requeue_daily_summary_job(job_id, self.worker_id, attempt, now=utc_now_iso())
         except DailyJobCancelled as exc:
-            self.store.discard_unsent_delivery_outbox(job_id=job_id)
             current = self.store.get_daily_summary_job(job_id) or {}
-            write_job(
+            finish_job(
                 "canceled",
                 {**(current.get("progress") or {}), "phase": "canceled", "label": "canceled"},
                 package_id=str((package or {}).get("run_id") or package_run_id or "") or None,
                 summary_id=str((summary or {}).get("run_id") or "") or None,
                 error=str(exc) or "canceled",
-                finished_at=utc_now_iso(),
+                discard_unsent_outbox=True,
             )
         except Exception as exc:
             current = self.store.get_daily_summary_job(job_id) or {}
-            write_job(
+            finish_job(
                 "failed",
                 {**(current.get("progress") or {}), "phase": "failed", "label": "failed"},
                 package_id=str((package or {}).get("run_id") or package_run_id or "") or None,
                 summary_id=str((summary or {}).get("run_id") or "") or None,
                 error=str(exc),
-                finished_at=utc_now_iso(),
             )
         finally:
+            heartbeat_stop.set()
+            heartbeat_thread.join(timeout=5.0)
             with self._process_lock:
                 self._current_process = None
                 self._current_job_id = None
@@ -483,13 +741,40 @@ class DailyJobWorker:
         *,
         cancel_check: Callable[[], None] | None = None,
     ) -> None:
-        while not self._stop_event.is_set():
-            if cancel_check:
-                cancel_check()
-            if not self._deliver_pending_once(summary_run_id=summary_run_id):
-                return
+        if self.telegram_runtime is not None:
+            while not self._stop_event.is_set():
+                if cancel_check:
+                    cancel_check()
+                if not self._deliver_pending_once(summary_run_id=summary_run_id):
+                    return
+            return
 
-    def _deliver_pending_once(self, summary_run_id: str | None = None) -> bool:
+        if self._standalone_delivery_factory is None:
+            return
+        pending = [
+            item
+            for item in self.store.list_delivery_outbox(summary_run_id=summary_run_id)
+            if item.get("status") in {"pending", "retry", "sending"}
+        ]
+        if not pending:
+            return
+        account_ids = {str(item["account_id"]) for item in pending if item.get("account_id")}
+        with self._standalone_delivery_factory(self.config, self.store, account_ids) as runtime:
+            while not self._stop_event.is_set():
+                if cancel_check:
+                    cancel_check()
+                if not self._deliver_pending_once(summary_run_id=summary_run_id, telegram_runtime=runtime):
+                    return
+
+    def _deliver_pending_once(
+        self,
+        summary_run_id: str | None = None,
+        *,
+        telegram_runtime: Any | None = None,
+    ) -> bool:
+        runtime = telegram_runtime if telegram_runtime is not None else self.telegram_runtime
+        if runtime is None:
+            return False
         now_dt = datetime.now(timezone.utc)
         item = self.store.claim_delivery_outbox(
             now=now_dt.isoformat(),
@@ -498,6 +783,7 @@ class DailyJobWorker:
         )
         if item is None:
             return False
+        attempts = int(item.get("attempts") or 1)
         delivery = DailyDeliveryConfig(
             enabled=True,
             account_id=str(item["account_id"]),
@@ -505,77 +791,47 @@ class DailyJobWorker:
             topic_id=int(item.get("topic_id") or 0),
         )
         try:
-            if self.telegram_runtime is not None:
-                result = self.telegram_runtime.call(
-                    delivery.account_id,
-                    "deliver_chunk",
-                    cancel_event=self._stop_event,
-                    delivery=delivery,
-                    content=str(item["content"]),
-                )
-            else:
-                from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
-
-                account = resolve_account_config(self.config, self.store, delivery.account_id)
-                result = self._run_delivery_coroutine(
-                    TelegramSummaryDeliveryService(account, self.store).send_summary(
-                        delivery,
-                        str(item["content"]),
-                        split_content=False,
-                    )
-                )
+            result = runtime.call(
+                delivery.account_id,
+                "deliver_chunk",
+                cancel_event=self._stop_event,
+                delivery=delivery,
+                content=str(item["content"]),
+            )
             message_ids = list(result.get("message_ids") or [])
             self.store.complete_delivery_outbox(
                 str(item["outbox_id"]),
                 message_id=int(message_ids[0]) if message_ids else None,
                 now=utc_now_iso(),
+                expected_attempt=attempts,
             )
             return True
         except Exception as exc:
-            attempts = int(item.get("attempts") or 1)
+            if self._stop_event.is_set():
+                self.store.release_delivery_outbox(
+                    str(item["outbox_id"]),
+                    error=str(exc),
+                    now=utc_now_iso(),
+                    expected_attempt=attempts,
+                )
+                return False
+            if attempts >= DELIVERY_MAX_ATTEMPTS:
+                self.store.fail_delivery_outbox(
+                    str(item["outbox_id"]),
+                    error=str(exc),
+                    now=utc_now_iso(),
+                    expected_attempt=attempts,
+                )
+                return False
             retry_at = datetime.now(timezone.utc) + timedelta(seconds=min(300, 2 ** min(attempts, 8)))
             self.store.retry_delivery_outbox(
                 str(item["outbox_id"]),
                 error=str(exc),
                 next_attempt_at=retry_at.isoformat(),
                 now=utc_now_iso(),
+                expected_attempt=attempts,
             )
             return False
-
-    def _run_delivery_coroutine(self, coroutine: Any) -> dict[str, Any]:
-        loop = asyncio.new_event_loop()
-        task = loop.create_task(coroutine)
-        with self._process_lock:
-            self._current_delivery_loop = loop
-            self._current_delivery_task = task
-        if self._stop_event.is_set():
-            task.cancel()
-        try:
-            return loop.run_until_complete(task)
-        except asyncio.CancelledError as exc:
-            raise DailyJobWorkerStopping("delivery interrupted") from exc
-        finally:
-            with self._process_lock:
-                if self._current_delivery_task is task:
-                    self._current_delivery_task = None
-                    self._current_delivery_loop = None
-            try:
-                loop.run_until_complete(loop.shutdown_asyncgens())
-            finally:
-                loop.close()
-
-    def _cancel_current_delivery(self, *, job_id: str | None = None) -> None:
-        with self._process_lock:
-            if job_id is not None and self._current_job_id != job_id:
-                return
-            loop = self._current_delivery_loop
-            task = self._current_delivery_task
-        if loop is None or task is None or task.done():
-            return
-        try:
-            loop.call_soon_threadsafe(task.cancel)
-        except RuntimeError:
-            pass
 
 
 def _is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:

@@ -71,8 +71,8 @@ class LocalLifecycleTest(unittest.IsolatedAsyncioTestCase):
             events.append("worker-stop-acknowledged")
 
         class FakeRuntime:
-            def __init__(self, config: object, store: object) -> None:
-                events.append("runtime-created")
+            def __init__(self, config: object, store: object, *, ingest: bool = True) -> None:
+                events.append(f"runtime-created:ingest={ingest}")
 
             async def start(self) -> None:
                 events.append("runtime-started")
@@ -109,7 +109,7 @@ class LocalLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             events,
             [
-                "runtime-created",
+                "runtime-created:ingest=True",
                 "runtime-started",
                 "worker-created",
                 "worker-started",
@@ -124,7 +124,7 @@ class LocalLifecycleTest(unittest.IsolatedAsyncioTestCase):
         never_stopped = asyncio.Event()
 
         class FakeRuntime:
-            def __init__(self, config: object, store: object) -> None:
+            def __init__(self, config: object, store: object, *, ingest: bool = True) -> None:
                 pass
 
             async def start(self) -> None:
@@ -179,6 +179,214 @@ class LocalLifecycleTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("api-created", events)
         self.assertIn("api-started", events)
         self.assertEqual(events[-3:], ["api-stopped", "worker-stopped", "runtime-stopped"])
+
+    async def test_serve_api_runs_core_without_ingestion(self) -> None:
+        from tele_mess_core.cli import _run_core
+
+        observed_ingest: list[bool] = []
+        never_stopped = asyncio.Event()
+
+        class FakeRuntime:
+            def __init__(self, config: object, store: object, *, ingest: bool = True) -> None:
+                observed_ingest.append(ingest)
+
+            async def start(self) -> None:
+                return None
+
+            async def stop(self) -> None:
+                return None
+
+        class FakeWorker:
+            def __init__(self, store: object, config: object, *, telegram_runtime: object) -> None:
+                pass
+
+            def start(self) -> None:
+                return None
+
+            def stop(self) -> None:
+                return None
+
+        class FakeApi:
+            def __init__(self, *args: object, **kwargs: object) -> None:
+                pass
+
+            def start_background(self) -> None:
+                return None
+
+            async def wait_stopped(self) -> None:
+                await never_stopped.wait()
+
+            def stop(self) -> None:
+                return None
+
+        def stop_immediately(event: asyncio.Event) -> None:
+            event.set()
+
+        with (
+            patch("tele_mess_core.telegram.manager.TelegramRuntimeManager", FakeRuntime),
+            patch("tele_mess_core.daily_jobs.DailyJobWorker", FakeWorker),
+            patch("tele_mess_core.cli.SyncApiServer", FakeApi),
+            patch("tele_mess_core.cli._install_stop_handlers", stop_immediately),
+        ):
+            config = SimpleNamespace(
+                server=SimpleNamespace(
+                    host="127.0.0.1",
+                    port=8765,
+                    token="",
+                    mcp_token="",
+                    allow_unauthenticated_localhost=True,
+                )
+            )
+            await _run_core(config, object(), web=True, ingest=False)  # type: ignore[arg-type]
+
+        self.assertEqual(observed_ingest, [False])
+
+    async def test_smoke_telegram_fails_fast_when_offline(self) -> None:
+        from tele_mess_core.archive import ArchiveStore
+        from tele_mess_core.cli import _smoke_telegram
+        from tele_mess_core.config import AppConfig, LoggingConfig, ServerConfig, StorageConfig, TelegramAccountConfig, TelegramConfig
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        class OfflineClient:
+            async def connect(self) -> None:
+                raise ConnectionError("offline")
+
+            async def disconnect(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ArchiveStore(root / "archive.db")
+            store.initialize()
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=root / "archive.db"),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            stdout = io.StringIO()
+            original_init = TelegramRuntimeManager.__init__
+
+            def fast_init(self_rt, *args, **kwargs):
+                kwargs["client_factory"] = lambda _cfg: OfflineClient()
+                kwargs["connect_wait_seconds"] = 0.5
+                original_init(self_rt, *args, **kwargs)
+
+            try:
+                with patch.object(TelegramRuntimeManager, "__init__", fast_init), redirect_stdout(stdout):
+                    code = await _smoke_telegram(config, store, "main", False, 20)
+            finally:
+                store.close()
+
+            self.assertEqual(code, 1)
+            payload = json.loads(stdout.getvalue())
+            self.assertFalse(payload["status"]["authorized"])
+            self.assertEqual(payload["status"]["error"]["code"], "auth_status_failed")
+
+
+class DailyCliExecutionTest(unittest.TestCase):
+    def _config_file(self, root: Path) -> Path:
+        config_path = root / "config.yml"
+        config_path.write_text(
+            f"""
+storage:
+  data_dir: {root / 'data'}
+  database: {root / 'data' / 'archive.db'}
+telegram:
+  accounts:
+    - account_id: main
+      api_id: 1
+      api_hash: hash
+      session_name: main
+      session_dir: {root / 'data' / 'sessions'}
+server:
+  token: secret
+logging:
+  file: null
+daily:
+  output_dir: {root / 'data' / 'daily-packages'}
+  ai:
+    provider: disabled
+""",
+            encoding="utf-8",
+        )
+        return config_path
+
+    def test_daily_run_runs_only_its_own_job_when_no_service_is_running(self) -> None:
+        from tele_mess_core.archive import ArchiveStore
+        from tele_mess_core.daily_jobs import enqueue_daily_summary_job
+        from tele_mess_core.config import load_config
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._config_file(root)
+            config = load_config(config_path)
+            store = ArchiveStore(config.storage.database)
+            store.initialize()
+            try:
+                earlier = enqueue_daily_summary_job(store, config, run_date="2026-07-02", timezone_name="UTC")
+            finally:
+                store.close()
+
+            stdout = io.StringIO()
+            with redirect_stdout(stdout):
+                code = main(["--config", str(config_path), "daily-run", "--date", "2026-07-03", "--timezone", "UTC"])
+
+            self.assertEqual(code, 0)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["status"], "completed")
+            self.assertNotEqual(payload["job_id"], earlier["job_id"])
+
+            store = ArchiveStore(config.storage.database)
+            try:
+                earlier_after = store.get_daily_summary_job(earlier["job_id"])
+                assert earlier_after is not None
+                self.assertEqual(earlier_after["status"], "queued")
+            finally:
+                store.close()
+
+    def test_daily_run_waits_for_running_service_when_worker_lock_is_held(self) -> None:
+        from tele_mess_core.archive import ArchiveStore
+        from tele_mess_core.config import load_config
+        from tele_mess_core.daily_jobs import DailyJobWorker
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._config_file(root)
+            config = load_config(config_path)
+            store = ArchiveStore(config.storage.database)
+            store.initialize()
+            worker = DailyJobWorker(store, config, poll_interval=0.05, worker_id="service-worker")
+            worker.start()
+            try:
+                # Wait until the service worker acquires the process lock.
+                lock_path = config.storage.data_dir / ".daily-worker.lock"
+                for _ in range(50):
+                    if lock_path.exists() and "service-worker" in lock_path.read_text(encoding="utf-8"):
+                        break
+                    import time
+                    time.sleep(0.02)
+
+                stdout = io.StringIO()
+                with redirect_stdout(stdout):
+                    code = main(["--config", str(config_path), "daily-run", "--date", "2026-07-03", "--timezone", "UTC"])
+
+                self.assertEqual(code, 0)
+                payload = json.loads(stdout.getvalue())
+                self.assertEqual(payload["status"], "completed")
+                job = store.get_daily_summary_job(payload["job_id"])
+                assert job is not None
+                self.assertEqual(job["worker_id"], "service-worker")
+            finally:
+                worker.stop()
+                store.close()
 
 
 if __name__ == "__main__":

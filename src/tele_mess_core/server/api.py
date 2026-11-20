@@ -443,13 +443,13 @@ class SyncApiServer:
                     )
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth/status" and method == "POST":
-                    item = _auth_status(config, store, payload, telegram_runtime)
+                    item = _auth_status(payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth/request-code" and method == "POST":
-                    item = _request_auth_code(config, store, payload, telegram_runtime)
+                    item = _request_auth_code(payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/accounts/auth/submit-code" and method == "POST":
-                    item = _submit_auth_code(config, store, payload, telegram_runtime)
+                    item = _submit_auth_code(payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/origins" and method == "POST":
                     item = _create_origin(store, payload)
@@ -481,10 +481,10 @@ class SyncApiServer:
                     item = _delete_origin(store, payload)
                     self._json({"item": item})
                 elif path == "/manage/discover-origins" and method == "POST":
-                    item = _discover_origins(config, store, payload, telegram_runtime)
+                    item = _discover_origins(payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/participants/refresh" and method == "POST":
-                    item = _refresh_participants(config, store, payload, telegram_runtime)
+                    item = _refresh_participants(payload, telegram_runtime)
                     self._json({"item": item})
                 elif path == "/manage/operation-events" and method == "DELETE":
                     item = _delete_operation_events(store, payload)
@@ -499,7 +499,7 @@ class SyncApiServer:
                     item = _create_daily_package(config, store, payload)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
                 elif path == "/manage/daily-summaries" and method == "POST":
-                    item = _create_daily_summary(config, store, payload, telegram_runtime, daily_worker)
+                    item = _create_daily_summary(config, store, payload, daily_worker)
                     self._json({"item": item}, status=HTTPStatus.CREATED)
                 elif path == "/manage/daily-summary-jobs" and method == "POST":
                     item = _create_daily_summary_job(config, store, payload, daily_worker)
@@ -1195,40 +1195,32 @@ def _telegram_account_id(payload: dict[str, Any]) -> str:
     return _required_str(payload, "account_id")
 
 
+def _require_telegram_runtime(
+    telegram_runtime: "TelegramRuntimeManager | None",
+) -> "TelegramRuntimeManager":
+    if telegram_runtime is None:
+        raise ValueError("Telegram runtime is required for live Telegram management actions")
+    return telegram_runtime
+
+
 def _auth_status(
-    config: "AppConfig | None",
-    store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
     account_id = _telegram_account_id(payload)
-    if telegram_runtime is not None:
-        return telegram_runtime.call(account_id, "auth_status")
-    account = _account_config(config, store, account_id)
-    from tele_mess_core.telegram.auth import TelegramAuthService
-
-    return asyncio.run(TelegramAuthService(account, store).status())
+    return _require_telegram_runtime(telegram_runtime).call(account_id, "auth_status")
 
 
 def _request_auth_code(
-    config: "AppConfig | None",
-    store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
     account_id = _telegram_account_id(payload)
     phone = _required_str(payload, "phone")
-    if telegram_runtime is not None:
-        return telegram_runtime.call(account_id, "request_code", phone=phone)
-    account = _account_config(config, store, account_id)
-    from tele_mess_core.telegram.auth import TelegramAuthService
-
-    return asyncio.run(TelegramAuthService(account, store).request_code(phone))
+    return _require_telegram_runtime(telegram_runtime).call(account_id, "request_code", phone=phone)
 
 
 def _submit_auth_code(
-    config: "AppConfig | None",
-    store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
@@ -1236,17 +1228,16 @@ def _submit_auth_code(
     phone = _required_str(payload, "phone")
     code = _required_str(payload, "code")
     password = _optional_payload_str(payload, "password")
-    if telegram_runtime is not None:
-        return telegram_runtime.call(account_id, "submit_code", phone=phone, code=code, password=password)
-    account = _account_config(config, store, account_id)
-    from tele_mess_core.telegram.auth import TelegramAuthService
-
-    return asyncio.run(TelegramAuthService(account, store).submit_code(phone, code, password))
+    return _require_telegram_runtime(telegram_runtime).call(
+        account_id,
+        "submit_code",
+        phone=phone,
+        code=code,
+        password=password,
+    )
 
 
 def _discover_origins(
-    config: "AppConfig | None",
-    store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
@@ -1254,46 +1245,28 @@ def _discover_origins(
     include_topics = _payload_bool(payload, "include_topics", True)
     include_private = _payload_bool(payload, "include_private", False)
     topic_limit = _payload_int(payload, "topic_limit", 100)
-    if telegram_runtime is not None:
-        return telegram_runtime.call(
-            account_id,
-            "discover_origins",
-            include_topics=include_topics,
-            topic_limit=topic_limit,
-            include_private=include_private,
-        )
-    account = _account_config(config, store, account_id)
-    from tele_mess_core.telegram.discovery import TelegramDiscoveryService
-
-    return asyncio.run(
-        TelegramDiscoveryService(account, store).discover_origins(
-            include_topics=include_topics,
-            topic_limit=topic_limit,
-            include_private=include_private,
-        )
+    return _require_telegram_runtime(telegram_runtime).call(
+        account_id,
+        "discover_origins",
+        include_topics=include_topics,
+        topic_limit=topic_limit,
+        include_private=include_private,
     )
 
 
 def _refresh_participants(
-    config: "AppConfig | None",
-    store: ArchiveStore,
     payload: dict[str, Any],
     telegram_runtime: "TelegramRuntimeManager | None" = None,
 ) -> dict[str, Any]:
     account_id = _telegram_account_id(payload)
     origin_id = _required_int(payload, "origin_id")
     limit = _payload_int(payload, "limit", 500)
-    if telegram_runtime is not None:
-        return telegram_runtime.call(
-            account_id,
-            "refresh_participants",
-            origin_id=origin_id,
-            limit=limit,
-        )
-    account = _account_config(config, store, account_id)
-    from tele_mess_core.telegram.discovery import TelegramDiscoveryService
-
-    return asyncio.run(TelegramDiscoveryService(account, store).refresh_participants(origin_id, limit))
+    return _require_telegram_runtime(telegram_runtime).call(
+        account_id,
+        "refresh_participants",
+        origin_id=origin_id,
+        limit=limit,
+    )
 
 
 def _update_daily_package_schedule(
@@ -1368,49 +1341,20 @@ def _create_daily_summary(
     config: "AppConfig | None",
     store: ArchiveStore,
     payload: dict[str, Any],
-    telegram_runtime: "TelegramRuntimeManager | None" = None,
     daily_worker: "DailyJobWorker | None" = None,
 ) -> dict[str, Any]:
-    if config is None:
-        raise ValueError("Server config is required for daily summary runs")
-    from tele_mess_core.daily import run_daily_summary
-
-    scope = _daily_scope(payload)
-    if daily_worker is not None:
-        job = daily_worker.enqueue(
-            package_run_id=_optional_payload_str(payload, "package_run_id"),
-            run_date=_optional_payload_str(payload, "date"),
-            timezone_name=_optional_payload_str(payload, "timezone"),
-            scope=scope,
-            force=_payload_bool(payload, "force", False),
-        )
-        if _payload_bool(payload, "background", True):
-            return job
-        terminal = daily_worker.wait_for_terminal(
-            str(job["job_id"]),
-            timeout=max(300, config.daily.ai.timeout_seconds * 20),
-        )
-        if terminal.get("summary_run_id"):
-            summary = store.get_daily_summary_run(str(terminal["summary_run_id"]))
-            if summary is not None:
-                return summary
-        return terminal
+    job = _create_daily_summary_job(config, store, payload, daily_worker)
     if _payload_bool(payload, "background", True):
-        return _create_daily_summary_job(
-            config,
-            store,
-            payload,
-            daily_worker=daily_worker,
-        )
-    return run_daily_summary(
-        store,
-        config,
-        package_run_id=_optional_payload_str(payload, "package_run_id"),
-        run_date=_optional_payload_str(payload, "date"),
-        timezone_name=_optional_payload_str(payload, "timezone"),
-        scope=scope,
-        telegram_runtime=telegram_runtime,
-    )
+        return job
+    from tele_mess_core.daily_jobs import wait_for_daily_summary_job
+
+    timeout = max(300, config.daily.ai.timeout_seconds * 20) if config is not None else 300
+    terminal = wait_for_daily_summary_job(store, str(job["job_id"]), timeout=timeout)
+    if terminal.get("summary_run_id"):
+        summary = store.get_daily_summary_run(str(terminal["summary_run_id"]))
+        if summary is not None:
+            return summary
+    return terminal
 
 
 def _create_daily_summary_job(

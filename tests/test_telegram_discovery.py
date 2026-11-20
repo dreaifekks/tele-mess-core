@@ -79,13 +79,6 @@ class FakeClient:
 
 
 class FakeDiscoveryService(TelegramDiscoveryService):
-    def __init__(self, config, store):
-        super().__init__(config, store)
-        self.fake_client = FakeClient()
-
-    async def _connected_client(self):
-        return self.fake_client
-
     def _forum_topics_request(self, functions, entity, offset_id, offset_topic, limit):
         return SimpleNamespace(offset_id=offset_id, offset_topic=offset_topic, limit=limit)
 
@@ -107,6 +100,7 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
             api_hash="hash",
             session_name="main",
         )
+        self.client = FakeClient()
         self.service = FakeDiscoveryService(self.config, self.store)
 
     def tearDown(self) -> None:
@@ -114,7 +108,7 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.tmp.cleanup()
 
     async def test_discover_origins_and_refresh_participants(self) -> None:
-        result = await self.service.discover_origins(include_topics=True, topic_limit=10)
+        result = await self.service.discover_origins(include_topics=True, topic_limit=10, client=self.client)
         self.assertTrue(result["authorized"])
         self.assertEqual(result["status"], "ok")
         self.assertEqual(result["origins"], 2)
@@ -130,14 +124,14 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(topics), 2)
         self.assertEqual(next(item for item in topics if item["topic_id"] == 10)["last_message_at"], "2026-01-04T03:04:05+00:00")
 
-        refresh = await self.service.refresh_participants(-1001)
+        refresh = await self.service.refresh_participants(-1001, client=self.client)
         self.assertEqual(refresh["participants"], 1)
         self.assertEqual(refresh["status"], "ok")
         participants = self.store.list_participants(account_id="main", origin_id=-1001)
         self.assertEqual(participants[0]["username"], "alice")
 
     async def test_discover_topics_respects_limit_and_reports_truncation(self) -> None:
-        result = await self.service.discover_origins(include_topics=True, topic_limit=1)
+        result = await self.service.discover_origins(include_topics=True, topic_limit=1, client=self.client)
 
         self.assertEqual(result["topics"], 1)
         self.assertTrue(result["topics_truncated"])
@@ -145,7 +139,7 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(topics), 1)
 
     async def test_discover_origins_can_include_private_when_explicit(self) -> None:
-        result = await self.service.discover_origins(include_topics=False, include_private=True)
+        result = await self.service.discover_origins(include_topics=False, include_private=True, client=self.client)
 
         self.assertEqual(result["origins"], 3)
         self.assertEqual(result["private_skipped"], 0)
@@ -153,9 +147,7 @@ class TelegramDiscoveryTest(unittest.IsolatedAsyncioTestCase):
         self.assertIn("private", {item["origin_type"] for item in origins})
 
     async def test_refresh_participants_records_access_error(self) -> None:
-        self.service.fake_client = FailingParticipantClient()
-
-        result = await self.service.refresh_participants(-1001)
+        result = await self.service.refresh_participants(-1001, client=FailingParticipantClient())
 
         self.assertEqual(result["status"], "failed")
         self.assertEqual(result["participants"], 0)

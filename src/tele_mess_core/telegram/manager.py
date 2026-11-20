@@ -34,16 +34,24 @@ class TelegramAccountRuntime:
         store: ArchiveStore,
         *,
         client_factory: ClientFactory,
+        ingest: bool = True,
+        connect_wait_seconds: float = 5.0,
     ) -> None:
         self.config = config
         self.app_config = app_config
         self.store = store
         self.client_factory = client_factory
+        self.ingest = ingest
+        self._connect_wait_seconds = max(0.0, float(connect_wait_seconds))
         self.logger = logging.getLogger(__name__)
         self.client: Any | None = None
         self._command_lock = asyncio.Lock()
         self._ready = asyncio.Event()
+        self._attempt_cv = asyncio.Condition()
+        self._attempt_seq = 0
+        self._reconnect_now = asyncio.Event()
         self._stopping = asyncio.Event()
+        self._last_connect_error: Exception | None = None
         self._supervisor_task: asyncio.Task[None] | None = None
         self._ingest_task: asyncio.Task[None] | None = None
         self._ingest_retry_task: asyncio.Task[None] | None = None
@@ -61,6 +69,8 @@ class TelegramAccountRuntime:
 
     async def stop(self) -> None:
         self._stopping.set()
+        self._reconnect_now.set()
+        await self._notify_attempt()
         await self._stop_ingestion()
         client = self.client
         if client is not None:
@@ -76,11 +86,13 @@ class TelegramAccountRuntime:
         self._ready.clear()
 
     async def execute(self, operation: str, **kwargs: Any) -> dict[str, Any]:
-        await self._ready.wait()
+        if operation == "refresh_capture" and not self.ingest:
+            return {"account_id": self.config.account_id, "status": "ingest_disabled"}
+        await self._wait_for_connection()
         async with self._command_lock:
             client = self.client
-            if client is None:
-                raise RuntimeError(f"Telegram account {self.config.account_id} is not connected")
+            if client is None or not self._ready.is_set():
+                return self._offline_result(operation, **kwargs)
             if operation == "auth_status":
                 result = await TelegramAuthService(self.config, self.store).status(client=client)
                 if result.get("authorized"):
@@ -114,18 +126,11 @@ class TelegramAccountRuntime:
                     int(kwargs.get("limit", 500)),
                     client=client,
                 )
-            if operation == "deliver_summary":
-                return await TelegramSummaryDeliveryService(self.config, self.store).send_summary(
-                    kwargs["delivery"],
-                    str(kwargs.get("content") or ""),
-                    client=client,
-                )
             if operation == "deliver_chunk":
-                return await TelegramSummaryDeliveryService(self.config, self.store).send_summary(
+                return await TelegramSummaryDeliveryService(self.config, self.store).send_chunk(
                     kwargs["delivery"],
                     str(kwargs.get("content") or ""),
                     client=client,
-                    split_content=False,
                 )
             if operation == "refresh_capture":
                 if not await client.is_user_authorized():
@@ -140,6 +145,65 @@ class TelegramAccountRuntime:
                 return {"account_id": self.config.account_id, "status": "refreshed"}
             raise ValueError(f"Unknown Telegram runtime operation: {operation}")
 
+    async def _notify_attempt(self) -> None:
+        async with self._attempt_cv:
+            self._attempt_seq += 1
+            self._attempt_cv.notify_all()
+
+    async def _wait_for_connection(self) -> None:
+        if self._ready.is_set() or self._stopping.is_set():
+            return
+        if self._connect_wait_seconds <= 0:
+            self._reconnect_now.set()
+            return
+        async with self._attempt_cv:
+            if self._ready.is_set() or self._stopping.is_set():
+                return
+            seen = self._attempt_seq
+            if seen > 0:
+                self._reconnect_now.set()
+            try:
+                await asyncio.wait_for(
+                    self._attempt_cv.wait_for(
+                        lambda: self._ready.is_set() or self._stopping.is_set() or self._attempt_seq > seen
+                    ),
+                    timeout=self._connect_wait_seconds,
+                )
+            except TimeoutError:
+                pass
+
+    def _offline_result(self, operation: str, **kwargs: Any) -> dict[str, Any]:
+        exc = self._last_connect_error or ConnectionError(
+            f"Telegram account {self.config.account_id} is not connected"
+        )
+        if operation == "auth_status":
+            return TelegramAuthService(self.config, self.store).status_error_result(exc)
+        if operation == "request_code":
+            return TelegramAuthService(self.config, self.store).request_code_error_result(
+                str(kwargs["phone"]),
+                exc,
+            )
+        if operation == "submit_code":
+            return TelegramAuthService(self.config, self.store).submit_code_error_result(
+                str(kwargs["phone"]),
+                exc,
+            )
+        if operation == "discover_origins":
+            return TelegramDiscoveryService(self.config, self.store).discover_origins_error_result(exc)
+        if operation == "refresh_participants":
+            return TelegramDiscoveryService(self.config, self.store).refresh_participants_error_result(
+                int(kwargs["origin_id"]),
+                exc,
+            )
+        if operation == "deliver_chunk":
+            raise TelegramSummaryDeliveryService(self.config, self.store).record_delivery_error(
+                kwargs["delivery"],
+                exc,
+            ) from exc
+        if operation == "refresh_capture":
+            return {"account_id": self.config.account_id, "status": "offline"}
+        raise ValueError(f"Unknown Telegram runtime operation: {operation}")
+
     def status(self) -> dict[str, Any]:
         supervisor = self._supervisor_task
         return {
@@ -151,53 +215,72 @@ class TelegramAccountRuntime:
 
     async def _supervise_connection(self) -> None:
         delay = CONNECTION_RETRY_INITIAL_SECONDS
-        while not self._stopping.is_set():
-            client = None
-            try:
-                client = self.client_factory(self.config)
-                if inspect.isawaitable(client):
-                    client = await client
-                if callable(getattr(client, "on", None)):
-                    self._prepare_ingestion(client)
-                await client.connect()
-                self.client = client
-                self._ready.set()
-                delay = CONNECTION_RETRY_INITIAL_SECONDS
-                authorized = await client.is_user_authorized()
-                self._record_auth_state("authorized" if authorized else "needs_login")
-                if authorized:
-                    self._schedule_ingestion(client)
-                disconnected = getattr(client, "disconnected", None)
-                if inspect.isawaitable(disconnected):
-                    await disconnected
-                else:
-                    await self._stopping.wait()
-                if not self._stopping.is_set():
-                    raise RuntimeError("Telegram client disconnected")
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                self._record_runtime_failure(exc)
-                if self._stopping.is_set():
-                    break
+        try:
+            while not self._stopping.is_set():
+                client = None
                 try:
-                    await asyncio.wait_for(self._stopping.wait(), timeout=delay)
-                except TimeoutError:
-                    pass
-                delay = min(delay * 2, 60.0)
-            finally:
-                self._ready.clear()
-                try:
-                    await self._stop_ingestion()
+                    client = self.client_factory(self.config)
+                    if inspect.isawaitable(client):
+                        client = await client
+                    if self.ingest and callable(getattr(client, "on", None)):
+                        self._prepare_ingestion(client)
+                    await client.connect()
+                    self.client = client
+                    self._last_connect_error = None
+                    self._ready.set()
+                    await self._notify_attempt()
+                    delay = CONNECTION_RETRY_INITIAL_SECONDS
+                    authorized = await client.is_user_authorized()
+                    self._record_auth_state("authorized" if authorized else "needs_login")
+                    if authorized:
+                        self._schedule_ingestion(client)
+                    disconnected = getattr(client, "disconnected", None)
+                    if inspect.isawaitable(disconnected):
+                        await disconnected
+                    else:
+                        await self._stopping.wait()
+                    if not self._stopping.is_set():
+                        raise RuntimeError("Telegram client disconnected")
+                except asyncio.CancelledError:
+                    raise
                 except Exception as exc:
-                    self._record_runtime_failure(exc, operation="ingest_stop")
-                if client is not None:
+                    self._last_connect_error = exc
+                    await self._notify_attempt()
+                    self._record_runtime_failure(exc)
+                    if self._stopping.is_set():
+                        break
+                    await self._wait_retry_delay(delay)
+                    delay = min(delay * 2, 60.0)
+                finally:
+                    self._ready.clear()
                     try:
-                        await client.disconnect()
-                    except Exception:
-                        self.logger.debug("Telegram client disconnect cleanup failed", exc_info=True)
-                if self.client is client:
-                    self.client = None
+                        await self._stop_ingestion()
+                    except Exception as exc:
+                        self._record_runtime_failure(exc, operation="ingest_stop")
+                    if client is not None:
+                        try:
+                            await client.disconnect()
+                        except Exception:
+                            self.logger.debug("Telegram client disconnect cleanup failed", exc_info=True)
+                    if self.client is client:
+                        self.client = None
+        finally:
+            await self._notify_attempt()
+
+    async def _wait_retry_delay(self, delay: float) -> None:
+        stop_task = asyncio.create_task(self._stopping.wait())
+        reconnect_task = asyncio.create_task(self._reconnect_now.wait())
+        try:
+            _, pending = await asyncio.wait(
+                {stop_task, reconnect_task},
+                timeout=delay,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        finally:
+            self._reconnect_now.clear()
 
     def _prepare_ingestion(self, client: Any) -> TelegramArchiveService:
         if self._ingest_service is not None:
@@ -215,7 +298,7 @@ class TelegramAccountRuntime:
         return service
 
     def _schedule_ingestion(self, client: Any) -> None:
-        if self._ingest_task is not None:
+        if not self.ingest or self._ingest_task is not None:
             return
         retry_task = self._ingest_retry_task
         if retry_task is not None and not retry_task.done():
@@ -338,11 +421,18 @@ class TelegramRuntimeManager:
         *,
         client_factory: ClientFactory | None = None,
         call_timeout: float = 300.0,
+        ingest: bool = True,
+        connect_wait_seconds: float = 5.0,
+        account_ids: set[str] | None = None,
     ) -> None:
+        """Run one client per account; with ingest=False the clients serve commands without archiving."""
         self.config = config
         self.store = store
         self.client_factory = client_factory or _default_client_factory
         self.call_timeout = call_timeout
+        self.ingest = ingest
+        self.connect_wait_seconds = max(0.0, float(connect_wait_seconds))
+        self._account_ids = set(account_ids) if account_ids is not None else None
         self.logger = logging.getLogger(__name__)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
@@ -356,6 +446,8 @@ class TelegramRuntimeManager:
             if item.get("source") == SOURCE_TELEGRAM and item["account_id"] not in configs:
                 configs[item["account_id"]] = stored_account_config(self.config, item)
         for account in configs.values():
+            if self._account_ids is not None and account.account_id not in self._account_ids:
+                continue
             await self._register_account(account)
 
     async def stop(self) -> None:
@@ -424,6 +516,8 @@ class TelegramRuntimeManager:
             self.config,
             self.store,
             client_factory=self.client_factory,
+            ingest=self.ingest,
+            connect_wait_seconds=self.connect_wait_seconds,
         )
         self._runtimes[config.account_id] = runtime
         await runtime.start()

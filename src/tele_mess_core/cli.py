@@ -54,7 +54,12 @@ def main(argv: list[str] | None = None) -> int:
         )
 
     add_config_arg(sub.add_parser("init-db", help="Initialize the SQLite archive"))
-    add_config_arg(sub.add_parser("serve-api", help="Run HTTP API and durable daily worker without Telegram ingestion"))
+    add_config_arg(
+        sub.add_parser(
+            "serve-api",
+            help="Run HTTP API, durable daily worker, and Telegram clients without ingestion",
+        )
+    )
     add_config_arg(sub.add_parser("run-telegram", help="Run only Telegram ingestion"))
     add_config_arg(sub.add_parser("run-server", help="Run Telegram ingestion and sync API"))
     local_parser = sub.add_parser(
@@ -188,7 +193,7 @@ def main(argv: list[str] | None = None) -> int:
             logger.info("Initialized archive at %s", config.storage.database)
             return 0
         if args.command == "serve-api":
-            return _serve_api(config, store)
+            return _run_async(_run_core(config, store, web=True, ingest=False))
         if args.command == "run-telegram":
             return _run_async(_run_telegram(config, store))
         if args.command == "run-server":
@@ -296,31 +301,6 @@ def _paths_payload(
     return payload
 
 
-def _serve_api(config: AppConfig, store: ArchiveStore) -> int:
-    from tele_mess_core.daily_jobs import DailyJobWorker
-
-    daily_worker = DailyJobWorker(store, config)
-    api = SyncApiServer(
-        store,
-        config.server.host,
-        config.server.port,
-        config.server.token,
-        config,
-        allow_unauthenticated_localhost=config.server.allow_unauthenticated_localhost,
-        daily_worker=daily_worker,
-        mcp_token=config.server.mcp_token,
-    )
-    daily_worker.start()
-    try:
-        api.serve_forever()
-    except KeyboardInterrupt:
-        logging.getLogger(__name__).info("Stopping API server")
-    finally:
-        api.stop()
-        daily_worker.stop()
-    return 0
-
-
 def _sync_configured_accounts(store: ArchiveStore, config: AppConfig) -> None:
     now = utc_now_iso()
     existing = {
@@ -379,8 +359,7 @@ async def _smoke_telegram(
     discover_origins: bool,
     topic_limit: int,
 ) -> int:
-    from tele_mess_core.telegram.auth import TelegramAuthService
-    from tele_mess_core.telegram.discovery import TelegramDiscoveryService
+    from tele_mess_core.telegram.manager import TelegramRuntimeManager
 
     if not config.telegram.accounts:
         raise RuntimeError("No telegram.accounts configured")
@@ -391,18 +370,30 @@ async def _smoke_telegram(
             raise RuntimeError(f"Unknown account_id: {account_id}")
         account = matches[0]
 
-    status = await TelegramAuthService(account, store).status()
-    result: dict[str, object] = {
-        "account_id": account.account_id,
-        "session_name": account.session_name,
-        "session_dir": str(account.session_dir),
-        "status": status,
-    }
-    if discover_origins and status.get("authorized"):
-        result["discovery"] = await TelegramDiscoveryService(account, store).discover_origins(
-            include_topics=True,
-            topic_limit=topic_limit,
-        )
+    runtime = TelegramRuntimeManager(
+        config,
+        store,
+        ingest=False,
+        account_ids={account.account_id},
+    )
+    await runtime.start()
+    try:
+        status = await runtime.execute(account.account_id, "auth_status")
+        result: dict[str, object] = {
+            "account_id": account.account_id,
+            "session_name": account.session_name,
+            "session_dir": str(account.session_dir),
+            "status": status,
+        }
+        if discover_origins and status.get("authorized"):
+            result["discovery"] = await runtime.execute(
+                account.account_id,
+                "discover_origins",
+                include_topics=True,
+                topic_limit=topic_limit,
+            )
+    finally:
+        await runtime.stop()
     print(json.dumps(result, ensure_ascii=False, indent=2, default=str))
     return 0 if status.get("authorized") else 1
 
@@ -415,11 +406,11 @@ async def _run_local(config: AppConfig, store: ArchiveStore, *, web: bool = Fals
     await _run_core(config, store, web=web)
 
 
-async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool) -> None:
+async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool, ingest: bool = True) -> None:
     from tele_mess_core.daily_jobs import DailyJobWorker
     from tele_mess_core.telegram.manager import TelegramRuntimeManager
 
-    runtime = TelegramRuntimeManager(config, store)
+    runtime = TelegramRuntimeManager(config, store, ingest=ingest)
     daily_worker: DailyJobWorker | None = None
     api: SyncApiServer | None = None
     stop_event = asyncio.Event()
@@ -507,31 +498,38 @@ def _daily_package(config: AppConfig, store: ArchiveStore, args: argparse.Namesp
 
 
 def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
-    from tele_mess_core.daily_jobs import DailyJobWorker
+    from tele_mess_core.daily_jobs import enqueue_daily_summary_job, run_daily_summary_job_from_cli
 
     scope = _daily_scope_from_args(args)
-    worker = DailyJobWorker(store, config)
-    job = worker.enqueue(
+    job = enqueue_daily_summary_job(
+        store,
+        config,
         package_run_id=args.package_run_id,
         run_date=args.date,
         timezone_name=args.timezone,
         scope=scope,
         force=bool(args.force),
     )
-    terminal = worker.wait_for_terminal(str(job["job_id"]), timeout=max(300, config.daily.ai.timeout_seconds * 20))
+    terminal = run_daily_summary_job_from_cli(
+        store,
+        config,
+        str(job["job_id"]),
+        timeout=max(300, config.daily.ai.timeout_seconds * 20),
+    )
     item = store.get_daily_summary_run(str(terminal.get("summary_run_id") or "")) or terminal
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
 
 
 def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> int:
-    from tele_mess_core.daily_jobs import DailyJobWorker
+    from tele_mess_core.daily_jobs import enqueue_daily_summary_job, run_daily_summary_job_from_cli
 
     schedule = store.get_daily_package_schedule() if args.scheduled else {}
     scope = dict(schedule.get("scope") or {}) if args.scheduled else {}
     scope.update(_daily_scope_from_args(args))
     timezone_name = args.timezone or schedule.get("timezone") or scope.get("timezone")
-    worker = DailyJobWorker(store, config)
-    job = worker.enqueue(
+    job = enqueue_daily_summary_job(
+        store,
+        config,
         run_date=args.date,
         timezone_name=timezone_name,
         scope=scope,
@@ -550,7 +548,12 @@ def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace)
         }
         print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
         return 1 if item.get("status") in {"failed", "canceled"} else 0
-    terminal = worker.wait_for_terminal(str(job["job_id"]), timeout=max(300, config.daily.ai.timeout_seconds * 20))
+    terminal = run_daily_summary_job_from_cli(
+        store,
+        config,
+        str(job["job_id"]),
+        timeout=max(300, config.daily.ai.timeout_seconds * 20),
+    )
     package = store.get_daily_package_run(str(terminal.get("package_run_id") or ""))
     summary = store.get_daily_summary_run(str(terminal.get("summary_run_id") or ""))
     item = {

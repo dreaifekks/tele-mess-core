@@ -44,7 +44,7 @@ from tele_mess_core.media import (
 )
 
 
-SCHEMA_VERSION = 19
+SCHEMA_VERSION = 20
 UPGRADE_PENDING_META = "upgrade_pending"
 LEGACY_SCHEMA_BASELINE = 12
 
@@ -1581,64 +1581,98 @@ class ArchiveStore:
             raise ValueError("daily summary delivery was not persisted")
         return item
 
-    def upsert_daily_package_run(self, run: DailyPackageRunRecord) -> dict[str, Any]:
+    def _execute_upsert_daily_package_run(self, run: DailyPackageRunRecord) -> None:
         started_at = run.started_at or utc_now_iso()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO daily_package_runs(
-                  run_id, status, date, timezone, scope_json, output_dir,
-                  package_json_path, package_md_path, origin_count, message_count,
-                  media_count, important_origin_count, progress_total, progress_current,
-                  progress_label, progress_json, error, started_at, finished_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                  status = excluded.status,
-                  date = excluded.date,
-                  timezone = excluded.timezone,
-                  scope_json = excluded.scope_json,
-                  output_dir = excluded.output_dir,
-                  package_json_path = excluded.package_json_path,
-                  package_md_path = excluded.package_md_path,
-                  origin_count = excluded.origin_count,
-                  message_count = excluded.message_count,
-                  media_count = excluded.media_count,
-                  important_origin_count = excluded.important_origin_count,
-                  progress_total = excluded.progress_total,
-                  progress_current = excluded.progress_current,
-                  progress_label = excluded.progress_label,
-                  progress_json = excluded.progress_json,
-                  error = excluded.error,
-                  finished_at = excluded.finished_at
-                """,
-                (
-                    run.run_id,
-                    run.status,
-                    run.date,
-                    run.timezone,
-                    run.scope_json,
-                    run.output_dir,
-                    run.package_json_path,
-                    run.package_md_path,
-                    int(run.origin_count),
-                    int(run.message_count),
-                    int(run.media_count),
-                    int(run.important_origin_count),
-                    int(run.progress_total),
-                    int(run.progress_current),
-                    run.progress_label,
-                    run.progress_json,
-                    run.error,
-                    started_at,
-                    run.finished_at,
-                ),
+        self._conn.execute(
+            """
+            INSERT INTO daily_package_runs(
+              run_id, status, date, timezone, scope_json, output_dir,
+              package_json_path, package_md_path, origin_count, message_count,
+              media_count, important_origin_count, progress_total, progress_current,
+              progress_label, progress_json, error, started_at, finished_at
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+              status = excluded.status,
+              date = excluded.date,
+              timezone = excluded.timezone,
+              scope_json = excluded.scope_json,
+              output_dir = excluded.output_dir,
+              package_json_path = excluded.package_json_path,
+              package_md_path = excluded.package_md_path,
+              origin_count = excluded.origin_count,
+              message_count = excluded.message_count,
+              media_count = excluded.media_count,
+              important_origin_count = excluded.important_origin_count,
+              progress_total = excluded.progress_total,
+              progress_current = excluded.progress_current,
+              progress_label = excluded.progress_label,
+              progress_json = excluded.progress_json,
+              error = excluded.error,
+              finished_at = excluded.finished_at
+            """,
+            (
+                run.run_id,
+                run.status,
+                run.date,
+                run.timezone,
+                run.scope_json,
+                run.output_dir,
+                run.package_json_path,
+                run.package_md_path,
+                int(run.origin_count),
+                int(run.message_count),
+                int(run.media_count),
+                int(run.important_origin_count),
+                int(run.progress_total),
+                int(run.progress_current),
+                run.progress_label,
+                run.progress_json,
+                run.error,
+                started_at,
+                run.finished_at,
+            ),
+        )
+
+    def upsert_daily_package_run(self, run: DailyPackageRunRecord) -> dict[str, Any]:
+        with self._lock:
+            self._execute_upsert_daily_package_run(run)
             self._conn.commit()
         item = self.get_daily_package_run(run.run_id)
         if item is None:
             raise ValueError("daily package run was not persisted")
         return item
+
+    def upsert_daily_package_run_for_job(
+        self,
+        run: DailyPackageRunRecord,
+        *,
+        job_id: str,
+        worker_id: str,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
+        placeholders = ", ".join("?" for _ in required_statuses)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                owner = self._conn.execute(
+                    f"""
+                    SELECT 1 FROM daily_summary_jobs
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ({placeholders})
+                    """,
+                    (job_id, worker_id, int(attempt), *required_statuses),
+                ).fetchone()
+                if owner is None:
+                    self._conn.rollback()
+                    return None
+                self._execute_upsert_daily_package_run(run)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_daily_package_run(run.run_id)
 
     def get_daily_package_run(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1684,64 +1718,98 @@ class ArchiveStore:
             items.append(data)
         return items
 
-    def upsert_daily_summary_run(self, run: DailySummaryRunRecord) -> dict[str, Any]:
+    def _execute_upsert_daily_summary_run(self, run: DailySummaryRunRecord) -> None:
         started_at = run.started_at or utc_now_iso()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO daily_summary_runs(
-                  run_id, status, package_run_id, date, timezone, scope_json,
-                  output_dir, summary_path, provider, origin_count, group_count,
-                  image_count, progress_total, progress_current, progress_label,
-                  progress_json, error, started_at, finished_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(run_id) DO UPDATE SET
-                  status = excluded.status,
-                  package_run_id = excluded.package_run_id,
-                  date = excluded.date,
-                  timezone = excluded.timezone,
-                  scope_json = excluded.scope_json,
-                  output_dir = excluded.output_dir,
-                  summary_path = excluded.summary_path,
-                  provider = excluded.provider,
-                  origin_count = excluded.origin_count,
-                  group_count = excluded.group_count,
-                  image_count = excluded.image_count,
-                  progress_total = excluded.progress_total,
-                  progress_current = excluded.progress_current,
-                  progress_label = excluded.progress_label,
-                  progress_json = excluded.progress_json,
-                  error = excluded.error,
-                  finished_at = excluded.finished_at
-                """,
-                (
-                    run.run_id,
-                    run.status,
-                    run.package_run_id,
-                    run.date,
-                    run.timezone,
-                    run.scope_json,
-                    run.output_dir,
-                    run.summary_path,
-                    run.provider,
-                    int(run.origin_count),
-                    int(run.group_count),
-                    int(run.image_count),
-                    int(run.progress_total),
-                    int(run.progress_current),
-                    run.progress_label,
-                    run.progress_json,
-                    run.error,
-                    started_at,
-                    run.finished_at,
-                ),
+        self._conn.execute(
+            """
+            INSERT INTO daily_summary_runs(
+              run_id, status, package_run_id, date, timezone, scope_json,
+              output_dir, summary_path, provider, origin_count, group_count,
+              image_count, progress_total, progress_current, progress_label,
+              progress_json, error, started_at, finished_at
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(run_id) DO UPDATE SET
+              status = excluded.status,
+              package_run_id = excluded.package_run_id,
+              date = excluded.date,
+              timezone = excluded.timezone,
+              scope_json = excluded.scope_json,
+              output_dir = excluded.output_dir,
+              summary_path = excluded.summary_path,
+              provider = excluded.provider,
+              origin_count = excluded.origin_count,
+              group_count = excluded.group_count,
+              image_count = excluded.image_count,
+              progress_total = excluded.progress_total,
+              progress_current = excluded.progress_current,
+              progress_label = excluded.progress_label,
+              progress_json = excluded.progress_json,
+              error = excluded.error,
+              finished_at = excluded.finished_at
+            """,
+            (
+                run.run_id,
+                run.status,
+                run.package_run_id,
+                run.date,
+                run.timezone,
+                run.scope_json,
+                run.output_dir,
+                run.summary_path,
+                run.provider,
+                int(run.origin_count),
+                int(run.group_count),
+                int(run.image_count),
+                int(run.progress_total),
+                int(run.progress_current),
+                run.progress_label,
+                run.progress_json,
+                run.error,
+                started_at,
+                run.finished_at,
+            ),
+        )
+
+    def upsert_daily_summary_run(self, run: DailySummaryRunRecord) -> dict[str, Any]:
+        with self._lock:
+            self._execute_upsert_daily_summary_run(run)
             self._conn.commit()
         item = self.get_daily_summary_run(run.run_id)
         if item is None:
             raise ValueError("daily summary run was not persisted")
         return item
+
+    def upsert_daily_summary_run_for_job(
+        self,
+        run: DailySummaryRunRecord,
+        *,
+        job_id: str,
+        worker_id: str,
+        attempt: int,
+    ) -> dict[str, Any] | None:
+        required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
+        placeholders = ", ".join("?" for _ in required_statuses)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                owner = self._conn.execute(
+                    f"""
+                    SELECT 1 FROM daily_summary_jobs
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ({placeholders})
+                    """,
+                    (job_id, worker_id, int(attempt), *required_statuses),
+                ).fetchone()
+                if owner is None:
+                    self._conn.rollback()
+                    return None
+                self._execute_upsert_daily_summary_run(run)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_daily_summary_run(run.run_id)
 
     def get_daily_summary_run(self, run_id: str) -> dict[str, Any] | None:
         with self._lock:
@@ -1798,7 +1866,7 @@ class ArchiveStore:
             items.append(data)
         return items
 
-    def upsert_daily_summary_job(self, job: DailySummaryJobRecord) -> dict[str, Any]:
+    def insert_daily_summary_job(self, job: DailySummaryJobRecord) -> dict[str, Any]:
         now = job.updated_at or utc_now_iso()
         started_at = job.started_at or now
         with self._lock:
@@ -1812,34 +1880,6 @@ class ArchiveStore:
                   cancel_requested_at, error, started_at, finished_at, updated_at
                 )
                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(job_id) DO UPDATE SET
-                  status = CASE
-                    WHEN daily_summary_jobs.status = 'cancel_requested' AND excluded.status = 'running'
-                    THEN 'cancel_requested'
-                    ELSE excluded.status
-                  END,
-                  date = excluded.date,
-                  timezone = excluded.timezone,
-                  scope_json = excluded.scope_json,
-                  package_run_id = excluded.package_run_id,
-                  summary_run_id = excluded.summary_run_id,
-                  provider = excluded.provider,
-                  progress_total = excluded.progress_total,
-                  progress_current = excluded.progress_current,
-                  progress_label = excluded.progress_label,
-                  progress_json = excluded.progress_json,
-                  request_json = COALESCE(excluded.request_json, daily_summary_jobs.request_json),
-                  dedupe_key = COALESCE(excluded.dedupe_key, daily_summary_jobs.dedupe_key),
-                  worker_id = COALESCE(excluded.worker_id, daily_summary_jobs.worker_id),
-                  lease_until = COALESCE(excluded.lease_until, daily_summary_jobs.lease_until),
-                  heartbeat_at = COALESCE(excluded.heartbeat_at, daily_summary_jobs.heartbeat_at),
-                  attempt = MAX(excluded.attempt, daily_summary_jobs.attempt),
-                  retry_at = excluded.retry_at,
-                  retry_count = MAX(excluded.retry_count, daily_summary_jobs.retry_count),
-                  cancel_requested_at = COALESCE(excluded.cancel_requested_at, daily_summary_jobs.cancel_requested_at),
-                  error = excluded.error,
-                  finished_at = excluded.finished_at,
-                  updated_at = excluded.updated_at
                 """,
                 (
                     job.job_id,
@@ -1970,8 +2010,9 @@ class ArchiveStore:
         *,
         now: str,
         lease_until: str,
+        job_id: str | None = None,
     ) -> dict[str, Any] | None:
-        job_id: str | None = None
+        claimed_job_id: str | None = None
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1987,19 +2028,24 @@ class ArchiveStore:
                     (now, now, now),
                 )
                 self._close_canceled_job_runs(now)
+                job_clause = " AND job_id = ?" if job_id else ""
+                params: list[Any] = [now, now]
+                if job_id:
+                    params.append(job_id)
                 row = self._conn.execute(
-                    """
+                    f"""
                     SELECT job_id
                     FROM daily_summary_jobs
-                    WHERE (status = 'queued' AND (retry_at IS NULL OR retry_at <= ?))
-                       OR (status = 'running' AND (lease_until IS NULL OR lease_until < ?))
+                    WHERE ((status = 'queued' AND (retry_at IS NULL OR retry_at <= ?))
+                       OR (status = 'running' AND (lease_until IS NULL OR lease_until < ?)))
+                      {job_clause}
                     ORDER BY started_at ASC
                     LIMIT 1
                     """,
-                    (now, now),
+                    tuple(params),
                 ).fetchone()
                 if row is not None:
-                    job_id = str(row["job_id"])
+                    claimed_job_id = str(row["job_id"])
                     self._conn.execute(
                         """
                         UPDATE daily_summary_jobs
@@ -2007,18 +2053,78 @@ class ArchiveStore:
                             attempt = attempt + 1, retry_at = NULL, updated_at = ?
                         WHERE job_id = ?
                         """,
-                        (worker_id, lease_until, now, now, job_id),
+                        (worker_id, lease_until, now, now, claimed_job_id),
                     )
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
-        return self.get_daily_summary_job(job_id) if job_id else None
+        return self.get_daily_summary_job(claimed_job_id) if claimed_job_id else None
+
+    def update_daily_summary_job_progress(
+        self,
+        job_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        progress: dict[str, Any],
+        lease_until: str,
+        now: str,
+        package_run_id: str | None = None,
+        summary_run_id: str | None = None,
+        date: str | None = None,
+        timezone: str | None = None,
+        provider: str | None = None,
+    ) -> bool:
+        progress_total = int(progress.get("total") or 0)
+        progress_current = int(progress.get("current") or 0)
+        progress_label = str(progress.get("label") or "running")
+        progress_json = json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE daily_summary_jobs
+                SET date = COALESCE(?, date),
+                    timezone = COALESCE(?, timezone),
+                    package_run_id = COALESCE(?, package_run_id),
+                    summary_run_id = COALESCE(?, summary_run_id),
+                    provider = COALESCE(?, provider),
+                    progress_total = ?,
+                    progress_current = ?,
+                    progress_label = ?,
+                    progress_json = ?,
+                    lease_until = ?,
+                    heartbeat_at = ?,
+                    updated_at = ?
+                WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                  AND status IN ('running', 'cancel_requested')
+                """,
+                (
+                    date,
+                    timezone,
+                    package_run_id,
+                    summary_run_id,
+                    provider,
+                    progress_total,
+                    progress_current,
+                    progress_label,
+                    progress_json,
+                    lease_until,
+                    now,
+                    now,
+                    job_id,
+                    worker_id,
+                    int(attempt),
+                ),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
 
     def renew_daily_summary_job_lease(
         self,
         job_id: str,
         worker_id: str,
+        attempt: int,
         *,
         now: str,
         lease_until: str,
@@ -2028,12 +2134,98 @@ class ArchiveStore:
                 """
                 UPDATE daily_summary_jobs
                 SET heartbeat_at = ?, lease_until = ?, updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND status IN ('running', 'cancel_requested')
+                WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                  AND status IN ('running', 'cancel_requested')
                 """,
-                (now, lease_until, now, job_id, worker_id),
+                (now, lease_until, now, job_id, worker_id, int(attempt)),
             )
             self._conn.commit()
             return cur.rowcount > 0
+
+    def finish_daily_summary_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        status: str,
+        progress: dict[str, Any],
+        now: str,
+        package_run_id: str | None = None,
+        summary_run_id: str | None = None,
+        date: str | None = None,
+        timezone: str | None = None,
+        provider: str | None = None,
+        error: str | None = None,
+        discard_unsent_outbox: bool = False,
+    ) -> bool:
+        if status not in {"completed", "failed", "canceled"}:
+            raise ValueError(f"Unsupported terminal daily summary job status: {status}")
+        allowed = ("running",) if status == "completed" else ("running", "cancel_requested")
+        placeholders = ", ".join("?" for _ in allowed)
+        progress_total = int(progress.get("total") or 0)
+        progress_current = int(progress.get("current") or 0)
+        progress_label = str(progress.get("label") or status)
+        progress_json = json.dumps(progress, ensure_ascii=False, sort_keys=True)
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    f"""
+                    UPDATE daily_summary_jobs
+                    SET status = ?,
+                        date = COALESCE(?, date),
+                        timezone = COALESCE(?, timezone),
+                        package_run_id = COALESCE(?, package_run_id),
+                        summary_run_id = COALESCE(?, summary_run_id),
+                        provider = COALESCE(?, provider),
+                        progress_total = ?,
+                        progress_current = ?,
+                        progress_label = ?,
+                        progress_json = ?,
+                        error = ?,
+                        retry_at = NULL,
+                        lease_until = NULL,
+                        heartbeat_at = ?,
+                        finished_at = ?,
+                        updated_at = ?
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ({placeholders})
+                    """,
+                    (
+                        status,
+                        date,
+                        timezone,
+                        package_run_id,
+                        summary_run_id,
+                        provider,
+                        progress_total,
+                        progress_current,
+                        progress_label,
+                        progress_json,
+                        error,
+                        now,
+                        now,
+                        now,
+                        job_id,
+                        worker_id,
+                        int(attempt),
+                        *allowed,
+                    ),
+                )
+                updated = cur.rowcount > 0
+                if updated and discard_unsent_outbox:
+                    self._conn.execute(
+                        "DELETE FROM delivery_outbox WHERE job_id = ? AND status NOT IN ('sent', 'failed')",
+                        (job_id,),
+                    )
+                if updated and status == "canceled":
+                    self._close_canceled_job_runs(now)
+                self._conn.commit()
+                return updated
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def daily_summary_job_cancel_requested(self, job_id: str) -> bool:
         with self._lock:
@@ -2043,50 +2235,58 @@ class ArchiveStore:
             ).fetchone()
         return bool(row and (row["status"] == "cancel_requested" or row["cancel_requested_at"]))
 
-    def requeue_daily_summary_job(self, job_id: str, worker_id: str, *, now: str) -> bool:
+    def requeue_daily_summary_job(
+        self,
+        job_id: str,
+        worker_id: str,
+        attempt: int,
+        *,
+        now: str,
+    ) -> bool:
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE daily_summary_jobs
-                SET status = CASE
-                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
-                      THEN 'canceled'
-                      ELSE 'queued'
-                    END,
-                    worker_id = NULL, lease_until = NULL,
-                    heartbeat_at = NULL, retry_at = NULL,
-                    progress_label = CASE
-                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
-                      THEN 'canceled'
-                      ELSE 'queued after worker stop'
-                    END,
-                    finished_at = CASE
-                      WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
-                      THEN COALESCE(finished_at, ?)
-                      ELSE NULL
-                    END,
-                    updated_at = ?
-                WHERE job_id = ? AND worker_id = ?
-                  AND status IN ('running', 'cancel_requested')
-                """,
-                (now, now, job_id, worker_id),
-            )
-            requeued = cur.rowcount > 0
-            if requeued:
-                self._close_canceled_job_runs(now)
-            self._conn.commit()
-            return requeued
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    """
+                    UPDATE daily_summary_jobs
+                    SET status = CASE
+                          WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                          THEN 'canceled'
+                          ELSE 'queued'
+                        END,
+                        worker_id = NULL, lease_until = NULL,
+                        heartbeat_at = NULL, retry_at = NULL,
+                        progress_label = CASE
+                          WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                          THEN 'canceled'
+                          ELSE 'queued after worker stop'
+                        END,
+                        finished_at = CASE
+                          WHEN status = 'cancel_requested' OR cancel_requested_at IS NOT NULL
+                          THEN COALESCE(finished_at, ?)
+                          ELSE NULL
+                        END,
+                        updated_at = ?
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ('running', 'cancel_requested')
+                    """,
+                    (now, now, job_id, worker_id, int(attempt)),
+                )
+                requeued = cur.rowcount > 0
+                if requeued:
+                    self._close_canceled_job_runs(now)
+                self._conn.commit()
+                return requeued
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _close_canceled_job_runs(self, now: str) -> None:
-        """Drop the unsent chunks and close the running summary of jobs that ended canceled.
-
-        A cancel request already discards unsent chunks, but a worker stopped
-        while publishing can add new ones after it.
-        """
+        """Drop unsent chunks and close running summaries of jobs that ended canceled."""
         self._conn.execute(
             """
             DELETE FROM delivery_outbox
-            WHERE status != 'sent'
+            WHERE status NOT IN ('sent', 'failed')
               AND job_id IN (SELECT job_id FROM daily_summary_jobs WHERE status = 'canceled')
             """
         )
@@ -2107,6 +2307,7 @@ class ArchiveStore:
         self,
         job_id: str,
         worker_id: str,
+        attempt: int,
         *,
         retry_at: str,
         max_retries: int,
@@ -2125,7 +2326,7 @@ class ArchiveStore:
                     worker_id = NULL, lease_until = NULL, heartbeat_at = NULL,
                     progress_label = ?, progress_json = ?, error = ?,
                     finished_at = NULL, updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND status = 'running'
+                WHERE job_id = ? AND worker_id = ? AND attempt = ? AND status = 'running'
                   AND cancel_requested_at IS NULL AND retry_count < ?
                 """,
                 (
@@ -2136,6 +2337,7 @@ class ArchiveStore:
                     now,
                     job_id,
                     worker_id,
+                    int(attempt),
                     int(max_retries),
                 ),
             )
@@ -2162,7 +2364,7 @@ class ArchiveStore:
                     (now, now, job_id),
                 )
                 self._conn.execute(
-                    "DELETE FROM delivery_outbox WHERE job_id = ? AND status != 'sent'",
+                    "DELETE FROM delivery_outbox WHERE job_id = ? AND status NOT IN ('sent', 'failed')",
                     (job_id,),
                 )
                 self._conn.commit()
@@ -2474,6 +2676,108 @@ class ArchiveStore:
             raise ValueError("daily summary record was not persisted")
         return item
 
+    def _insert_outbox_items(self, outbox_items: list[dict[str, Any]] | None) -> None:
+        if not outbox_items:
+            return
+        run_ids = sorted({str(item["summary_run_id"]) for item in outbox_items})
+        job_ids = sorted({str(item["job_id"]) for item in outbox_items if item.get("job_id")})
+        legacy_runs: set[str] = set()
+        legacy_jobs: set[str] = set()
+        if run_ids:
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT summary_run_id FROM delivery_outbox
+                WHERE content_kind = 'summary'
+                  AND summary_run_id IN ({', '.join('?' for _ in run_ids)})
+                """,
+                tuple(run_ids),
+            ).fetchall()
+            legacy_runs = {str(row["summary_run_id"]) for row in rows}
+        if job_ids:
+            rows = self._conn.execute(
+                f"""
+                SELECT DISTINCT job_id FROM delivery_outbox
+                WHERE content_kind = 'summary'
+                  AND job_id IN ({', '.join('?' for _ in job_ids)})
+                """,
+                tuple(job_ids),
+            ).fetchall()
+            legacy_jobs = {str(row["job_id"]) for row in rows if row["job_id"] is not None}
+        for item in outbox_items:
+            run_id = str(item["summary_run_id"])
+            job_id = str(item["job_id"]) if item.get("job_id") else None
+            content_kind = str(item.get("content_kind") or "summary")
+            if content_kind != "summary" and (run_id in legacy_runs or (job_id is not None and job_id in legacy_jobs)):
+                continue
+            now = str(item.get("created_at") or utc_now_iso())
+            self._conn.execute(
+                """
+                INSERT INTO delivery_outbox(
+                  outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+                  content_kind, chunk_index, chunk_count, content, status, attempts,
+                  created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                ON CONFLICT(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
+                DO NOTHING
+                """,
+                (
+                    str(item.get("outbox_id") or f"out_{uuid.uuid4().hex[:16]}"),
+                    run_id,
+                    job_id,
+                    str(item["account_id"]),
+                    int(item["origin_id"]),
+                    int(item.get("topic_id") or 0),
+                    content_kind,
+                    int(item["chunk_index"]),
+                    int(item["chunk_count"]),
+                    str(item["content"]),
+                    now,
+                    now,
+                ),
+            )
+
+    def publish_daily_summary(
+        self,
+        summary_run: DailySummaryRunRecord,
+        records: list[DailySummaryRecord],
+        outbox_items: list[dict[str, Any]] | None = None,
+        *,
+        message_points: list[DailyMessagePointRecord] | None = None,
+        job_owner: tuple[str, str, int] | None = None,
+    ) -> dict[str, Any] | None:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if job_owner is not None:
+                    job_id, worker_id, attempt = job_owner
+                    owner = self._conn.execute(
+                        """
+                        SELECT 1 FROM daily_summary_jobs
+                        WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                          AND status = 'running'
+                        """,
+                        (job_id, worker_id, int(attempt)),
+                    ).fetchone()
+                    if owner is None:
+                        self._conn.rollback()
+                        return None
+                self._execute_upsert_daily_summary_run(summary_run)
+                for record in records:
+                    self.upsert_daily_summary_record(record, commit=False)
+                if message_points is not None:
+                    if any(point.run_id != summary_run.run_id for point in message_points):
+                        raise ValueError("all daily message points must belong to the published summary run")
+                    self._conn.execute("DELETE FROM daily_message_points WHERE run_id = ?", (summary_run.run_id,))
+                    for point in message_points:
+                        self.upsert_daily_message_point(point, commit=False)
+                self._insert_outbox_items(outbox_items)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
+        return self.get_daily_summary_run(summary_run.run_id)
+
     def persist_daily_summary_batch(
         self,
         records: list[DailySummaryRecord],
@@ -2498,32 +2802,7 @@ class ArchiveStore:
                     self._conn.execute("DELETE FROM daily_message_points WHERE run_id = ?", (point_run_id,))
                     for point in message_points:
                         self.upsert_daily_message_point(point, commit=False)
-                for item in outbox_items or []:
-                    now = str(item.get("created_at") or utc_now_iso())
-                    self._conn.execute(
-                        """
-                        INSERT INTO delivery_outbox(
-                          outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
-                          chunk_index, chunk_count, content, status, attempts, created_at, updated_at
-                        )
-                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
-                        ON CONFLICT(summary_run_id, account_id, origin_id, topic_id, chunk_index)
-                        DO NOTHING
-                        """,
-                        (
-                            str(item.get("outbox_id") or f"out_{uuid.uuid4().hex[:16]}"),
-                            str(item["summary_run_id"]),
-                            item.get("job_id"),
-                            str(item["account_id"]),
-                            int(item["origin_id"]),
-                            int(item.get("topic_id") or 0),
-                            int(item["chunk_index"]),
-                            int(item["chunk_count"]),
-                            str(item["content"]),
-                            now,
-                            now,
-                        ),
-                    )
+                self._insert_outbox_items(outbox_items)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
@@ -2536,7 +2815,7 @@ class ArchiveStore:
         job_id: str | None = None,
         summary_run_id: str | None = None,
     ) -> int:
-        clauses = ["status != 'sent'"]
+        clauses = ["status NOT IN ('sent', 'failed')"]
         params: list[Any] = []
         if job_id:
             clauses.append("job_id = ?")
@@ -2572,7 +2851,7 @@ class ArchiveStore:
             params.append(status)
         if clauses:
             sql += " WHERE " + " AND ".join(clauses)
-        sql += " ORDER BY created_at, chunk_index LIMIT ?"
+        sql += " ORDER BY created_at, content_kind, chunk_index LIMIT ?"
         params.append(_bounded_limit(limit, max_limit=2000))
         with self._lock:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
@@ -2609,10 +2888,11 @@ class ArchiveStore:
                           AND previous.account_id = o.account_id
                           AND previous.origin_id = o.origin_id
                           AND previous.topic_id = o.topic_id
+                          AND previous.content_kind = o.content_kind
                           AND previous.chunk_index < o.chunk_index
                           AND previous.status != 'sent'
                       )
-                    ORDER BY o.created_at, o.chunk_index
+                    ORDER BY o.created_at, o.content_kind, o.chunk_index
                     LIMIT 1
                     """,
                     tuple(params),
@@ -2637,18 +2917,37 @@ class ArchiveStore:
             row = self._conn.execute("SELECT * FROM delivery_outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
         return dict(row) if row is not None else None
 
-    def complete_delivery_outbox(self, outbox_id: str, *, message_id: int | None, now: str) -> None:
+    def complete_delivery_outbox(
+        self,
+        outbox_id: str,
+        *,
+        message_id: int | None,
+        now: str,
+        expected_attempt: int | None = None,
+    ) -> bool:
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE delivery_outbox
-                SET status = 'sent', message_id = ?, last_error = NULL,
-                    next_attempt_at = NULL, sent_at = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (message_id, now, now, outbox_id),
-            )
+            if expected_attempt is not None:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'sent', message_id = ?, last_error = NULL,
+                        next_attempt_at = NULL, sent_at = ?, updated_at = ?
+                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
+                    """,
+                    (message_id, now, now, outbox_id, int(expected_attempt)),
+                )
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'sent', message_id = ?, last_error = NULL,
+                        next_attempt_at = NULL, sent_at = ?, updated_at = ?
+                    WHERE outbox_id = ?
+                    """,
+                    (message_id, now, now, outbox_id),
+                )
             self._conn.commit()
+            return cur.rowcount > 0
 
     def retry_delivery_outbox(
         self,
@@ -2657,17 +2956,124 @@ class ArchiveStore:
         error: str,
         next_attempt_at: str,
         now: str,
-    ) -> None:
+        expected_attempt: int | None = None,
+    ) -> bool:
         with self._lock:
-            self._conn.execute(
-                """
-                UPDATE delivery_outbox
-                SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
-                WHERE outbox_id = ?
-                """,
-                (error, next_attempt_at, now, outbox_id),
-            )
+            if expected_attempt is not None:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
+                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
+                    """,
+                    (error, next_attempt_at, now, outbox_id, int(expected_attempt)),
+                )
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
+                    WHERE outbox_id = ?
+                    """,
+                    (error, next_attempt_at, now, outbox_id),
+                )
             self._conn.commit()
+            return cur.rowcount > 0
+
+    def release_delivery_outbox(
+        self,
+        outbox_id: str,
+        *,
+        error: str,
+        now: str,
+        expected_attempt: int | None = None,
+    ) -> bool:
+        """Return a chunk interrupted by shutdown to retry without spending an attempt."""
+        with self._lock:
+            if expected_attempt is not None:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'retry', attempts = MAX(0, attempts - 1), last_error = ?,
+                        next_attempt_at = NULL, updated_at = ?
+                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
+                    """,
+                    (error, now, outbox_id, int(expected_attempt)),
+                )
+            else:
+                cur = self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'retry', attempts = MAX(0, attempts - 1), last_error = ?,
+                        next_attempt_at = NULL, updated_at = ?
+                    WHERE outbox_id = ? AND status = 'sending'
+                    """,
+                    (error, now, outbox_id),
+                )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def fail_delivery_outbox(
+        self,
+        outbox_id: str,
+        *,
+        error: str,
+        now: str,
+        expected_attempt: int | None = None,
+    ) -> bool:
+        """Mark a chunk and all remaining unsent chunks of the same report as failed."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if expected_attempt is not None:
+                    row = self._conn.execute(
+                        """
+                        SELECT summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index
+                        FROM delivery_outbox
+                        WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
+                        """,
+                        (outbox_id, int(expected_attempt)),
+                    ).fetchone()
+                else:
+                    row = self._conn.execute(
+                        """
+                        SELECT summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index
+                        FROM delivery_outbox
+                        WHERE outbox_id = ?
+                        """,
+                        (outbox_id,),
+                    ).fetchone()
+                if row is None:
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    """
+                    UPDATE delivery_outbox
+                    SET status = 'failed', last_error = ?, next_attempt_at = NULL, updated_at = ?
+                    WHERE summary_run_id = ?
+                      AND account_id = ?
+                      AND origin_id = ?
+                      AND topic_id = ?
+                      AND content_kind = ?
+                      AND chunk_index >= ?
+                      AND status != 'sent'
+                    """,
+                    (
+                        error,
+                        now,
+                        row["summary_run_id"],
+                        row["account_id"],
+                        row["origin_id"],
+                        row["topic_id"],
+                        row["content_kind"],
+                        row["chunk_index"],
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def get_daily_summary_record(
         self,

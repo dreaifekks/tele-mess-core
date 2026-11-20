@@ -281,6 +281,7 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
   account_id TEXT NOT NULL,
   origin_id INTEGER NOT NULL,
   topic_id INTEGER NOT NULL DEFAULT 0,
+  content_kind TEXT NOT NULL DEFAULT 'summary',
   chunk_index INTEGER NOT NULL,
   chunk_count INTEGER NOT NULL,
   content TEXT NOT NULL,
@@ -292,7 +293,7 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
   created_at TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   sent_at TEXT,
-  UNIQUE(summary_run_id, account_id, origin_id, topic_id, chunk_index)
+  UNIQUE(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
 );
 
 CREATE TABLE IF NOT EXISTS daily_summary_records (
@@ -438,7 +439,8 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS delivery_outbox_validate_insert
 BEFORE INSERT ON delivery_outbox
-WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent')
+WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
+  OR length(trim(COALESCE(NEW.content_kind, ''))) = 0
   OR NEW.chunk_index <= 0
   OR NEW.chunk_count <= 0
   OR NEW.chunk_index > NEW.chunk_count
@@ -449,7 +451,8 @@ END;
 
 CREATE TRIGGER IF NOT EXISTS delivery_outbox_validate_update
 BEFORE UPDATE ON delivery_outbox
-WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent')
+WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
+  OR length(trim(COALESCE(NEW.content_kind, ''))) = 0
   OR NEW.chunk_index <= 0
   OR NEW.chunk_count <= 0
   OR NEW.chunk_index > NEW.chunk_count

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import hashlib
 import json
 import mimetypes
@@ -52,6 +51,10 @@ PACKAGE_MESSAGE_PAGE_SIZE = 5000
 
 class DailyJobInterrupted(RuntimeError):
     """A recoverable interruption that must be handled by the durable worker."""
+
+
+class DailyJobLeaseLost(DailyJobInterrupted):
+    """The durable worker no longer owns the job lease."""
 
 
 class DailyJobCancelled(RuntimeError):
@@ -232,6 +235,7 @@ def build_daily_package(
     run_id: str | None = None,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
+    job_owner: tuple[str, str, int] | None = None,
 ) -> dict[str, Any]:
     scope = dict(scope or {})
     timezone_name = timezone_name or str(scope.get("timezone") or DEFAULT_TIMEZONE)
@@ -242,11 +246,27 @@ def build_daily_package(
     window_start_utc = window_start_local.astimezone(timezone.utc)
     window_end_utc = window_end_local.astimezone(timezone.utc)
     run_id = run_id or _new_run_id("pkg")
-    output_root = _daily_output_dir(config) / package_date.isoformat() / run_id
+    output_base = _daily_output_dir(config) / package_date.isoformat() / run_id
+    output_root = output_base / f"attempt-{job_owner[2]}" if job_owner is not None else output_base
     package_json_path = output_root / "package.json"
     package_md_path = output_root / "package.md"
     scope_json = json.dumps(scope, ensure_ascii=False, sort_keys=True)
     progress_state: dict[str, Any] = {"current": 0, "total": 0, "label": "starting"}
+
+    def persist_package_run(record: DailyPackageRunRecord) -> dict[str, Any]:
+        if job_owner is None:
+            return store.upsert_daily_package_run(record)
+        persisted = store.upsert_daily_package_run_for_job(
+            record,
+            job_id=job_owner[0],
+            worker_id=job_owner[1],
+            attempt=job_owner[2],
+        )
+        if persisted is None:
+            if record.status == "completed" and store.daily_summary_job_cancel_requested(job_owner[0]):
+                raise DailyJobCancelled("canceled")
+            raise DailyJobLeaseLost(f"lost lease for job {job_owner[0]}")
+        return persisted
 
     def run_record(
         status: str,
@@ -287,7 +307,7 @@ def build_daily_package(
             cancel_check()
         progress_state.clear()
         progress_state.update({"stage": "package", "current": current, "total": total, "label": label, **(extra or {})})
-        store.upsert_daily_package_run(run_record("running", progress_state))
+        persist_package_run(run_record("running", progress_state))
         if progress_callback:
             progress_callback(dict(progress_state))
 
@@ -470,7 +490,7 @@ def build_daily_package(
         _write_json(package_json_path, package_payload)
         package_md_path.write_text(_package_markdown(package_payload), encoding="utf-8")
 
-        return store.upsert_daily_package_run(
+        return persist_package_run(
             run_record(
                 "completed",
                 {
@@ -488,13 +508,15 @@ def build_daily_package(
                 totals=totals,
             )
         )
+    except DailyJobInterrupted:
+        raise
     except DailyJobCancelled as exc:
         error = str(exc) or "canceled"
-        return store.upsert_daily_package_run(
+        return persist_package_run(
             run_record("canceled", {**progress_state, "label": "canceled", "error": error}, error=error)
         )
     except Exception as exc:
-        return store.upsert_daily_package_run(
+        return persist_package_run(
             run_record("failed", {**progress_state, "label": "failed", "error": str(exc)}, error=str(exc))
         )
 
@@ -574,13 +596,18 @@ def run_daily_summary(
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     cancel_check: Callable[[], None] | None = None,
     process_callback: Callable[[subprocess.Popen[str] | None, str], None] | None = None,
-    telegram_runtime: Any | None = None,
-    defer_delivery: bool = False,
-    job_id: str | None = None,
+    job_owner: tuple[str, str, int] | None = None,
 ) -> dict[str, Any]:
     package_run = store.get_daily_package_run(package_run_id) if package_run_id else None
     if package_run is None:
-        package_run = build_daily_package(store, config, run_date=run_date, timezone_name=timezone_name, scope=scope)
+        package_run = build_daily_package(
+            store,
+            config,
+            run_date=run_date,
+            timezone_name=timezone_name,
+            scope=scope,
+            job_owner=job_owner,
+        )
         package_run_id = package_run["run_id"]
     if package_run.get("status") != "completed":
         raise ValueError(f"Package run is not completed: {package_run_id}")
@@ -593,7 +620,8 @@ def run_daily_summary(
     progress_counts = _summary_progress_counts(package_payload, include_delivery=delivery.enabled)
     image_count_estimate = len(_collect_image_paths(package_payload))
     run_id = run_id or _new_run_id("sum")
-    output_root = Path(str(package_run["output_dir"])) / "analysis" / run_id
+    output_base = Path(str(package_run["output_dir"])) / "analysis" / run_id
+    output_root = output_base / f"attempt-{job_owner[2]}" if job_owner is not None else output_base
     summary_path = output_root / "summary.md"
     important_summary_path = output_root / "important-summary.md"
     important_prompt_path = output_root / "important-summary.prompt.md"
@@ -604,6 +632,21 @@ def run_daily_summary(
     progress_state = _summary_progress_payload(progress_counts, current=0, label="queued", phase="queued")
     provider_state = AiProviderRuntimeState()
     stats = package_payload.get("stats", {})
+
+    def persist_summary_run(record: DailySummaryRunRecord) -> dict[str, Any]:
+        if job_owner is None:
+            return store.upsert_daily_summary_run(record)
+        persisted = store.upsert_daily_summary_run_for_job(
+            record,
+            job_id=job_owner[0],
+            worker_id=job_owner[1],
+            attempt=job_owner[2],
+        )
+        if persisted is None:
+            if record.status == "completed" and store.daily_summary_job_cancel_requested(job_owner[0]):
+                raise DailyJobCancelled("canceled")
+            raise DailyJobLeaseLost(f"lost lease for job {job_owner[0]}")
+        return persisted
 
     def run_record(
         status: str,
@@ -652,7 +695,7 @@ def run_daily_summary(
             phase=phase,
             extra=progress_extra,
         )
-        store.upsert_daily_summary_run(
+        persist_summary_run(
             run_record("running", progress_state, provider=str(progress_state["provider"]))
         )
         if progress_callback:
@@ -660,7 +703,7 @@ def run_daily_summary(
 
     message_point_records: list[DailyMessagePointRecord] = []
 
-    def persist_message_points(points: list[dict[str, Any]]) -> None:
+    def keep_message_points(points: list[dict[str, Any]]) -> None:
         nonlocal message_point_records
         message_point_records = _build_message_point_records(
             run_id=run_id,
@@ -669,7 +712,6 @@ def run_daily_summary(
             provider=_effective_provider_label(config, provider_state),
             points=points,
         )
-        store.persist_daily_message_points(run_id, message_point_records)
 
     update_progress(0, "starting summary", "starting")
     try:
@@ -682,7 +724,7 @@ def run_daily_summary(
             important_prompt_path=important_prompt_path,
             point_summary_path=point_summary_path,
             point_prompt_path=point_prompt_path,
-            points_ready_callback=persist_message_points,
+            points_ready_callback=keep_message_points,
             progress_callback=update_progress,
             cancel_check=cancel_check,
             process_callback=process_callback,
@@ -694,16 +736,6 @@ def run_daily_summary(
         image_paths = _collect_image_paths(package_payload)
         important_summary_text = str((analysis.get("important_summary") or {}).get("content") or "")
         point_summary_text = str((analysis.get("point_summary") or {}).get("content") or "")
-        _write_summary_analysis_json(
-            output_root / "summary.json",
-            run_id=run_id,
-            package_run_id=str(package_run_id),
-            provider=effective_provider,
-            image_paths=image_paths,
-            summary_path=summary_path,
-            analysis=analysis,
-            delivery=None,
-        )
         summary_records = _build_summary_records(
             run_id=run_id,
             package_run_id=str(package_run_id),
@@ -715,9 +747,11 @@ def run_daily_summary(
             analysis=analysis,
         )
         delivery_result: dict[str, Any] | None = None
-        delivery_contents: list[tuple[str, str]] = []
         outbox_items: list[dict[str, Any]] = []
         if delivery.enabled:
+            from tele_mess_core.telegram.delivery import split_telegram_markdown
+
+            delivery_contents: list[tuple[str, str]] = []
             if package_payload.get("important_origins"):
                 delivery_contents.append(
                     (
@@ -743,114 +777,73 @@ def run_daily_summary(
                     ),
                 )
             )
-            if defer_delivery:
-                from tele_mess_core.telegram.delivery import split_telegram_markdown
-
-                pending_chunks = [
-                    (kind, chunk)
-                    for kind, content in delivery_contents
-                    for chunk in split_telegram_markdown(content)
-                ]
-                for index, (kind, chunk) in enumerate(pending_chunks, start=1):
-                    body = f"[{index}/{len(pending_chunks)}]\n\n{chunk}" if len(pending_chunks) > 1 else chunk
+            for kind, content in delivery_contents:
+                chunks = split_telegram_markdown(content)
+                for index, chunk in enumerate(chunks, start=1):
+                    body = f"[{index}/{len(chunks)}]\n\n{chunk}" if len(chunks) > 1 else chunk
                     outbox_items.append(
                         {
-                            "outbox_id": f"out_{run_id}_{index}",
+                            "outbox_id": f"out_{run_id}_{kind}_{index}",
                             "summary_run_id": run_id,
-                            "job_id": job_id,
+                            "job_id": job_owner[0] if job_owner is not None else None,
                             "account_id": delivery.account_id,
                             "origin_id": delivery.origin_id,
                             "topic_id": delivery.topic_id,
-                            "chunk_index": index,
-                            "chunk_count": len(pending_chunks),
                             "content_kind": kind,
+                            "chunk_index": index,
+                            "chunk_count": len(chunks),
                             "content": body,
                         }
                     )
-        store.persist_daily_summary_batch(
+            delivery_result = {
+                **_delivery_target_payload(delivery),
+                "status": "queued",
+                "message_count": len(outbox_items),
+                "outbox_ids": [item["outbox_id"] for item in outbox_items],
+                "delivery_kinds": [kind for kind, _ in delivery_contents],
+            }
+        _write_summary_analysis_json(
+            output_root / "summary.json",
+            run_id=run_id,
+            package_run_id=str(package_run_id),
+            provider=effective_provider,
+            image_paths=image_paths,
+            summary_path=summary_path,
+            analysis=analysis,
+            delivery=delivery_result,
+        )
+        completed_extra: dict[str, Any] = {"provider": effective_provider}
+        if delivery_result is not None:
+            completed_extra["delivery"] = delivery_result
+        completed_record = run_record(
+            "completed",
+            _summary_progress_payload(
+                progress_counts,
+                current=int(progress_counts.get("total") or 0),
+                label="completed",
+                phase="completed",
+                extra=completed_extra,
+            ),
+            provider=effective_provider,
+            image_count=len(image_paths),
+        )
+        published = store.publish_daily_summary(
+            completed_record,
             summary_records,
             outbox_items,
             message_points=message_point_records,
+            job_owner=job_owner,
         )
-        if delivery.enabled:
-            delivery_start = max(
-                0,
-                int(progress_counts.get("total") or 0) - int(progress_counts.get("delivery_count") or 0),
-            )
-            update_progress(
-                delivery_start,
-                "queueing daily deliveries" if defer_delivery else "delivering daily summaries",
-                "delivery",
-                {
-                    "delivery": _delivery_target_payload(delivery),
-                    "delivery_kinds": [kind for kind, _ in delivery_contents],
-                },
-            )
-            if defer_delivery:
-                delivery_result = {
-                    **_delivery_target_payload(delivery),
-                    "status": "queued",
-                    "message_count": len(outbox_items),
-                    "outbox_ids": [item["outbox_id"] for item in outbox_items],
-                    "delivery_kinds": [kind for kind, _ in delivery_contents],
-                }
-            else:
-                delivery_results: list[dict[str, Any]] = []
-                for delivery_index, (kind, content) in enumerate(delivery_contents, start=1):
-                    result = deliver_daily_summary(
-                        store,
-                        config,
-                        content,
-                        telegram_runtime=telegram_runtime,
-                        delivery=delivery,
-                    )
-                    delivery_results.append({"kind": kind, "result": result})
-                    update_progress(
-                        delivery_start + delivery_index,
-                        f"delivered {kind}",
-                        "delivery",
-                        {"delivery": result, "delivery_kind": kind},
-                    )
-                delivery_result = {
-                    **_delivery_target_payload(delivery),
-                    "status": "sent",
-                    "deliveries": delivery_results,
-                }
-            _write_summary_analysis_json(
-                output_root / "summary.json",
-                run_id=run_id,
-                package_run_id=str(package_run_id),
-                provider=effective_provider,
-                image_paths=image_paths,
-                summary_path=summary_path,
-                analysis=analysis,
-                delivery=delivery_result,
-            )
-            update_progress(
-                int(progress_counts.get("total") or 0),
-                "queued daily deliveries" if defer_delivery else "delivered daily summaries",
-                "delivery",
-                {"delivery": delivery_result},
-            )
-        return store.upsert_daily_summary_run(
-            run_record(
-                "completed",
-                _summary_progress_payload(
-                    progress_counts,
-                    current=int(progress_counts.get("total") or 0),
-                    label="completed",
-                    phase="completed",
-                    extra={"provider": effective_provider},
-                ),
-                provider=effective_provider,
-                image_count=len(image_paths),
-            )
-        )
+        if published is None:
+            if job_owner is not None and store.daily_summary_job_cancel_requested(job_owner[0]):
+                raise DailyJobCancelled("canceled")
+            raise DailyJobLeaseLost(f"lost lease for job {job_owner[0] if job_owner else run_id}")
+        return published
     except DailyJobInterrupted:
         raise
     except DailyJobCancelled as exc:
         error = str(exc) or "canceled"
-        return store.upsert_daily_summary_run(
+        return persist_summary_run(
             run_record(
                 "canceled",
                 {**progress_state, "label": "canceled", "phase": "canceled", "error": error},
@@ -866,7 +859,7 @@ def run_daily_summary(
                 "retryable": bool(exc.retryable),
                 "provider": exc.provider,
             }
-        return store.upsert_daily_summary_run(
+        return persist_summary_run(
             run_record(
                 "failed",
                 {**progress_state, **error_progress, "label": "failed", "phase": "failed", "error": str(exc)},
@@ -874,66 +867,6 @@ def run_daily_summary(
                 error=str(exc),
             )
         )
-
-
-def run_daily_package_and_summary(
-    store: ArchiveStore,
-    config: AppConfig,
-    *,
-    run_date: str | None = None,
-    timezone_name: str | None = None,
-    scope: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    package = build_daily_package(store, config, run_date=run_date, timezone_name=timezone_name, scope=scope)
-    result: dict[str, Any] = {
-        "status": package.get("status"),
-        "package_run_id": package.get("run_id"),
-        "summary_run_id": None,
-        "package": package,
-        "summary": None,
-        "error": package.get("error"),
-    }
-    if package.get("status") != "completed":
-        result["status"] = "failed"
-        result["error"] = package.get("error") or "Daily package did not complete"
-        return result
-
-    summary = run_daily_summary(store, config, package_run_id=str(package["run_id"]), scope=scope)
-    result.update(
-        {
-            "status": "completed" if summary.get("status") == "completed" else "failed",
-            "summary_run_id": summary.get("run_id"),
-            "summary": summary,
-            "error": summary.get("error"),
-        }
-    )
-    return result
-
-
-def deliver_daily_summary(
-    store: ArchiveStore,
-    config: AppConfig,
-    content: str,
-    *,
-    telegram_runtime: Any | None = None,
-    delivery: DailyDeliveryConfig | None = None,
-) -> dict[str, Any] | None:
-    delivery = delivery or resolve_daily_summary_delivery(store, config)
-    if not delivery.enabled:
-        return None
-    if delivery.origin_id is None:
-        raise ValueError("daily.delivery.origin_id is required when daily.delivery.enabled is true")
-    if telegram_runtime is not None:
-        return telegram_runtime.call(
-            delivery.account_id,
-            "deliver_summary",
-            delivery=delivery,
-            content=content,
-        )
-    account = resolve_account_config(config, store, delivery.account_id)
-    from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
-
-    return asyncio.run(TelegramSummaryDeliveryService(account, store).send_summary(delivery, content))
 
 
 def daily_summary_delivery_state(store: ArchiveStore, config: AppConfig) -> dict[str, Any]:
@@ -2711,11 +2644,11 @@ def _run_codex_provider(
         cwd=str(ai_work_dir),
         start_new_session=(os.name != "nt"),
     )
-    if process_callback:
-        process_callback(process, task_name)
     deadline = time_module.monotonic() + max(1, int(config.daily.ai.timeout_seconds))
     input_text: str | None = prompt
     try:
+        if process_callback:
+            process_callback(process, task_name)
         while True:
             if cancel_check:
                 cancel_check()
@@ -2867,11 +2800,11 @@ def _run_openai_fallback_provider(
         cwd=str(ai_work_dir),
         start_new_session=(os.name != "nt"),
     )
-    if process_callback:
-        process_callback(process, f"{task_name}:fallback")
     deadline = time_module.monotonic() + max(1, int(config.daily.ai.timeout_seconds) + 5)
     input_text: str | None = request_payload
     try:
+        if process_callback:
+            process_callback(process, f"{task_name}:fallback")
         while True:
             if cancel_check:
                 cancel_check()

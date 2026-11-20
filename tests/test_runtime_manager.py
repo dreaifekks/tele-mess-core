@@ -372,6 +372,71 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.stop()
 
+    async def test_ingest_false_never_attaches_handlers_or_ingestion(self) -> None:
+        clients: list[HandlerAwareClient] = []
+
+        def factory(config: TelegramAccountConfig) -> HandlerAwareClient:
+            client = HandlerAwareClient()
+            clients.append(client)
+            return client
+
+        manager = TelegramRuntimeManager(self.config, self.store, client_factory=factory, ingest=False)
+        await manager.start()
+        try:
+            status = await manager.execute("main", "auth_status")
+            self.assertTrue(status["authorized"])
+            refresh = await manager.execute("main", "refresh_capture")
+            self.assertEqual(refresh["status"], "ingest_disabled")
+            self.assertEqual(clients[0].handlers, [])
+            self.assertEqual(clients[0].catch_up_count, 0)
+        finally:
+            await manager.stop()
+
+    async def test_offline_execute_returns_structured_errors_and_recovers_when_online(self) -> None:
+        from tele_mess_core.config import DailyDeliveryConfig
+        from tele_mess_core.telegram.runtime import TelegramOperationError
+
+        online = False
+
+        def factory(config: TelegramAccountConfig) -> FakeClient:
+            if not online:
+                return FakeClient(connect_error=ConnectionError("offline"))
+            return FakeClient(authorized=True)
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=factory,
+            ingest=False,
+            connect_wait_seconds=1.0,
+        )
+        await manager.start()
+        try:
+            auth = await manager.execute("main", "auth_status")
+            self.assertFalse(auth["authorized"])
+            self.assertEqual(auth["error"]["code"], "auth_status_failed")
+
+            discover = await manager.execute("main", "discover_origins")
+            self.assertFalse(discover["authorized"])
+            self.assertEqual(discover["status"], "failed")
+            self.assertEqual(discover["errors"][0]["code"], "discover_origins_failed")
+
+            with self.assertRaises(TelegramOperationError):
+                await manager.execute(
+                    "main",
+                    "deliver_chunk",
+                    delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+                    content="hello",
+                )
+
+            # Once connectivity returns, the next call wakes the supervisor and succeeds immediately.
+            online = True
+            recovered = await manager.execute("main", "auth_status")
+            self.assertTrue(recovered["authorized"])
+            self.assertEqual(recovered["auth_state"], "authorized")
+        finally:
+            await manager.stop()
+
 
 class ConfiguredAccountSyncTest(unittest.TestCase):
     def test_bootstrap_preserves_observed_auth_state(self) -> None:

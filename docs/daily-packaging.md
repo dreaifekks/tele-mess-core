@@ -307,21 +307,28 @@ how far the current run has advanced.
 For UI clients that need one button to run the full workflow, daily summary
 jobs wrap package generation plus summary analysis in one durable job. A job
 stores its canonical request, deduplication key, package/summary run IDs,
-current stage, counters, worker lease, heartbeat, and attempt count.
-Cancellation marks the job as cancel-requested, stops the active provider
-process when possible, and leaves the package/summary run rows with their last
-recorded state. Expired running leases are reclaimed after service restart.
+current stage, counters, worker lease, heartbeat, and attempt count. All job
+progress, run status updates, lease renewals, cancellation cleanup, and final
+publishes are fenced by `(job_id, worker_id, attempt)`, and each attempt writes
+its package and analysis files into an isolated `attempt-<n>/` directory so a
+stale worker whose lease expired cannot overwrite a newer owner's database
+state or published files. Cancellation marks the job as cancel-requested, stops
+the active provider process when possible, and refuses publication. Expired
+running leases are reclaimed after service restart.
 
-When Telegram delivery is enabled, summary records and deterministic delivery
-chunks are committed in one transaction. Important and point reports are built
-as independent payloads and chunk sequences before they are queued. The worker
-sends chunks in order and stores returned Telegram message IDs. A send failure
-moves only the outbox row to retry state with backoff; it does not roll back or
-fail the completed analysis. Canceling a job discards its unsent outbox rows;
-an already in-flight Telegram request is best-effort and cannot be retracted.
-Repeating an equivalent request returns its active
-or completed job by default; use API `force: true` or CLI `--force` for an
-intentional rerun.
+When Telegram delivery is enabled, the completed summary run, summary records,
+message points, and deterministic delivery chunks are published in one
+transaction. Important and point reports are numbered and queued independently
+by `content_kind`, so a chunk retrying in one report does not block the other.
+The worker sends chunks in order per report and stores returned Telegram
+message IDs. A send failure moves only the outbox row to retry state with
+backoff; after 30 failed attempts, that chunk and any remaining unsent chunks
+of the same report are marked `failed`. A send interrupted by service shutdown
+is released back to `retry` without spending an attempt. Canceling a job
+discards its unsent outbox rows; an already in-flight Telegram request is
+best-effort and cannot be retracted. Repeating an equivalent request returns
+its active or completed job by default; use API `force: true` or CLI `--force`
+for an intentional rerun.
 
 Telegram account runtime failures are recorded on a best-effort basis so a
 temporary SQLite or filesystem write failure cannot terminate the reconnect
@@ -391,10 +398,13 @@ tele-mess-core daily-schedule --config config.yml remove
 The systemd timer runs `daily-run --scheduled --enqueue-only`. It persists the
 durable job and exits; the long-running core worker then writes one
 `daily_package_runs` row, one `daily_summary_runs` row, independently queryable
-message-point rows, and the important/point daily summary records. Keeping
-execution in the core service also makes Telegram delivery reuse the existing
-account runtime instead of opening the same Telethon SQLite session from a
-second process.
+message-point rows, and the important/point daily summary records. Manual
+`daily-run` and `daily-summary` commands coordinate with the core service via a
+process lock (`<data_dir>/.daily-worker.lock`): when a service is running, the
+CLI enqueues and waits for the service worker without touching Telegram
+sessions; when no service is running, the CLI acquires the lock, executes only
+its own job, and delivers any queued chunks through a short-lived non-ingesting
+Telegram runtime.
 
 The durable worker treats transient SQLite busy/locked errors as recoverable:
 it resets its thread-local connection, backs off, and keeps processing jobs and

@@ -57,9 +57,13 @@ API/systemd trigger -> durable daily job queue -> package + analysis -> typed su
 - `TelegramRuntimeManager`, which keeps one long-lived client per account and
   shares it across ingestion, auth, discovery, participant refresh, and summary
   delivery. Account reconnect failures are isolated and retried independently.
-- `DailyJobWorker`, which claims durable SQLite jobs with leases, recovers work
-  after restart, observes cancellation, and drains retryable delivery-outbox
-  chunks.
+  `serve-api` runs the same runtime with ingestion disabled (`ingest=False`),
+  and offline management calls return structured error payloads instead of
+  blocking until the bridge timeout.
+- `DailyJobWorker`, which holds `<data_dir>/.daily-worker.lock` while active,
+  claims durable SQLite jobs with fenced `(worker_id, attempt)` leases and
+  periodic heartbeats, recovers work after restart, observes cancellation, and
+  drains retryable delivery-outbox chunks per report.
 - `SyncApiServer`, whose route authorization and request shape checks are read
   from the same contract registry that generates the OpenAPI and Markdown docs.
 

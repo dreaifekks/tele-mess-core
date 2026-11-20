@@ -37,12 +37,10 @@ class TelegramDiscoveryService:
         include_topics: bool = True,
         topic_limit: int = 100,
         include_private: bool = False,
-        client: Any | None = None,
+        *,
+        client: Any,
     ) -> dict[str, Any]:
-        owns_client = client is None
         try:
-            if client is None:
-                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 return {"account_id": self.account_id, "authorized": False, "status": "needs_login", "origins": 0, "topics": 0}
@@ -116,32 +114,30 @@ class TelegramDiscoveryService:
                 "include_private": include_private,
             }
         except Exception as exc:
-            error = classify_telegram_exception(exc, default_code="discover_origins_failed")
-            payload = error.to_public_dict()
-            self._record_operation("discover_origins", "failed", error=payload)
-            return {
-                "account_id": self.account_id,
-                "authorized": False,
-                "status": "failed",
-                "origins": 0,
-                "topics": 0,
-                "errors": [payload],
-                "topics_truncated": False,
-            }
-        finally:
-            if owns_client and client is not None:
-                await client.disconnect()
+            return self.discover_origins_error_result(exc)
+
+    def discover_origins_error_result(self, exc: Exception) -> dict[str, Any]:
+        error = classify_telegram_exception(exc, default_code="discover_origins_failed")
+        payload = error.to_public_dict()
+        self._record_operation("discover_origins", "failed", error=payload)
+        return {
+            "account_id": self.account_id,
+            "authorized": False,
+            "status": "failed",
+            "origins": 0,
+            "topics": 0,
+            "errors": [payload],
+            "topics_truncated": False,
+        }
 
     async def refresh_participants(
         self,
         origin_id: int,
         limit: int = 500,
-        client: Any | None = None,
+        *,
+        client: Any,
     ) -> dict[str, Any]:
-        owns_client = client is None
         try:
-            if client is None:
-                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 return {
@@ -207,35 +203,26 @@ class TelegramDiscoveryService:
                 "limit": effective_limit,
             }
         except Exception as exc:
-            error = classify_telegram_exception(exc, default_code="refresh_participants_failed")
-            payload = error.to_public_dict()
-            self._record_operation(
-                "refresh_participants",
-                "failed",
-                subject_type="origin",
-                subject_id=str(origin_id),
-                error=payload,
-            )
-            return {
-                "account_id": self.account_id,
-                "origin_id": origin_id,
-                "authorized": False,
-                "status": "failed",
-                "participants": 0,
-                "errors": [payload],
-            }
-        finally:
-            if owns_client and client is not None:
-                await client.disconnect()
+            return self.refresh_participants_error_result(origin_id, exc)
 
-    async def _connected_client(self) -> Any:
-        from telethon import TelegramClient
-
-        self.config.session_dir.mkdir(parents=True, exist_ok=True)
-        session_file = self.config.session_dir / self.config.session_name
-        client = TelegramClient(str(session_file), self.config.api_id, self.config.api_hash)
-        await client.connect()
-        return client
+    def refresh_participants_error_result(self, origin_id: int, exc: Exception) -> dict[str, Any]:
+        error = classify_telegram_exception(exc, default_code="refresh_participants_failed")
+        payload = error.to_public_dict()
+        self._record_operation(
+            "refresh_participants",
+            "failed",
+            subject_type="origin",
+            subject_id=str(origin_id),
+            error=payload,
+        )
+        return {
+            "account_id": self.account_id,
+            "origin_id": origin_id,
+            "authorized": False,
+            "status": "failed",
+            "participants": 0,
+            "errors": [payload],
+        }
 
     async def _discover_topics(self, client: Any, entity: Any, origin_id: int, topic_limit: int) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []

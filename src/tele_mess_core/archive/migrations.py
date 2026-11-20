@@ -300,6 +300,92 @@ def _migration_19(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_20(connection: sqlite3.Connection) -> None:
+    table = connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'delivery_outbox'"
+    ).fetchone()
+    if table is None:
+        return
+    columns = {str(row[1]) for row in connection.execute("PRAGMA table_info(delivery_outbox)").fetchall()}
+    if "content_kind" not in columns:
+        connection.execute(
+            """
+            CREATE TABLE delivery_outbox_v20 (
+              outbox_id TEXT PRIMARY KEY,
+              summary_run_id TEXT NOT NULL,
+              job_id TEXT,
+              account_id TEXT NOT NULL,
+              origin_id INTEGER NOT NULL,
+              topic_id INTEGER NOT NULL DEFAULT 0,
+              content_kind TEXT NOT NULL DEFAULT 'summary',
+              chunk_index INTEGER NOT NULL,
+              chunk_count INTEGER NOT NULL,
+              content TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              attempts INTEGER NOT NULL DEFAULT 0,
+              message_id INTEGER,
+              last_error TEXT,
+              next_attempt_at TEXT,
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              sent_at TEXT,
+              UNIQUE(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO delivery_outbox_v20(
+              outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+              content_kind, chunk_index, chunk_count, content, status, attempts,
+              message_id, last_error, next_attempt_at, created_at, updated_at, sent_at
+            )
+            SELECT
+              outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+              'summary', chunk_index, chunk_count, content, status, attempts,
+              message_id, last_error, next_attempt_at, created_at, updated_at, sent_at
+            FROM delivery_outbox
+            """
+        )
+        connection.execute("DROP TABLE delivery_outbox")
+        connection.execute("ALTER TABLE delivery_outbox_v20 RENAME TO delivery_outbox")
+    connection.execute(
+        "CREATE INDEX IF NOT EXISTS idx_delivery_outbox_pending ON delivery_outbox(status, next_attempt_at, created_at)"
+    )
+    connection.execute("DROP TRIGGER IF EXISTS delivery_outbox_validate_insert")
+    connection.execute("DROP TRIGGER IF EXISTS delivery_outbox_validate_update")
+    connection.execute(
+        """
+        CREATE TRIGGER delivery_outbox_validate_insert
+        BEFORE INSERT ON delivery_outbox
+        WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
+          OR length(trim(COALESCE(NEW.content_kind, ''))) = 0
+          OR NEW.chunk_index <= 0
+          OR NEW.chunk_count <= 0
+          OR NEW.chunk_index > NEW.chunk_count
+          OR NEW.attempts < 0
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid delivery outbox state');
+        END
+        """
+    )
+    connection.execute(
+        """
+        CREATE TRIGGER delivery_outbox_validate_update
+        BEFORE UPDATE ON delivery_outbox
+        WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
+          OR length(trim(COALESCE(NEW.content_kind, ''))) = 0
+          OR NEW.chunk_index <= 0
+          OR NEW.chunk_count <= 0
+          OR NEW.chunk_index > NEW.chunk_count
+          OR NEW.attempts < 0
+        BEGIN
+          SELECT RAISE(ABORT, 'invalid delivery outbox state');
+        END
+        """
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -315,4 +401,5 @@ MIGRATIONS: dict[int, Migration] = {
     17: _migration_17,
     18: _migration_18,
     19: _migration_19,
+    20: _migration_20,
 }

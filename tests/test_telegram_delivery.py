@@ -11,24 +11,13 @@ from tele_mess_core.config import DailyDeliveryConfig, TelegramAccountConfig
 from tele_mess_core.telegram.delivery import (
     TelegramSummaryDeliveryService,
     split_telegram_markdown,
-    split_telegram_message,
     telegram_markdown_for_send,
 )
 
 
 class TelegramDeliveryTest(unittest.TestCase):
-    def test_split_telegram_message_prefers_paragraph_boundaries(self) -> None:
-        text = "first paragraph\n\n" + ("second " * 80) + "\n\nthird"
-
-        chunks = split_telegram_message(text, limit=140)
-
-        self.assertGreater(len(chunks), 1)
-        self.assertTrue(chunks[0].startswith("first paragraph"))
-        self.assertTrue(chunks[-1].endswith("third"))
-        self.assertTrue(all(len(chunk) <= 140 for chunk in chunks))
-
-    def test_split_telegram_message_uses_empty_marker(self) -> None:
-        self.assertEqual(split_telegram_message(""), ["Daily summary is empty."])
+    def test_split_telegram_markdown_uses_empty_marker(self) -> None:
+        self.assertEqual(split_telegram_markdown(""), ["Daily summary is empty."])
 
     def test_telegram_markdown_converts_headings_but_preserves_tags_and_code(self) -> None:
         content = "# Daily Summary\n\n#point\n\n```md\n# code heading\n```"
@@ -104,7 +93,7 @@ class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         service = TelegramSummaryDeliveryService(account, store)
 
-        result = await service.send_summary(
+        result = await service.send_chunk(
             DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-1001),
             "# Important Summary\n\n**Bold** and `code`\n\n#point",
             client=client,
@@ -117,7 +106,7 @@ class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(str(client.calls[0]["body"]).startswith("**Important Summary**"))
         self.assertIn("#point", str(client.calls[0]["body"]))
 
-    async def test_send_summary_keeps_markdown_on_every_chunk(self) -> None:
+    async def test_send_chunk_preserves_markdown_on_split_chunks(self) -> None:
         class SentMessage:
             id = 42
 
@@ -146,15 +135,18 @@ class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
         client = FakeClient()
         service = TelegramSummaryDeliveryService(account, store)
         content = "**" + ("formatted content " * 300) + "**"
+        chunks = split_telegram_markdown(content, limit=100)
 
-        result = await service.send_summary(
-            DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-1001),
-            content,
-            client=client,
-        )
+        for chunk in chunks:
+            result = await service.send_chunk(
+                DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-1001),
+                chunk,
+                client=client,
+            )
+            self.assertEqual(result["message_count"], 1)
 
-        self.assertGreater(result["message_count"], 1)
-        self.assertEqual(len(client.calls), result["message_count"])
+        self.assertGreater(len(chunks), 1)
+        self.assertEqual(len(client.calls), len(chunks))
         self.assertTrue(all(call["parse_mode"] == "md" for call in client.calls))
         for call in client.calls:
             parsed, entities = telethon_markdown.parse(str(call["body"]))

@@ -7,6 +7,25 @@ validation rules.
 
 ## Unreleased
 
+- Delivery outbox chunks are numbered and ordered per `(summary_run_id, target,
+  content_kind)`, so important and point reports carry independent `[i/n]`
+  prefixes and a retrying report no longer blocks the other. After 30 failed
+  attempts a chunk and any trailing unsent chunks of the same report move to
+  the `failed` terminal state instead of retrying forever; shutdown
+  interruptions release the chunk back to `retry` without spending an attempt.
+  Schema version 20 adds `delivery_outbox.content_kind` and the `failed` state,
+  preserving pre-v20 `'summary'` rows without re-queueing them on rerun.
+- Daily job execution now coordinates via `<data_dir>/.daily-worker.lock`:
+  manual `daily-run` / `daily-summary` waits for the running core service when
+  present and runs only its own job standalone when no service is running. Job
+  progress, lease heartbeats, package/summary runs, cancellation cleanup,
+  outbox updates, and atomic summary publication are fenced by owner attempt,
+  with isolated per-attempt output directories (`attempt-<n>/`) so stale
+  workers cannot overwrite published results.
+- All Telegram I/O routes through `TelegramRuntimeManager`; `serve-api` and
+  `smoke-telegram` run the runtime with ingestion disabled, and offline
+  management calls return structured HTTP 200 error payloads promptly instead
+  of timing out.
 - `PATCH /manage/backup-policies` and `PATCH /manage/accounts/auth` keep
   fields the request omits instead of resetting them to defaults; patching the
   auth of an account that has no row yet still creates it.

@@ -25,19 +25,16 @@ class TelegramSummaryDeliveryService:
         self.store = store
         self.logger = logging.getLogger(__name__)
 
-    async def send_summary(
+    async def send_chunk(
         self,
         delivery: DailyDeliveryConfig,
         content: str,
-        client: Any | None = None,
-        split_content: bool = True,
+        *,
+        client: Any,
     ) -> dict[str, Any]:
         if delivery.origin_id is None:
             raise ValueError("daily.delivery.origin_id is required")
-        owns_client = client is None
         try:
-            if client is None:
-                client = await self._connected_client()
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login")
                 raise TelegramOperationError(
@@ -48,32 +45,21 @@ class TelegramSummaryDeliveryService:
 
             self._set_auth_state("authorized")
             entity = await client.get_entity(delivery.origin_id)
-            chunks = (
-                split_telegram_markdown(content)
-                if split_content
-                else [telegram_markdown_for_send(content)]
+            body = telegram_markdown_for_send(content)
+            sent = await client.send_message(
+                entity,
+                body,
+                reply_to=delivery.topic_id or None,
+                parse_mode=TELEGRAM_SUMMARY_PARSE_MODE,
             )
-            message_ids: list[int] = []
-            for index, chunk in enumerate(chunks, start=1):
-                body = chunk
-                if len(chunks) > 1:
-                    body = f"[{index}/{len(chunks)}]\n\n{chunk}"
-                sent = await client.send_message(
-                    entity,
-                    body,
-                    reply_to=delivery.topic_id or None,
-                    parse_mode=TELEGRAM_SUMMARY_PARSE_MODE,
-                )
-                message_id = getattr(sent, "id", None)
-                if message_id is not None:
-                    message_ids.append(int(message_id))
-
+            message_id = getattr(sent, "id", None)
+            message_ids = [int(message_id)] if message_id is not None else []
             result = {
                 "account_id": self.account_id,
                 "origin_id": delivery.origin_id,
                 "topic_id": delivery.topic_id,
                 "status": "sent",
-                "message_count": len(chunks),
+                "message_count": 1,
                 "message_ids": message_ids,
             }
             self._record_operation("deliver_daily_summary", "ok", result=result)
@@ -87,31 +73,32 @@ class TelegramSummaryDeliveryService:
             )
             raise
         except Exception as exc:
-            error = classify_telegram_exception(
-                exc,
-                default_code="daily_summary_delivery_failed",
-                default_auth_state="authorized",
-            )
-            payload = error.to_public_dict()
-            self._record_operation(
-                "deliver_daily_summary",
-                "failed",
-                subject_id=_delivery_subject_id(delivery),
-                error=payload,
-            )
-            raise TelegramOperationError(error.code, error.message, error.auth_state, error.http_status, error.retry_after, error.error_type) from exc
-        finally:
-            if owns_client and client is not None:
-                await client.disconnect()
+            raise self.record_delivery_error(delivery, exc) from exc
 
-    async def _connected_client(self) -> Any:
-        from telethon import TelegramClient
-
-        self.config.session_dir.mkdir(parents=True, exist_ok=True)
-        session_file = self.config.session_dir / self.config.session_name
-        client = TelegramClient(str(session_file), self.config.api_id, self.config.api_hash)
-        await client.connect()
-        return client
+    def record_delivery_error(
+        self,
+        delivery: DailyDeliveryConfig,
+        exc: Exception,
+    ) -> TelegramOperationError:
+        error = classify_telegram_exception(
+            exc,
+            default_code="daily_summary_delivery_failed",
+            default_auth_state="authorized",
+        )
+        self._record_operation(
+            "deliver_daily_summary",
+            "failed",
+            subject_id=_delivery_subject_id(delivery),
+            error=error.to_public_dict(),
+        )
+        return TelegramOperationError(
+            error.code,
+            error.message,
+            error.auth_state,
+            error.http_status,
+            error.retry_after,
+            error.error_type,
+        )
 
     def _set_auth_state(self, state: str) -> None:
         self.store.upsert_account_auth(
@@ -149,23 +136,6 @@ class TelegramSummaryDeliveryService:
                 raw_json=json.dumps(error or result or {}, ensure_ascii=False),
             )
         )
-
-
-def split_telegram_message(content: str, limit: int = MAX_TELEGRAM_MESSAGE_CHARS) -> list[str]:
-    text = str(content or "").strip()
-    if not text:
-        return ["Daily summary is empty."]
-    if limit < 100:
-        raise ValueError("limit must be at least 100")
-    chunks: list[str] = []
-    remaining = text
-    while len(remaining) > limit:
-        split_at = _best_split_index(remaining, limit)
-        chunks.append(remaining[:split_at].rstrip())
-        remaining = remaining[split_at:].lstrip()
-    if remaining:
-        chunks.append(remaining)
-    return chunks
 
 
 def split_telegram_markdown(content: str, limit: int = MAX_TELEGRAM_MESSAGE_CHARS) -> list[str]:
@@ -283,14 +253,6 @@ def _slice_telegram_entities(
         chunk_entity.length = overlap_end - overlap_start
         chunk_entities.append(chunk_entity)
     return chunk_entities
-
-
-def _best_split_index(text: str, limit: int) -> int:
-    for separator in ("\n\n", "\n", ". ", " "):
-        index = text.rfind(separator, 0, limit + 1)
-        if index >= max(1, limit // 2):
-            return index + len(separator)
-    return limit
 
 
 def _delivery_subject_id(delivery: DailyDeliveryConfig) -> str:

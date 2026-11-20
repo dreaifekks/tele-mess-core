@@ -1372,9 +1372,99 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 with self.subTest(operation=operation.__name__):
                     runtime = Mock()
                     with self.assertRaisesRegex(ValueError, "source"):
-                        operation(config, store, payload, runtime)
+                        operation(payload, runtime)
                     runtime.call.assert_not_called()
             store.close()
+
+    def test_offline_runtime_returns_http_200_structured_errors(self) -> None:
+        import asyncio
+        import threading
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        class OfflineClient:
+            async def connect(self) -> None:
+                raise ConnectionError("network unreachable")
+
+            async def disconnect(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ArchiveStore(root / "archive.db")
+            store.initialize()
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=root / "archive.db"),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: OfflineClient(),
+                ingest=False,
+                connect_wait_seconds=1.0,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                def post(path: str, body: dict) -> tuple[int, dict]:
+                    req = Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=json.dumps(body).encode("utf-8"),
+                        method="POST",
+                    )
+                    req.add_header("Authorization", "Bearer secret")
+                    req.add_header("Content-Type", "application/json")
+                    with urlopen(req, timeout=3) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+                status, auth_payload = post("/manage/accounts/auth/status", {"account_id": "main"})
+                self.assertEqual(status, 200)
+                self.assertFalse(auth_payload["item"]["authorized"])
+                self.assertEqual(auth_payload["item"]["auth_state"], "auth_failed")
+                self.assertEqual(auth_payload["item"]["error"]["code"], "auth_status_failed")
+
+                status, discover_payload = post("/manage/discover-origins", {"account_id": "main"})
+                self.assertEqual(status, 200)
+                self.assertFalse(discover_payload["item"]["authorized"])
+                self.assertEqual(discover_payload["item"]["status"], "failed")
+                self.assertEqual(discover_payload["item"]["errors"][0]["code"], "discover_origins_failed")
+
+                status, part_payload = post("/manage/participants/refresh", {"account_id": "main", "origin_id": -1001})
+                self.assertEqual(status, 200)
+                self.assertFalse(part_payload["item"]["authorized"])
+                self.assertEqual(part_payload["item"]["status"], "failed")
+                self.assertEqual(part_payload["item"]["errors"][0]["code"], "refresh_participants_failed")
+            finally:
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
 
 
 if __name__ == "__main__":

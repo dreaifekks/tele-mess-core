@@ -40,7 +40,6 @@ from tele_mess_core.daily import (
     _origin_image_paths,
     _run_summary_provider,
     build_daily_package,
-    deliver_daily_summary,
     resolve_daily_summary_delivery,
     run_daily_summary,
     update_daily_package_schedule,
@@ -76,7 +75,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_worker_interruption_fails_the_package_run(self) -> None:
+    def test_worker_interruption_leaves_package_run_resumable(self) -> None:
         checks = 0
 
         def interrupt_after_start() -> None:
@@ -86,19 +85,20 @@ class DailyPackagingTest(unittest.TestCase):
                 raise DailyJobInterrupted("worker stopping")
 
         run_id = "pkg_interrupted"
-        build_daily_package(
-            self.store,
-            self.config,
-            run_date="2026-07-03",
-            timezone_name="UTC",
-            run_id=run_id,
-            cancel_check=interrupt_after_start,
-        )
+        with self.assertRaises(DailyJobInterrupted):
+            build_daily_package(
+                self.store,
+                self.config,
+                run_date="2026-07-03",
+                timezone_name="UTC",
+                run_id=run_id,
+                cancel_check=interrupt_after_start,
+            )
 
         package = self.store.get_daily_package_run(run_id)
         assert package is not None
-        self.assertEqual(package["status"], "failed")
-        self.assertIsNotNone(package["finished_at"])
+        self.assertEqual(package["status"], "running")
+        self.assertIsNone(package["finished_at"])
 
     def test_worker_interruption_does_not_fail_summary_run(self) -> None:
         package = build_daily_package(
@@ -300,33 +300,27 @@ class DailyPackagingTest(unittest.TestCase):
             )
         )
 
-        delivery_result = {
-            "account_id": "main",
-            "origin_id": -9001,
-            "topic_id": 88,
-            "status": "sent",
-            "message_count": 1,
-            "message_ids": [123],
-        }
-        with patch("tele_mess_core.daily.deliver_daily_summary", return_value=delivery_result) as deliver:
-            summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
+        summary = run_daily_summary(self.store, self.config, package_run_id=package["run_id"])
 
-        deliver.assert_called_once()
-        delivered_content = deliver.call_args.args[2]
-        self.assertIn("# Daily Message Point Summary", delivered_content)
+        outbox = self.store.list_delivery_outbox(summary_run_id=summary["run_id"])
+        self.assertEqual(len(outbox), 1)
+        self.assertEqual(outbox[0]["content_kind"], "point_summary")
+        self.assertEqual(outbox[0]["origin_id"], -9001)
+        self.assertEqual(outbox[0]["topic_id"], 88)
+        delivered_content = outbox[0]["content"]
+        self.assertIn("**Daily Message Point Summary**", delivered_content)
         self.assertIn("- Date: `2026-07-03`", delivered_content)
         self.assertIn("- Timezone: `UTC`", delivered_content)
         self.assertIn("- Tags: #point", delivered_content)
         self.assertIn("- Summary provider: `disabled`", delivered_content)
         self.assertIn("No message points were extracted", delivered_content)
 
-        self.assertEqual(deliver.call_args.kwargs["delivery"].origin_id, -9001)
         self.assertEqual(summary["status"], "completed")
         self.assertEqual(summary["progress_current"], summary["progress_total"])
         self.assertEqual(summary["progress"]["delivery_count"], 1)
         summary_payload = json.loads((Path(summary["output_dir"]) / "summary.json").read_text(encoding="utf-8"))
-        self.assertEqual(summary_payload["delivery"]["status"], "sent")
-        self.assertEqual(summary_payload["delivery"]["deliveries"], [{"kind": "point_summary", "result": delivery_result}])
+        self.assertEqual(summary_payload["delivery"]["status"], "queued")
+        self.assertEqual(summary_payload["delivery"]["delivery_kinds"], ["point_summary"])
 
     def test_image_paths_follow_the_archive_media_classification(self) -> None:
         media_dir = self.root / "media"
@@ -396,36 +390,6 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(resolved.account_id, "runtime-account")
         self.assertEqual(resolved.origin_id, -9001)
         self.assertEqual(resolved.topic_id, 42)
-        runtime = Mock()
-        runtime.call.return_value = {"status": "sent", "message_ids": [123]}
-
-        result = deliver_daily_summary(self.store, self.config, "summary", telegram_runtime=runtime)
-
-        self.assertEqual(result, {"status": "sent", "message_ids": [123]})
-        runtime.call.assert_called_once_with(
-            "runtime-account",
-            "deliver_summary",
-            delivery=resolved,
-            content="summary",
-        )
-
-        with patch("tele_mess_core.telegram.delivery.TelegramSummaryDeliveryService") as service_class:
-            service_class.return_value.send_summary = AsyncMock(
-                return_value={"status": "sent", "message_ids": [456]}
-            )
-            direct_result = deliver_daily_summary(self.store, self.config, "direct summary")
-
-        self.assertEqual(direct_result, {"status": "sent", "message_ids": [456]})
-        account = service_class.call_args.args[0]
-        self.assertEqual(account.account_id, "runtime-account")
-        self.assertEqual(account.api_id, 123)
-        self.assertEqual(account.api_hash, "template-hash")
-        self.assertEqual(account.session_name, "runtime-session")
-        self.assertEqual(account.session_dir, self.root / "runtime-sessions")
-        service_class.return_value.send_summary.assert_awaited_once_with(
-            resolved,
-            "direct summary",
-        )
 
     def test_daily_delivery_rejects_non_telegram_management_account(self) -> None:
         self.store.upsert_account(
@@ -496,17 +460,8 @@ class DailyPackagingTest(unittest.TestCase):
             scope={"account_id": "main"},
         )
         fake_config, fake_log = self._structured_ai_config(delivery=True)
-        delivery_result = {
-            "account_id": "main",
-            "origin_id": -9900,
-            "topic_id": 0,
-            "status": "sent",
-            "message_count": 1,
-            "message_ids": [321],
-        }
 
-        with patch("tele_mess_core.daily.deliver_daily_summary", return_value=delivery_result) as deliver:
-            summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
+        summary = run_daily_summary(self.store, fake_config, package_run_id=package["run_id"])
 
         self.assertEqual(summary["status"], "completed")
         calls = self._structured_provider_calls(fake_log)
@@ -519,7 +474,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertIn("daily_point_summary", tasks)
         self.assertEqual(
             next(item for item in calls if item["task"] == "daily_point_summary")["persisted_point_count"],
-            2,
+            0,
         )
         self.assertNotIn("normal_origin_key_extraction", tasks)
         self.assertNotIn("normal_group_analysis", tasks)
@@ -550,10 +505,16 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertEqual(point_daily["tags"], ["point"])
         self.assertIn("Fake daily_point_summary", point_daily["content_preview"])
 
-        self.assertEqual(deliver.call_count, 2)
-        delivered = [item.args[2] for item in deliver.call_args_list]
-        important_delivery = next(content for content in delivered if content.startswith("# Important Daily Summary"))
-        point_delivery = next(content for content in delivered if content.startswith("# Daily Message Point Summary"))
+        outbox = self.store.list_delivery_outbox(summary_run_id=summary["run_id"])
+        self.assertEqual(len(outbox), 2)
+        by_kind = {item["content_kind"]: item for item in outbox}
+        self.assertEqual(set(by_kind), {"important_summary", "point_summary"})
+        self.assertEqual(by_kind["important_summary"]["chunk_index"], 1)
+        self.assertEqual(by_kind["important_summary"]["chunk_count"], 1)
+        self.assertEqual(by_kind["point_summary"]["chunk_index"], 1)
+        self.assertEqual(by_kind["point_summary"]["chunk_count"], 1)
+        important_delivery = by_kind["important_summary"]["content"]
+        point_delivery = by_kind["point_summary"]["content"]
         self.assertNotIn("- Tags: #point", important_delivery)
         self.assertIn("- Tags: #point", point_delivery)
         self.assertIn("Fake daily_point_summary", point_delivery)
@@ -607,7 +568,7 @@ class DailyPackagingTest(unittest.TestCase):
         all_calls = self._structured_provider_calls(fake_log)
         self.assertEqual(
             next(item for item in all_calls if item["task"] == "daily_point_summary")["persisted_point_count"],
-            2,
+            0,
         )
         points = self.store.list_daily_message_points(run_id=summary["run_id"], limit=20)
         self.assertEqual(
