@@ -162,7 +162,7 @@ class ArchiveStore:
                 raise
 
     def _upgrade_schema(self, existing_schema_version: int) -> None:
-        tables_sql, objects_sql = _schema_sql_parts()
+        tables_sql, object_statements = _schema_sql_parts()
         message_fts_existed = self._has_table("message_fts")
         if self._has_table("messages") and not self._has_column("messages", "account_id"):
             self._migrate_v1_to_v2()
@@ -172,7 +172,6 @@ class ArchiveStore:
         # until the triggers and the full-text index are rebuilt as well.
         self.set_meta(UPGRADE_PENDING_META, "1")
         self._conn.commit()
-        rebuild_message_fts = not message_fts_existed or not self._message_fts_integrity_is_valid()
         self._ensure_current_schema()
         current_version = self.get_meta("schema_version")
         apply_migrations(
@@ -180,16 +179,19 @@ class ArchiveStore:
             max(int(current_version) if current_version else existing_schema_version, LEGACY_SCHEMA_BASELINE),
             SCHEMA_VERSION,
         )
-        self._conn.executescript(
-            "DROP TRIGGER IF EXISTS messages_ai;\n"
-            "DROP TRIGGER IF EXISTS messages_ad;\n"
-            "DROP TRIGGER IF EXISTS messages_au;\n" + objects_sql
-        )
-        if rebuild_message_fts:
+        # Replacing the triggers and checking the index share one write
+        # transaction with the final version stamp in initialize(), so no
+        # message can be written while the full-text triggers are missing.
+        self._conn.execute("BEGIN IMMEDIATE")
+        for trigger in ("messages_ai", "messages_ad", "messages_au"):
+            self._conn.execute(f"DROP TRIGGER IF EXISTS {trigger}")
+        for statement in object_statements:
+            self._conn.execute(statement)
+        if not message_fts_existed or not self._message_fts_integrity_is_valid():
             self._rebuild_message_fts()
 
     def _rebuild_message_fts(self) -> None:
-        self._conn.executescript("INSERT INTO message_fts(message_fts) VALUES('rebuild');")
+        self._conn.execute("INSERT INTO message_fts(message_fts) VALUES('rebuild')")
 
     def _validate_existing_schema_version(self) -> int:
         user_version = int(self._conn.execute("PRAGMA user_version").fetchone()[0])
@@ -221,9 +223,7 @@ class ArchiveStore:
                 "INSERT INTO message_fts(message_fts, rank) VALUES('integrity-check', 1)"
             )
         except sqlite3.DatabaseError:
-            self._conn.rollback()
             return False
-        self._conn.rollback()
         return True
 
     def get_meta(self, key: str) -> str | None:
@@ -3490,7 +3490,7 @@ def _schema_sql() -> str:
     return resources.files("tele_mess_core.archive").joinpath("schema.sql").read_text()
 
 
-def _schema_sql_parts() -> tuple[str, str]:
+def _schema_sql_parts() -> tuple[str, list[str]]:
     """Split the schema snapshot into table statements and the indexes and triggers built on them."""
     tables: list[str] = []
     objects: list[str] = []
@@ -3501,7 +3501,7 @@ def _schema_sql_parts() -> tuple[str, str]:
             target = tables if re.match(r"\s*CREATE\s+(VIRTUAL\s+)?TABLE\b", statement) else objects
             target.append(statement.strip())
             statement = ""
-    return "\n".join(tables), "\n".join(objects)
+    return "\n".join(tables), objects
 
 
 def _row_to_dict(

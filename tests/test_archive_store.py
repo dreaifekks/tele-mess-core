@@ -339,6 +339,48 @@ class ArchiveStoreTest(unittest.TestCase):
 
         self.assertEqual(self.store.search_messages("interrupted")[0]["message_id"], 15)
 
+    def test_message_written_while_upgrade_replaces_triggers_is_indexed(self) -> None:
+        with self.store._lock:
+            self.store.set_meta("schema_version", str(SCHEMA_VERSION - 1))
+            self.store._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION - 1}")
+            self.store._conn.commit()
+        concurrent_write_failed = []
+
+        def insert_message(connection: sqlite3.Connection) -> None:
+            connection.execute(
+                """
+                INSERT INTO messages(source, account_id, chat_id, message_id, sent_at, ingested_at, text)
+                VALUES ('telegram', 'default', -1001, 16, '2026-07-03T00:00:00+00:00',
+                        '2026-07-03T00:00:00+00:00', 'written during upgrade')
+                """
+            )
+            connection.commit()
+
+        def write_from_another_connection(statement: str) -> None:
+            if "CREATE TRIGGER" in statement and "messages_ai" in statement and not concurrent_write_failed:
+                other = sqlite3.connect(str(self.store.database_path), timeout=0)
+                try:
+                    insert_message(other)
+                    concurrent_write_failed.append(False)
+                except sqlite3.OperationalError:
+                    concurrent_write_failed.append(True)
+                finally:
+                    other.close()
+
+        self.store._conn.set_trace_callback(write_from_another_connection)
+        try:
+            self.store.initialize()
+        finally:
+            self.store._conn.set_trace_callback(None)
+        if concurrent_write_failed == [True]:
+            other = sqlite3.connect(str(self.store.database_path))
+            try:
+                insert_message(other)
+            finally:
+                other.close()
+
+        self.assertEqual(self.store.search_messages("upgrade")[0]["message_id"], 16)
+
     def test_upgrade_repairs_existing_empty_fts_index(self) -> None:
         now = utc_now_iso()
         self.store.upsert_message(
