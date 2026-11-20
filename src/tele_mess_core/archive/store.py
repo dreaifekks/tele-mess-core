@@ -343,6 +343,7 @@ class ArchiveStore:
         expected_seq: int | None = None,
         owner_id: str | None = None,
         owner_epoch: int | None = None,
+        extra_meta: dict[str, str] | None = None,
     ) -> bool:
         now = auth.updated_at or utc_now_iso()
         seq_key = f"auth_state_seq:{auth.source}:{auth.account_id}"
@@ -366,6 +367,14 @@ class ArchiveStore:
                     if existing_seq != int(expected_seq) and not same_owner_newer:
                         self._conn.rollback()
                         return False
+                elif (
+                    owner_id is not None
+                    and owner_epoch is not None
+                    and existing_owner == owner_id
+                    and int(owner_epoch) <= existing_epoch
+                ):
+                    self._conn.rollback()
+                    return False
                 target_seq = existing_seq + 1
                 meta_value = json.dumps(
                     {
@@ -382,6 +391,15 @@ class ArchiveStore:
                     """,
                     (seq_key, meta_value),
                 )
+                if extra_meta:
+                    for key, value in extra_meta.items():
+                        self._conn.execute(
+                            """
+                            INSERT INTO meta(key, value) VALUES (?, ?)
+                            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+                            """,
+                            (str(key), str(value)),
+                        )
                 self._conn.execute(
                     """
                     INSERT INTO account_auth(

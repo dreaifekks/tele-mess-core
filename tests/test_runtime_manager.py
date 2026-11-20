@@ -767,6 +767,145 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(ops.count("request_code"), 1)
         self.assertEqual(ops.count("submit_code"), 2)
 
+    async def test_timed_out_request_code_cannot_overwrite_newer_hash_or_disconnect_telegram(self) -> None:
+        from types import SimpleNamespace
+
+        write_entered = threading.Event()
+        release_old_write = threading.Event()
+        disconnects = 0
+        signed_in_hashes: list[str | None] = []
+        original_upsert = self.store.upsert_account_auth
+
+        def gated_upsert(auth: AccountAuthRecord, **kwargs: object) -> bool:
+            if auth.auth_state == "code_sent" and auth.phone == "+1000":
+                write_entered.set()
+                release_old_write.wait(timeout=2.0)
+            return original_upsert(auth, **kwargs)
+
+        class CodeClient(FakeClient):
+            async def send_code_request(self, phone: str) -> object:
+                return SimpleNamespace(phone_code_hash="hash_old" if phone == "+1000" else "hash_new")
+
+            async def sign_in(self, **kwargs: object) -> None:
+                signed_in_hashes.append(kwargs.get("phone_code_hash"))  # type: ignore[arg-type]
+
+            async def disconnect(self) -> None:
+                nonlocal disconnects
+                disconnects += 1
+                await super().disconnect()
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: CodeClient(authorized=False),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=0.06,
+        )
+        await manager.start()
+        try:
+            with unittest.mock.patch.object(self.store, "upsert_account_auth", side_effect=gated_upsert):
+                first = await manager.execute("main", "request_code", phone="+1000")
+                self.assertFalse(first["sent"])
+                self.assertEqual(first["error"]["code"], "request_code_failed")
+                self.assertTrue(write_entered.wait(timeout=1.0))
+                # Only local SQLite persistence timed out — healthy Telegram client must NOT disconnect.
+                self.assertEqual(disconnects, 0)
+                self.assertFalse(manager._runtimes["main"]._force_disconnect.is_set())
+
+                # Second request_code succeeds immediately with new phone & hash.
+                second = await manager.execute("main", "request_code", phone="+2000")
+                self.assertEqual(second["auth_state"], "code_sent")
+                self.assertEqual(second["phone"], "+2000")
+
+                # Release the delayed background write from the timed-out first request.
+                release_old_write.set()
+                await asyncio.sleep(0.08)
+
+            accounts = {item["account_id"]: item for item in self.store.list_management_accounts()}
+            self.assertEqual(accounts["main"]["phone"], "+2000")
+            self.assertEqual(self.store.get_meta("telegram_auth:main:phone_code_hash"), "hash_new")
+
+            submitted = await manager.execute("main", "submit_code", phone="+2000", code="99999")
+            self.assertTrue(submitted["authorized"])
+            self.assertEqual(signed_in_hashes, ["hash_new"])
+        finally:
+            release_old_write.set()
+            await manager.stop()
+
+    async def test_discover_and_refresh_timeout_after_commit_preserves_partial_counts_without_reconnect(self) -> None:
+        from types import SimpleNamespace
+
+        release_second_origin = threading.Event()
+        release_second_participant = threading.Event()
+        disconnects = 0
+        original_upsert_origin = self.store.upsert_origin
+        original_upsert_participant = self.store.upsert_participant
+
+        def gated_origin(record: object) -> None:
+            if getattr(record, "origin_id", None) == -1002:
+                release_second_origin.wait(timeout=2.0)
+            original_upsert_origin(record)  # type: ignore[arg-type]
+
+        def gated_participant(record: object) -> None:
+            if getattr(record, "user_id", None) == 2:
+                release_second_participant.wait(timeout=2.0)
+            original_upsert_participant(record)  # type: ignore[arg-type]
+
+        class TwoItemClient(FakeClient):
+            async def iter_dialogs(self):
+                for oid, title in ((-1001, "One"), (-1002, "Two")):
+                    yield SimpleNamespace(
+                        id=oid,
+                        title=title,
+                        is_user=False,
+                        is_group=True,
+                        is_channel=False,
+                        date=None,
+                        entity=SimpleNamespace(megagroup=True, broadcast=False, forum=False, username=None),
+                    )
+
+            async def iter_participants(self, origin_id: int, limit: int = 500):
+                for uid, name in ((1, "Alice"), (2, "Bob")):
+                    yield SimpleNamespace(id=uid, username=name.lower(), first_name=name, last_name=None, bot=False)
+
+            async def disconnect(self) -> None:
+                nonlocal disconnects
+                disconnects += 1
+                await super().disconnect()
+
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: TwoItemClient(authorized=True),
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=0.06,
+        )
+        await manager.start()
+        try:
+            with (
+                unittest.mock.patch.object(self.store, "upsert_origin", side_effect=gated_origin),
+                unittest.mock.patch.object(self.store, "upsert_participant", side_effect=gated_participant),
+            ):
+                disc = await manager.execute("main", "discover_origins", include_topics=False)
+                self.assertEqual(disc["status"], "partial")
+                self.assertTrue(disc["authorized"])
+                self.assertEqual(disc["origins"], 1)
+                self.assertEqual(disc["errors"][-1]["code"], "discover_origins_failed")
+                self.assertEqual(disconnects, 0)
+
+                part = await manager.execute("main", "refresh_participants", origin_id=-1001)
+                self.assertEqual(part["status"], "partial")
+                self.assertTrue(part["authorized"])
+                self.assertEqual(part["participants"], 1)
+                self.assertEqual(part["errors"][-1]["code"], "refresh_participants_failed")
+                self.assertEqual(disconnects, 0)
+        finally:
+            release_second_origin.set()
+            release_second_participant.set()
+            await manager.stop()
+
 
 class ConfiguredAccountSyncTest(unittest.TestCase):
     def test_bootstrap_preserves_observed_auth_state(self) -> None:

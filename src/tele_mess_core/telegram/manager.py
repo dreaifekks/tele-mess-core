@@ -137,20 +137,27 @@ class TelegramAccountRuntime:
             timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
             return self._offline_result(operation, error=timeout_exc, **kwargs)
         lock_acquired = False
+        call_state: dict[str, Any] = {"cancelled_in_local_write": False}
+        progress: dict[str, Any] = {}
 
         async def run_with_lock() -> dict[str, Any]:
             nonlocal lock_acquired
             async with self._command_lock:
                 lock_acquired = True
-                return await self._execute_locked(operation, **kwargs)
+                return await self._execute_locked(
+                    operation,
+                    call_state=call_state,
+                    progress=progress,
+                    **kwargs,
+                )
 
         try:
             return await asyncio.wait_for(run_with_lock(), timeout=remaining)
         except TimeoutError:
             timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
-            if lock_acquired:
+            if lock_acquired and not call_state["cancelled_in_local_write"]:
                 self._trigger_reconnect_after_timeout(timeout_exc)
-            return self._offline_result(operation, error=timeout_exc, **kwargs)
+            return self._offline_result(operation, error=timeout_exc, progress=progress, **kwargs)
 
     def _operation_timeout(self, operation: str) -> float | None:
         if operation in MANAGEMENT_OPERATIONS:
@@ -165,10 +172,18 @@ class TelegramAccountRuntime:
         self._reconnect_now.set()
         self._force_disconnect.set()
 
-    async def _execute_locked(self, operation: str, **kwargs: Any) -> dict[str, Any]:
+    async def _execute_locked(
+        self,
+        operation: str,
+        *,
+        call_state: dict[str, Any] | None = None,
+        progress: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
         client = self.client
         if client is None or not self._ready.is_set():
-            return self._offline_result(operation, **kwargs)
+            return self._offline_result(operation, progress=progress, **kwargs)
+        write_runner = lambda writer, st=call_state: self._run_store_write(writer, state=st)
         if operation == "auth_status":
             result = await TelegramAuthService(
                 self.config,
@@ -176,7 +191,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
-                store_write_runner=self._run_store_write,
+                store_write_runner=write_runner,
             ).status(client=client)
             if result.get("authorized"):
                 self._schedule_ingestion(client)
@@ -188,7 +203,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
-                store_write_runner=self._run_store_write,
+                store_write_runner=write_runner,
             ).request_code(
                 str(kwargs["phone"]),
                 client=client,
@@ -200,7 +215,7 @@ class TelegramAccountRuntime:
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
                 auth_owner_provider=self._next_auth_mutation_owner,
-                store_write_runner=self._run_store_write,
+                store_write_runner=write_runner,
             ).submit_code(
                 str(kwargs["phone"]),
                 str(kwargs["code"]),
@@ -216,12 +231,13 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
-                store_write_runner=self._run_store_write,
+                store_write_runner=write_runner,
             ).discover_origins(
                 include_topics=bool(kwargs.get("include_topics", True)),
                 topic_limit=int(kwargs.get("topic_limit", 100)),
                 include_private=bool(kwargs.get("include_private", False)),
                 client=client,
+                progress=progress,
             )
         if operation == "refresh_participants":
             return await TelegramDiscoveryService(
@@ -229,11 +245,12 @@ class TelegramAccountRuntime:
                 self.store,
                 error_persister=self._schedule_offline_diagnostic,
                 auth_probe_provider=self._begin_auth_probe,
-                store_write_runner=self._run_store_write,
+                store_write_runner=write_runner,
             ).refresh_participants(
                 int(kwargs["origin_id"]),
                 int(kwargs.get("limit", 500)),
                 client=client,
+                progress=progress,
             )
         if operation == "deliver_chunk":
             return await TelegramSummaryDeliveryService(self.config, self.store).send_chunk(
@@ -288,6 +305,7 @@ class TelegramAccountRuntime:
         operation: str,
         *,
         error: Exception | None = None,
+        progress: dict[str, Any] | None = None,
         **kwargs: Any,
     ) -> dict[str, Any]:
         exc = error or self._last_connect_error or ConnectionError(
@@ -318,13 +336,13 @@ class TelegramAccountRuntime:
             return result
         if operation == "discover_origins":
             service = TelegramDiscoveryService(self.config, self.store)
-            result = service.discover_origins_error_result(exc, persist=False)
+            result = service.discover_origins_error_result(exc, persist=False, progress=progress)
             self._schedule_offline_diagnostic(lambda: service.discover_origins_error_result(exc, persist=True))
             return result
         if operation == "refresh_participants":
             origin_id = int(kwargs["origin_id"])
             service = TelegramDiscoveryService(self.config, self.store)
-            result = service.refresh_participants_error_result(origin_id, exc, persist=False)
+            result = service.refresh_participants_error_result(origin_id, exc, persist=False, progress=progress)
             self._schedule_offline_diagnostic(
                 lambda: service.refresh_participants_error_result(origin_id, exc, persist=True)
             )
@@ -338,13 +356,21 @@ class TelegramAccountRuntime:
             return {"account_id": self.config.account_id, "status": "offline"}
         raise ValueError(f"Unknown Telegram runtime operation: {operation}")
 
-    async def _run_store_write(self, writer: Callable[[], Any]) -> Any:
+    async def _run_store_write(
+        self,
+        writer: Callable[[], Any],
+        *,
+        state: dict[str, Any] | None = None,
+    ) -> Any:
         """Run a SQLite write off the shared event loop so management timeouts stay responsive."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[Any] = loop.create_future()
+        cancel_flag = threading.Event()
 
         def run() -> None:
             try:
+                if cancel_flag.is_set():
+                    return
                 conn = getattr(self.store, "_conn", None)
                 if conn is not None:
                     conn.execute("PRAGMA busy_timeout = 200")
@@ -378,7 +404,13 @@ class TelegramAccountRuntime:
             self._diagnostic_threads = {item for item in self._diagnostic_threads if item.is_alive()}
             self._diagnostic_threads.add(thread)
         thread.start()
-        return await future
+        try:
+            return await future
+        except asyncio.CancelledError:
+            cancel_flag.set()
+            if state is not None:
+                state["cancelled_in_local_write"] = True
+            raise
 
     def _schedule_offline_diagnostic(self, writer: Callable[[], Any]) -> None:
         """Persist offline diagnostic state off the HTTP response path so SQLite contention never blocks or fails it."""

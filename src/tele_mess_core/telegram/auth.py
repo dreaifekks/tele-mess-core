@@ -78,14 +78,22 @@ class TelegramAuthService:
         try:
             result = await client.send_code_request(phone)
             phone_code_hash = getattr(result, "phone_code_hash", None)
+            # Capture ordering token BEFORE scheduling the off-loop write so a timed-out
+            # earlier write cannot overwrite a newer request_code's hash or auth state.
+            probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
+            extra_meta = (
+                {_phone_code_hash_key(self.account_id): str(phone_code_hash)}
+                if phone_code_hash
+                else None
+            )
 
             def persist_sent() -> None:
-                if phone_code_hash:
-                    self.store.set_meta(_phone_code_hash_key(self.account_id), str(phone_code_hash))
                 self._record_state(
                     "code_sent",
                     phone=phone,
                     raw={"phone": phone, "phone_code_hash_set": bool(phone_code_hash)},
+                    probe=probe,
+                    extra_meta=extra_meta,
                 )
 
             await self._run_write(persist_sent)
@@ -143,9 +151,11 @@ class TelegramAuthService:
         except Exception as exc:
             if _is_password_needed(exc):
                 if not password:
+                    probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
+
                     def persist_password_needed() -> None:
-                        self._record_state("password_needed", phone=phone)
-                        self._record_operation("submit_code", "password_needed")
+                        if self._record_state("password_needed", phone=phone, probe=probe):
+                            self._record_operation("submit_code", "password_needed")
 
                     await self._run_write(persist_password_needed)
                     return {"account_id": self.account_id, "auth_state": "password_needed", "authorized": False}
@@ -170,9 +180,15 @@ class TelegramAuthService:
                     )
                 )
 
+        probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
+
         def persist_authorized() -> None:
-            self.store.set_meta(_phone_code_hash_key(self.account_id), "")
-            self._record_state("authorized", phone=phone)
+            self._record_state(
+                "authorized",
+                phone=phone,
+                probe=probe,
+                extra_meta={_phone_code_hash_key(self.account_id): ""},
+            )
 
         await self._run_write(persist_authorized)
         return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
@@ -246,17 +262,9 @@ class TelegramAuthService:
         raw: dict[str, Any] | None = None,
         *,
         probe: tuple[int, str, int] | None = None,
-    ) -> None:
+        extra_meta: dict[str, str] | None = None,
+    ) -> bool:
         now = utc_now_iso()
-        self.store.upsert_account(
-            AccountRecord(
-                source=SOURCE_TELEGRAM,
-                account_id=self.account_id,
-                display_name=self.account_id,
-                kind="telegram",
-                updated_at=now,
-            )
-        )
         auth_record = AccountAuthRecord(
             source=SOURCE_TELEGRAM,
             account_id=self.account_id,
@@ -270,21 +278,35 @@ class TelegramAuthService:
         )
         if probe is not None:
             expected_seq, owner_id, owner_epoch = probe
-            self.store.upsert_account_auth(
+            wrote = self.store.upsert_account_auth(
                 auth_record,
                 expected_seq=expected_seq,
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
+                extra_meta=extra_meta,
             )
         elif self._auth_owner_provider is not None:
             owner_id, owner_epoch = self._auth_owner_provider()
-            self.store.upsert_account_auth(
+            wrote = self.store.upsert_account_auth(
                 auth_record,
                 owner_id=owner_id,
                 owner_epoch=owner_epoch,
+                extra_meta=extra_meta,
             )
         else:
-            self.store.upsert_account_auth(auth_record)
+            wrote = self.store.upsert_account_auth(auth_record, extra_meta=extra_meta)
+        if not wrote:
+            return False
+        self.store.upsert_account(
+            AccountRecord(
+                source=SOURCE_TELEGRAM,
+                account_id=self.account_id,
+                display_name=self.account_id,
+                kind="telegram",
+                updated_at=now,
+            )
+        )
+        return True
 
     def _record_operation(self, operation: str, status: str, error: Any | None = None) -> None:
         self.store.add_operation_event(

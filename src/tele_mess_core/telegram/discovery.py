@@ -55,20 +55,32 @@ class TelegramDiscoveryService:
         include_private: bool = False,
         *,
         client: Any,
+        progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
+        effective_topic_limit, requested_topic_limit = _bounded_discovery_limit(topic_limit, MAX_TOPIC_DISCOVERY_LIMIT)
+        if progress is not None:
+            progress.setdefault("authorized", False)
+            progress.setdefault("origins", 0)
+            progress.setdefault("topics", 0)
+            progress.setdefault("private_skipped", 0)
+            progress.setdefault("errors", [])
+            progress.setdefault("topics_truncated", False)
+            progress["topic_limit"] = effective_topic_limit
+            progress["include_private"] = include_private
         try:
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login", probe=probe)
                 return {"account_id": self.account_id, "authorized": False, "status": "needs_login", "origins": 0, "topics": 0}
 
             self._set_auth_state("authorized", probe=probe)
+            if progress is not None:
+                progress["authorized"] = True
             origin_count = 0
             topic_count = 0
             private_skipped = 0
             errors: list[dict[str, Any]] = []
             topics_truncated = False
-            effective_topic_limit, requested_topic_limit = _bounded_discovery_limit(topic_limit, MAX_TOPIC_DISCOVERY_LIMIT)
             try:
                 async for dialog in client.iter_dialogs():
                     try:
@@ -77,6 +89,8 @@ class TelegramDiscoveryService:
                         origin_type = _dialog_origin_type(dialog, entity)
                         if origin_type == "private" and not include_private:
                             private_skipped += 1
+                            if progress is not None:
+                                progress["private_skipped"] = private_skipped
                             continue
                         is_forum = bool(getattr(entity, "forum", False))
                         origin_record = OriginRecord(
@@ -93,15 +107,28 @@ class TelegramDiscoveryService:
                         )
                         await self._run_write(lambda rec=origin_record: self.store.upsert_origin(rec))
                         origin_count += 1
+                        if progress is not None:
+                            progress["origins"] = origin_count
                         if include_topics and is_forum:
-                            topic_result = await self._discover_topics(client, entity, origin_id, effective_topic_limit)
+                            topic_result = await self._discover_topics(
+                                client,
+                                entity,
+                                origin_id,
+                                effective_topic_limit,
+                                progress=progress,
+                            )
                             topic_count += int(topic_result["topics"])
                             topics_truncated = topics_truncated or bool(topic_result["truncated"])
                             errors.extend(topic_result["errors"])
+                            if progress is not None:
+                                progress["topics"] = topic_count
+                                progress["topics_truncated"] = topics_truncated
                     except Exception as exc:
                         error = classify_telegram_exception(exc, default_code="origin_discovery_failed")
                         payload = error.to_public_dict()
                         errors.append(payload)
+                        if progress is not None:
+                            progress["errors"].append(payload)
                         self._record_operation_diagnostic(
                             "discover_origins",
                             "failed",
@@ -113,9 +140,13 @@ class TelegramDiscoveryService:
                 error = classify_telegram_exception(exc, default_code="dialog_discovery_failed")
                 payload = error.to_public_dict()
                 errors.append(payload)
+                if progress is not None:
+                    progress["errors"].append(payload)
                 self._record_operation_diagnostic("discover_origins", "failed", error=payload)
             if requested_topic_limit > effective_topic_limit:
                 topics_truncated = True
+                if progress is not None:
+                    progress["topics_truncated"] = True
             status = "ok" if not errors else "partial" if origin_count else "failed"
             return {
                 "account_id": self.account_id,
@@ -131,23 +162,38 @@ class TelegramDiscoveryService:
             }
         except Exception as exc:
             if self._error_persister is not None:
-                result = self.discover_origins_error_result(exc, persist=False)
+                result = self.discover_origins_error_result(exc, persist=False, progress=progress)
                 self._error_persister(lambda err=exc: self.discover_origins_error_result(err, persist=True))
                 return result
-            return self.discover_origins_error_result(exc)
+            return self.discover_origins_error_result(exc, progress=progress)
 
-    def discover_origins_error_result(self, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
+    def discover_origins_error_result(
+        self,
+        exc: Exception,
+        *,
+        persist: bool = True,
+        progress: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="discover_origins_failed")
         payload = error.to_public_dict()
-        result = {
+        origins = int((progress or {}).get("origins", 0))
+        topics = int((progress or {}).get("topics", 0))
+        prior_errors = list((progress or {}).get("errors") or [])
+        result: dict[str, Any] = {
             "account_id": self.account_id,
-            "authorized": False,
-            "status": "failed",
-            "origins": 0,
-            "topics": 0,
-            "errors": [payload],
-            "topics_truncated": False,
+            "authorized": bool((progress or {}).get("authorized", False)),
+            "status": "partial" if (origins > 0 or topics > 0) else "failed",
+            "origins": origins,
+            "topics": topics,
+            "errors": [*prior_errors, payload],
+            "topics_truncated": bool((progress or {}).get("topics_truncated", False)),
         }
+        if progress and "private_skipped" in progress:
+            result["private_skipped"] = int(progress["private_skipped"])
+        if progress and "topic_limit" in progress:
+            result["topic_limit"] = int(progress["topic_limit"])
+        if progress and "include_private" in progress:
+            result["include_private"] = bool(progress["include_private"])
         if persist:
             try:
                 self._record_operation("discover_origins", "failed", error=payload)
@@ -165,8 +211,16 @@ class TelegramDiscoveryService:
         limit: int = 500,
         *,
         client: Any,
+        progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         probe = self._auth_probe_provider() if self._auth_probe_provider is not None else None
+        effective_limit, requested_limit = _bounded_discovery_limit(limit, MAX_PARTICIPANT_REFRESH_LIMIT)
+        if progress is not None:
+            progress.setdefault("authorized", False)
+            progress.setdefault("participants", 0)
+            progress.setdefault("errors", [])
+            progress["participants_truncated"] = requested_limit > effective_limit
+            progress["limit"] = effective_limit
         try:
             if not await client.is_user_authorized():
                 self._set_auth_state("needs_login", probe=probe)
@@ -179,7 +233,8 @@ class TelegramDiscoveryService:
                 }
 
             self._set_auth_state("authorized", probe=probe)
-            effective_limit, requested_limit = _bounded_discovery_limit(limit, MAX_PARTICIPANT_REFRESH_LIMIT)
+            if progress is not None:
+                progress["authorized"] = True
             count = 0
             errors: list[dict[str, Any]] = []
             try:
@@ -198,10 +253,14 @@ class TelegramDiscoveryService:
                         )
                         await self._run_write(lambda rec=participant_record: self.store.upsert_participant(rec))
                         count += 1
+                        if progress is not None:
+                            progress["participants"] = count
                     except Exception as exc:
                         error = classify_telegram_exception(exc, default_code="participant_persist_failed")
                         payload = error.to_public_dict()
                         errors.append(payload)
+                        if progress is not None:
+                            progress["errors"].append(payload)
                         self._record_operation_diagnostic(
                             "refresh_participants",
                             "failed",
@@ -213,6 +272,8 @@ class TelegramDiscoveryService:
                 error = classify_telegram_exception(exc, default_code="participant_refresh_failed")
                 payload = error.to_public_dict()
                 errors.append(payload)
+                if progress is not None:
+                    progress["errors"].append(payload)
                 self._record_operation_diagnostic(
                     "refresh_participants",
                     "failed",
@@ -233,12 +294,12 @@ class TelegramDiscoveryService:
             }
         except Exception as exc:
             if self._error_persister is not None:
-                result = self.refresh_participants_error_result(origin_id, exc, persist=False)
+                result = self.refresh_participants_error_result(origin_id, exc, persist=False, progress=progress)
                 self._error_persister(
                     lambda oid=origin_id, err=exc: self.refresh_participants_error_result(oid, err, persist=True)
                 )
                 return result
-            return self.refresh_participants_error_result(origin_id, exc)
+            return self.refresh_participants_error_result(origin_id, exc, progress=progress)
 
     def refresh_participants_error_result(
         self,
@@ -246,17 +307,24 @@ class TelegramDiscoveryService:
         exc: Exception,
         *,
         persist: bool = True,
+        progress: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="refresh_participants_failed")
         payload = error.to_public_dict()
-        result = {
+        participants = int((progress or {}).get("participants", 0))
+        prior_errors = list((progress or {}).get("errors") or [])
+        result: dict[str, Any] = {
             "account_id": self.account_id,
             "origin_id": origin_id,
-            "authorized": False,
-            "status": "failed",
-            "participants": 0,
-            "errors": [payload],
+            "authorized": bool((progress or {}).get("authorized", False)),
+            "status": "partial" if participants > 0 else "failed",
+            "participants": participants,
+            "errors": [*prior_errors, payload],
         }
+        if progress and "participants_truncated" in progress:
+            result["participants_truncated"] = bool(progress["participants_truncated"])
+        if progress and "limit" in progress:
+            result["limit"] = int(progress["limit"])
         if persist:
             try:
                 self._record_operation(
@@ -274,10 +342,19 @@ class TelegramDiscoveryService:
                 )
         return result
 
-    async def _discover_topics(self, client: Any, entity: Any, origin_id: int, topic_limit: int) -> dict[str, Any]:
+    async def _discover_topics(
+        self,
+        client: Any,
+        entity: Any,
+        origin_id: int,
+        topic_limit: int,
+        *,
+        progress: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []
 
         count = 0
+        base_topics = int((progress or {}).get("topics", 0))
         offset_id = 0
         offset_topic = 0
         max_topics = max(1, min(topic_limit, MAX_TOPIC_DISCOVERY_LIMIT))
@@ -303,6 +380,8 @@ class TelegramDiscoveryService:
                 )
                 payload = error.to_public_dict()
                 errors.append(payload)
+                if progress is not None:
+                    progress["errors"].append(payload)
                 self._record_operation_diagnostic(
                     "discover_topics",
                     "failed",
@@ -331,6 +410,8 @@ class TelegramDiscoveryService:
                 )
                 await self._run_write(lambda rec=topic_record: self.store.upsert_origin(rec))
                 count += 1
+                if progress is not None:
+                    progress["topics"] = base_topics + count
             last_topic = topics[-1]
             next_offset_topic = int(getattr(last_topic, "id", 0) or 0)
             next_offset_id = int(getattr(last_topic, "top_message", 0) or 0)
