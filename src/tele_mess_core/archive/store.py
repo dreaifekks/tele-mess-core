@@ -440,19 +440,59 @@ class ArchiveStore:
     def delete_management_account(self, source: str, account_id: str) -> int:
         deleted = 0
         with self._lock:
-            for sql in (
-                "DELETE FROM account_auth WHERE source = ? AND account_id = ?",
-                "DELETE FROM origins WHERE source = ? AND account_id = ?",
-                "DELETE FROM backup_policies WHERE source = ? AND account_id = ?",
-                "DELETE FROM participants WHERE source = ? AND account_id = ?",
-                "DELETE FROM capture_cursors WHERE source = ? AND account_id = ?",
-                "DELETE FROM media_download_jobs WHERE source = ? AND account_id = ?",
-                "DELETE FROM operation_events WHERE source = ? AND account_id = ?",
-                "DELETE FROM accounts WHERE source = ? AND account_id = ?",
-            ):
-                cur = self._conn.execute(sql, (source, account_id))
-                deleted += max(cur.rowcount, 0)
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now = utc_now_iso()
+                pending_rows = self._conn.execute(
+                    """
+                    SELECT job_id, status, pending_file_path
+                    FROM media_download_jobs
+                    WHERE source = ? AND account_id = ?
+                      AND pending_file_path IS NOT NULL
+                    """,
+                    (source, account_id),
+                ).fetchall()
+                for row in pending_rows:
+                    remaining = self._clear_pending_path_value_unlocked(row["pending_file_path"])
+                    if remaining is None:
+                        self._conn.execute(
+                            "UPDATE media_download_jobs SET pending_file_path = NULL WHERE job_id = ?",
+                            (row["job_id"],),
+                        )
+                    else:
+                        self._conn.execute(
+                            """
+                            UPDATE media_download_jobs
+                            SET status = 'canceled',
+                                replace_existing = 0,
+                                claim_token = CASE WHEN status = 'downloading' THEN claim_token + 1 ELSE claim_token END,
+                                pending_file_path = ?,
+                                next_attempt_at = NULL,
+                                last_error = 'account deleted with pending file cleanup',
+                                error_code = 'account_deleted',
+                                updated_at = ?,
+                                completed_at = COALESCE(completed_at, ?)
+                            WHERE job_id = ?
+                            """,
+                            (remaining, now, now, row["job_id"]),
+                        )
+                for sql in (
+                    "DELETE FROM account_auth WHERE source = ? AND account_id = ?",
+                    "DELETE FROM origins WHERE source = ? AND account_id = ?",
+                    "DELETE FROM backup_policies WHERE source = ? AND account_id = ?",
+                    "DELETE FROM participants WHERE source = ? AND account_id = ?",
+                    "DELETE FROM capture_cursors WHERE source = ? AND account_id = ?",
+                    "DELETE FROM media_download_jobs WHERE source = ? AND account_id = ? AND pending_file_path IS NULL",
+                    "DELETE FROM operation_events WHERE source = ? AND account_id = ?",
+                    "DELETE FROM accounts WHERE source = ? AND account_id = ?",
+                ):
+                    cur = self._conn.execute(sql, (source, account_id))
+                    deleted += max(cur.rowcount, 0)
+                self._conn.commit()
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
         return deleted
 
     def list_management_accounts(self) -> list[dict[str, Any]]:
@@ -2305,7 +2345,7 @@ class ArchiveStore:
                 now_dt = datetime.now(dt_timezone.utc)
                 row = self._conn.execute(
                     """
-                    SELECT status, claim_token, updated_at, pending_file_path
+                    SELECT status, claim_token, updated_at, pending_file_path, error_code
                     FROM media_download_jobs
                     WHERE job_id = ? AND claim_token = ?
                     """,
@@ -2315,6 +2355,7 @@ class ArchiveStore:
                     self._conn.rollback()
                     return True, None
                 status = str(row["status"])
+                error_code = str(row["error_code"] or "")
                 if require_downloading:
                     if status != "downloading":
                         self._conn.rollback()
@@ -2333,14 +2374,23 @@ class ArchiveStore:
                     if not _unlink_file_confirmed(candidate):
                         self._conn.rollback()
                         return False, None
-                self._conn.execute(
-                    """
-                    UPDATE media_download_jobs
-                    SET pending_file_path = NULL
-                    WHERE job_id = ? AND claim_token = ?
-                    """,
-                    (job_id, int(expected_claim_token)),
-                )
+                if status == "canceled" and error_code == "account_deleted":
+                    self._conn.execute(
+                        """
+                        DELETE FROM media_download_jobs
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (job_id, int(expected_claim_token)),
+                    )
+                else:
+                    self._conn.execute(
+                        """
+                        UPDATE media_download_jobs
+                        SET pending_file_path = NULL
+                        WHERE job_id = ? AND claim_token = ?
+                        """,
+                        (job_id, int(expected_claim_token)),
+                    )
                 self._conn.commit()
                 return True, (None if referenced else candidate)
             except Exception:
@@ -2351,24 +2401,59 @@ class ArchiveStore:
     def list_media_jobs_with_pending_paths(
         self,
         *,
-        account_id: str,
+        account_id: str | None = None,
         source: str = SOURCE_TELEGRAM,
         stale_seconds: float = 300.0,
+        include_deleted_accounts: bool = True,
     ) -> list[dict[str, Any]]:
         stale_before = (
             datetime.now(dt_timezone.utc) - timedelta(seconds=max(0.0, float(stale_seconds)))
         ).isoformat()
         with self._lock:
-            rows = self._conn.execute(
-                """
-                SELECT job_id, claim_token, status, updated_at, pending_file_path
-                FROM media_download_jobs
-                WHERE source = ? AND account_id = ?
-                  AND pending_file_path IS NOT NULL
-                  AND (status != 'downloading' OR updated_at <= ?)
-                """,
-                (source, account_id, stale_before),
-            ).fetchall()
+            if account_id is None:
+                rows = self._conn.execute(
+                    """
+                    SELECT job_id, account_id, claim_token, status, updated_at, pending_file_path, error_code
+                    FROM media_download_jobs
+                    WHERE source = ?
+                      AND pending_file_path IS NOT NULL
+                      AND (status != 'downloading' OR updated_at <= ?)
+                    """,
+                    (source, stale_before),
+                ).fetchall()
+            elif include_deleted_accounts:
+                rows = self._conn.execute(
+                    """
+                    SELECT job_id, account_id, claim_token, status, updated_at, pending_file_path, error_code
+                    FROM media_download_jobs
+                    WHERE source = ?
+                      AND pending_file_path IS NOT NULL
+                      AND (
+                        (account_id = ? AND (status != 'downloading' OR updated_at <= ?))
+                        OR (
+                          status = 'canceled'
+                          AND error_code = 'account_deleted'
+                          AND NOT EXISTS (
+                            SELECT 1 FROM accounts a
+                            WHERE a.source = media_download_jobs.source
+                              AND a.account_id = media_download_jobs.account_id
+                          )
+                        )
+                      )
+                    """,
+                    (source, account_id, stale_before),
+                ).fetchall()
+            else:
+                rows = self._conn.execute(
+                    """
+                    SELECT job_id, account_id, claim_token, status, updated_at, pending_file_path, error_code
+                    FROM media_download_jobs
+                    WHERE source = ? AND account_id = ?
+                      AND pending_file_path IS NOT NULL
+                      AND (status != 'downloading' OR updated_at <= ?)
+                    """,
+                    (source, account_id, stale_before),
+                ).fetchall()
         return [_row_to_dict(row) for row in rows]
 
     def _clear_pending_path_value_unlocked(self, pending_path: str | None) -> str | None:

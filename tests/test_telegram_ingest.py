@@ -2736,6 +2736,272 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(job_b_cleaned["pending_file_path"])
         self.assertTrue(v2_path.exists())
 
+    async def test_heartbeat_survives_transient_sqlite_lock_and_completes_publish(self) -> None:
+        import sqlite3
+        from unittest import mock
+
+        chat_id = -1087
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.05, stale_seconds=0.35),
+        )
+        store2 = ArchiveStore(self.store.database_path)
+        try:
+            other_claimed: list[dict | None] = []
+
+            class SlowDownloadMessage(FakeMessage):
+                async def download_media(self, file: str) -> str:
+                    # Exceed stale_seconds so lease survival depends on heartbeat continuing after transient lock.
+                    await asyncio.sleep(0.45)
+                    other_claimed.append(store2.claim_media_download_job("main", stale_seconds=0.35))
+                    await asyncio.sleep(0.10)
+                    return await super().download_media(file)
+
+            msg = SlowDownloadMessage(380, chat_id, media=MessageMediaDocument())
+            service.client = FakeMediaClient(msg)
+            self.assertTrue(await service._store_message(msg, event_type="new"))
+
+            orig_heartbeat = self.store.heartbeat_media_download_job
+            hb_calls = {"count": 0}
+
+            def flaky_heartbeat(*args, **kwargs):
+                hb_calls["count"] += 1
+                if hb_calls["count"] == 1:
+                    raise sqlite3.OperationalError("database is locked")
+                return orig_heartbeat(*args, **kwargs)
+
+            with mock.patch.object(self.store, "heartbeat_media_download_job", side_effect=flaky_heartbeat):
+                await service.process_pending_media_downloads()
+
+            self.assertGreaterEqual(hb_calls["count"], 2)
+            self.assertEqual(other_claimed, [None])
+            files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=380)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(Path(files[0]["file_path"]).exists())
+            job = next(
+                j for j in self.store.list_media_download_jobs(account_id="main")
+                if j["chat_id"] == chat_id and j["message_id"] == 380
+            )
+            self.assertEqual(job["status"], "completed")
+        finally:
+            store2.close()
+
+    async def test_persistent_cleanup_failure_backs_off_exponentially_even_with_zero_retry_delay(self) -> None:
+        from unittest import mock
+
+        chat_id = -1088
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(
+                max_attempts=2,
+                retry_delay_seconds=0.0,
+                max_retry_delay_seconds=60.0,
+                stale_seconds=60.0,
+            ),
+        )
+        msg = FakeMessage(381, chat_id, media=MessageMediaDocument())
+        service.client = FakeMediaClient(msg)
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+        claimed1 = self.store.claim_media_download_job("main", stale_seconds=60.0)
+        assert claimed1 is not None
+        job_id = claimed1["job_id"]
+        orphan_dir = target_dir / f"{job_id}-t1"
+        orphan_dir.mkdir(parents=True, exist_ok=True)
+        orphan = orphan_dir / "381.bin"
+        orphan.write_bytes(b"stuck-file")
+        self.assertEqual(
+            self.store.record_media_download_pending_path(
+                job_id,
+                expected_claim_token=1,
+                pending_file_path=str(orphan),
+            ),
+            "ok",
+        )
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        self.store._conn.commit()
+
+        orig_unlink = Path.unlink
+
+        def always_eacces(path_self: Path, *args, **kwargs):
+            if path_self == orphan:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_unlink(path_self, *args, **kwargs)
+
+        delays: list[float] = []
+        with mock.patch.object(Path, "unlink", always_eacces):
+            for _ in range(4):
+                claimed = self.store.claim_media_download_job("main", stale_seconds=60.0)
+                assert claimed is not None
+                before = datetime.now(timezone.utc)
+                await service._execute_media_download_job(claimed)
+                row = self.store.get_media_download_job(job_id)
+                assert row is not None
+                self.assertEqual(row["status"], "retry")
+                self.assertEqual(row["attempts"], 1)
+                self.assertEqual(row["pending_file_path"], str(orphan))
+                due = datetime.fromisoformat(row["next_attempt_at"])
+                delays.append((due - before).total_seconds())
+                self.store._conn.execute(
+                    "UPDATE media_download_jobs SET next_attempt_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+                    (job_id,),
+                )
+                self.store._conn.commit()
+
+        self.assertEqual(msg.download_attempts, 0)
+        self.assertGreater(delays[1], delays[0] * 1.5)
+        self.assertGreater(delays[2], delays[1] * 1.5)
+        self.assertGreater(delays[3], delays[2] * 1.5)
+        self.assertGreaterEqual(delays[3], 0.35)
+
+    async def test_idle_worker_picks_up_job_enqueued_by_separate_service_instance(self) -> None:
+        chat_id = -1089
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        msg = FakeMessage(382, chat_id, media=MessageMediaDocument())
+
+        class IdleCrossInstanceClient(FakeMediaClient):
+            def on(self, event_builder: object):
+                return lambda fn: fn
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            def is_connected(self) -> bool:
+                return True
+
+            def iter_messages(self, cid: int, **kwargs):
+                return FakeBackfillIterator(messages=[])
+
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                if ids is not None:
+                    return await super().get_messages(cid, ids=ids, **kwargs)
+                return []
+
+        service1 = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+        )
+        store2 = ArchiveStore(self.store.database_path)
+        try:
+            await service1.activate(IdleCrossInstanceClient(msg))
+            # Let worker1 enter its idle wait loop with an empty queue.
+            await asyncio.sleep(0.12)
+
+            service2 = TelegramArchiveService(
+                self.config,
+                store2,
+                media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+            )
+            self.assertTrue(await service2._store_message(msg, event_type="new"))
+
+            deadline = asyncio.get_running_loop().time() + 2.0
+            while asyncio.get_running_loop().time() < deadline:
+                if self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=382):
+                    break
+                await asyncio.sleep(0.03)
+
+            files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=382)
+            self.assertEqual(len(files), 1)
+            self.assertTrue(Path(files[0]["file_path"]).exists())
+            job = next(
+                j for j in self.store.list_media_download_jobs(account_id="main")
+                if j["chat_id"] == chat_id and j["message_id"] == 382
+            )
+            self.assertEqual(job["status"], "completed")
+        finally:
+            await service1.stop()
+            store2.close()
+
+    async def test_delete_management_account_preserves_uncleaned_pending_path_for_later_cleanup(self) -> None:
+        from unittest import mock
+
+        chat_id = -1090
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            self.config,
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+        )
+
+        class ReplacementMessage(FakeMessage):
+            def __init__(self, payload: bytes, edit_date: datetime | None = None) -> None:
+                super().__init__(383, chat_id, media=MessageMediaDocument())
+                self._payload = payload
+                self.edit_date = edit_date
+
+            async def download_media(self, file: str) -> str:
+                path = Path(file) / "clip.bin"
+                path.write_bytes(self._payload)
+                return str(path)
+
+        msg_v1 = ReplacementMessage(b"old-clip")
+        service.client = FakeMediaClient(msg_v1)
+        self.assertTrue(await service._store_message(msg_v1, event_type="new"))
+        await service.process_pending_media_downloads()
+        v1_path = Path(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=383)[0]["file_path"])
+        self.assertTrue(v1_path.exists())
+
+        msg_v2 = ReplacementMessage(b"new-clip", edit_date=datetime(2026, 3, 3, 12, 0, tzinfo=timezone.utc))
+        service.client = FakeMediaClient(msg_v2)
+        self.assertTrue(await service._store_message(msg_v2, event_type="edit"))
+
+        orig_unlink = Path.unlink
+        orig_stat = Path.stat
+
+        def eacces_v1_unlink(path_self: Path, *args, **kwargs):
+            if path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_unlink(path_self, *args, **kwargs)
+
+        def eacces_v1_stat(path_self: Path, *args, **kwargs):
+            if path_self == v1_path:
+                raise PermissionError(errno.EACCES, "Permission denied", str(path_self))
+            return orig_stat(path_self, *args, **kwargs)
+
+        with mock.patch.object(Path, "unlink", eacces_v1_unlink), mock.patch.object(Path, "stat", eacces_v1_stat):
+            await service.process_pending_media_downloads(max_jobs=1)
+            # Deleting the management account while v1_path cannot be unlinked must preserve the pending cleanup record.
+            self.store.delete_management_account(SOURCE_TELEGRAM, "main")
+
+        self.assertTrue(v1_path.exists())
+        self.assertEqual(self.store.state()["media_download_pending"], 0)
+        self.assertEqual(self.store.state()["media_download_failed"], 0)
+        preserved = self.store.list_media_jobs_with_pending_paths(account_id="alt", source=SOURCE_TELEGRAM)
+        self.assertEqual(len(preserved), 1)
+        self.assertEqual(preserved[0]["pending_file_path"], str(v1_path))
+        self.assertEqual(preserved[0]["error_code"], "account_deleted")
+
+        # Once permissions recover, another surviving account's orphan scan cleans v1_path and removes the tombstone row.
+        alt_config = TelegramAccountConfig(
+            account_id="alt",
+            api_id=self.config.api_id,
+            api_hash=self.config.api_hash,
+            session_name="alt",
+            session_dir=self.config.session_dir,
+        )
+        alt_service = TelegramArchiveService(alt_config, self.store)
+        self.assertFalse(alt_service._cleanup_orphan_media_artifacts())
+        self.assertFalse(v1_path.exists())
+        self.assertFalse(v1_path.parent.exists())
+        self.assertEqual(self.store.list_media_download_jobs(account_id="main"), [])
+
 
 if __name__ == "__main__":
     unittest.main()

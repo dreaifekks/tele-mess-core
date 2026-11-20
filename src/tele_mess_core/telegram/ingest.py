@@ -66,6 +66,7 @@ class TelegramArchiveService:
         self._retry_task: asyncio.Task[None] | None = None
         self._media_wakeup = asyncio.Event()
         self._media_worker_task: asyncio.Task[None] | None = None
+        self._media_cleanup_failures: dict[str, int] = {}
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
         self._inflight_fetches: dict[tuple[int, int], dict[int, _InflightFetchState]] = {}
@@ -253,9 +254,14 @@ class TelegramArchiveService:
     async def _media_worker_loop(self) -> None:
         cleanup_retry_count = 0
         cleanup_retry_cap = 8
+        next_cleanup_at: float | None = None
+        loop = asyncio.get_running_loop()
         try:
             try:
-                self._cleanup_orphan_media_artifacts()
+                if self._cleanup_orphan_media_artifacts():
+                    base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                    next_cleanup_at = loop.time() + min(base_delay, 60.0)
+                    cleanup_retry_count = 1
             except Exception as exc:
                 self.logger.warning(
                     "Failed to clean up orphan media artifacts for account=%s: %s",
@@ -287,6 +293,7 @@ class TelegramArchiveService:
                     continue
                 if job is not None:
                     cleanup_retry_count = 0
+                    next_cleanup_at = None
                     try:
                         await self._execute_media_download_job(job)
                     except asyncio.CancelledError:
@@ -300,18 +307,26 @@ class TelegramArchiveService:
                         )
                         await self._wait_media_wakeup(1.0)
                     continue
-                has_remaining_cleanup = False
-                try:
-                    has_remaining_cleanup = self._cleanup_orphan_media_artifacts()
-                except Exception as exc:
-                    has_remaining_cleanup = True
-                    self.logger.warning(
-                        "Failed to clean up orphan media artifacts for account=%s: %s",
-                        self.account_id,
-                        exc,
-                    )
-                if not has_remaining_cleanup:
-                    cleanup_retry_count = 0
+                now_mono = loop.time()
+                if next_cleanup_at is None or now_mono >= next_cleanup_at:
+                    has_remaining_cleanup = False
+                    try:
+                        has_remaining_cleanup = self._cleanup_orphan_media_artifacts()
+                    except Exception as exc:
+                        has_remaining_cleanup = True
+                        self.logger.warning(
+                            "Failed to clean up orphan media artifacts for account=%s: %s",
+                            self.account_id,
+                            exc,
+                        )
+                    if not has_remaining_cleanup:
+                        cleanup_retry_count = 0
+                        next_cleanup_at = None
+                    else:
+                        base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
+                        delay = min(base_delay * (2 ** min(cleanup_retry_count, cleanup_retry_cap)), 60.0)
+                        cleanup_retry_count = min(cleanup_retry_count + 1, cleanup_retry_cap)
+                        next_cleanup_at = loop.time() + delay
                 try:
                     next_due = self.store.next_media_download_due_at(
                         self.account_id,
@@ -326,24 +341,22 @@ class TelegramArchiveService:
                     )
                     await self._wait_media_wakeup(1.0)
                     continue
+                idle_poll_seconds = min(
+                    max(0.05, float(self.media_download.retry_delay_seconds or 0.25)),
+                    1.0,
+                )
                 if next_due is None:
-                    if has_remaining_cleanup and cleanup_retry_count < cleanup_retry_cap:
-                        base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
-                        delay = min(base_delay * (2 ** cleanup_retry_count), 60.0)
-                        cleanup_retry_count += 1
-                        await self._wait_media_wakeup(delay)
-                        continue
-                    await self._media_wakeup.wait()
-                    cleanup_retry_count = 0
-                    continue
-                sleep_seconds = _seconds_until_iso(next_due)
-                if has_remaining_cleanup and cleanup_retry_count < cleanup_retry_cap:
-                    base_delay = max(0.05, float(self.media_download.retry_delay_seconds or 0.05))
-                    delay = min(base_delay * (2 ** cleanup_retry_count), 60.0)
-                    cleanup_retry_count += 1
-                    sleep_seconds = min(sleep_seconds, delay) if sleep_seconds > 0 else delay
+                    sleep_seconds = idle_poll_seconds
+                else:
+                    sleep_seconds = min(_seconds_until_iso(next_due), idle_poll_seconds)
+                if next_cleanup_at is not None:
+                    cleanup_wait = max(0.0, next_cleanup_at - loop.time())
+                    sleep_seconds = min(sleep_seconds, cleanup_wait)
                 if sleep_seconds > 0:
-                    await self._wait_media_wakeup(min(sleep_seconds, 60.0))
+                    await self._wait_media_wakeup(sleep_seconds)
+                if self._media_wakeup.is_set():
+                    cleanup_retry_count = 0
+                    next_cleanup_at = None
         except asyncio.CancelledError:
             raise
         finally:
@@ -682,17 +695,29 @@ class TelegramArchiveService:
 
         async def _heartbeat_loop() -> None:
             interval = max(0.05, min(float(self.media_download.stale_seconds) / 3.0, 30.0))
+            retry_interval = max(0.02, min(interval / 2.0, 0.25))
+            sleep_for = interval
             while True:
-                await asyncio.sleep(interval)
+                await asyncio.sleep(sleep_for)
                 try:
                     alive = self.store.heartbeat_media_download_job(
                         job_id,
                         expected_claim_token=claim_token,
                     )
-                    if not alive:
-                        return
-                except Exception:
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    self.logger.debug(
+                        "Transient lease heartbeat error for media job %s (claim_token=%s): %s",
+                        job_id,
+                        claim_token,
+                        exc,
+                    )
+                    sleep_for = retry_interval
+                    continue
+                if not alive:
                     return
+                sleep_for = interval
 
         try:
             # Start lease heartbeat immediately upon claim so slow get_messages() RPCs never expire the lease.
@@ -712,6 +737,7 @@ class TelegramArchiveService:
                         "media_cleanup_failed",
                         "previous uncommitted media file could not be cleaned up",
                     )
+            self._media_cleanup_failures.pop(job_id, None)
 
             if not replace_existing:
                 existing_media = self.store.list_media_files(
@@ -951,9 +977,18 @@ class TelegramArchiveService:
                 )
                 return
             if error.code == "media_cleanup_failed":
-                base_delay = max(0.01, float(self.media_download.retry_delay_seconds))
-                max_delay = max(base_delay, float(self.media_download.max_retry_delay_seconds))
-                backoff = min(base_delay * (2 ** max(0, attempts - 1)), max_delay)
+                if job_id in self._media_cleanup_failures:
+                    cleanup_step = self._media_cleanup_failures[job_id]
+                elif job.get("error_code") == "media_cleanup_failed":
+                    cleanup_step = min(max(1, claim_token - attempts), 10)
+                else:
+                    cleanup_step = 0
+                self._media_cleanup_failures[job_id] = min(cleanup_step + 1, 16)
+                configured_base = float(self.media_download.retry_delay_seconds)
+                base_delay = max(0.01, configured_base) if configured_base > 0 else 0.05
+                configured_max = float(self.media_download.max_retry_delay_seconds)
+                max_delay = max(base_delay, configured_max if configured_max > 0 else 60.0)
+                backoff = min(base_delay * (2 ** min(cleanup_step, 16)), max_delay)
                 next_at = (datetime.now(dt_timezone.utc) + timedelta(seconds=backoff)).isoformat()
                 self.store.retry_media_download_job(
                     job_id,
