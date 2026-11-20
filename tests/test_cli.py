@@ -388,6 +388,112 @@ daily:
                 worker.stop()
                 store.close()
 
+    def test_daily_summary_exits_nonzero_and_prints_job_on_canceled_or_failed(self) -> None:
+        from tele_mess_core.archive import ArchiveStore
+        from tele_mess_core.config import load_config
+        from tele_mess_core.models import DailySummaryRunRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._config_file(root)
+            config = load_config(config_path)
+            store = ArchiveStore(config.storage.database)
+            store.initialize()
+            try:
+                store.upsert_daily_summary_run(
+                    DailySummaryRunRecord(
+                        run_id="sum_stale_done",
+                        status="completed",
+                        package_run_id="pkg_1",
+                        date="2026-07-03",
+                        timezone="UTC",
+                        scope_json="{}",
+                        output_dir=str(root),
+                    )
+                )
+            finally:
+                store.close()
+
+            canceled_job = {
+                "job_id": "job_canceled_1",
+                "status": "canceled",
+                "summary_run_id": "sum_stale_done",
+                "error": "canceled during delivery",
+            }
+            stdout = io.StringIO()
+            with patch("tele_mess_core.daily_jobs.run_daily_summary_job_from_cli", return_value=canceled_job):
+                with redirect_stdout(stdout):
+                    code = main(["--config", str(config_path), "daily-summary", "--date", "2026-07-03", "--timezone", "UTC"])
+
+            self.assertEqual(code, 1)
+            payload = json.loads(stdout.getvalue())
+            self.assertEqual(payload["status"], "canceled")
+            self.assertEqual(payload["job_id"], "job_canceled_1")
+            self.assertEqual(payload["error"], "canceled during delivery")
+
+    def test_run_core_waits_for_worker_lock_before_starting_telegram_runtime(self) -> None:
+        import asyncio
+        import threading
+        import time
+        from types import SimpleNamespace
+        from tele_mess_core.cli import _run_core
+        from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyWorkerLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            holder = DailyWorkerLock(root / DAILY_WORKER_LOCK_FILENAME, owner="cli:active")
+            self.assertTrue(holder.try_acquire())
+            events: list[str] = []
+
+            class FakeRuntime:
+                def __init__(self, *args: object, **kwargs: object) -> None:
+                    pass
+
+                async def start(self) -> None:
+                    events.append("runtime_start")
+
+                async def stop(self) -> None:
+                    events.append("runtime_stop")
+
+            class FakeWorker:
+                def __init__(self, *args: object, **kwargs: object) -> None:
+                    self.use_process_lock = kwargs.get("use_process_lock")
+
+                def start(self) -> None:
+                    events.append("worker_start")
+
+                def stop(self) -> None:
+                    events.append("worker_stop")
+
+            def release_lock() -> None:
+                time.sleep(0.15)
+                events.append("cli_lock_release")
+                holder.release()
+
+            async def run() -> None:
+                stopper = threading.Thread(target=release_lock, daemon=True)
+                stopper.start()
+                config = SimpleNamespace(storage=SimpleNamespace(data_dir=root))
+
+                def install_stop(stop_event: asyncio.Event) -> None:
+                    asyncio.get_running_loop().call_later(0.35, stop_event.set)
+
+                try:
+                    with (
+                        patch("tele_mess_core.telegram.manager.TelegramRuntimeManager", FakeRuntime),
+                        patch("tele_mess_core.daily_jobs.DailyJobWorker", FakeWorker),
+                        patch("tele_mess_core.cli._install_stop_handlers", side_effect=install_stop),
+                    ):
+                        await _run_core(config, object(), web=False)  # type: ignore[arg-type]
+                finally:
+                    holder.release()
+                    stopper.join(timeout=2)
+
+            asyncio.run(run())
+            self.assertIn("cli_lock_release", events)
+            self.assertIn("runtime_start", events)
+            self.assertLess(events.index("cli_lock_release"), events.index("runtime_start"))
+
 
 if __name__ == "__main__":
     unittest.main()

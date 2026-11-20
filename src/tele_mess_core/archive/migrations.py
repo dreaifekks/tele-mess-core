@@ -1,10 +1,18 @@
 from __future__ import annotations
 
+import hashlib
 import sqlite3
 from typing import Callable
 
 
 Migration = Callable[[sqlite3.Connection], None]
+
+
+def outbox_send_random_id(outbox_id: str) -> int:
+    """Derive a deterministic non-zero signed 64-bit random_id for Telegram SendMessageRequest."""
+    digest = hashlib.sha256(f"tele-mess-core:outbox:{outbox_id}".encode("utf-8")).digest()
+    value = int.from_bytes(digest[:8], "big", signed=True)
+    return value if value != 0 else 1
 
 
 def apply_migrations(connection: sqlite3.Connection, current_version: int, target_version: int) -> None:
@@ -323,6 +331,8 @@ def _migration_20(connection: sqlite3.Connection) -> None:
               content TEXT NOT NULL,
               status TEXT NOT NULL DEFAULT 'pending',
               attempts INTEGER NOT NULL DEFAULT 0,
+              claim_token INTEGER NOT NULL DEFAULT 0,
+              send_random_id INTEGER,
               message_id INTEGER,
               last_error TEXT,
               next_attempt_at TEXT,
@@ -338,17 +348,61 @@ def _migration_20(connection: sqlite3.Connection) -> None:
             INSERT INTO delivery_outbox_v20(
               outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
               content_kind, chunk_index, chunk_count, content, status, attempts,
-              message_id, last_error, next_attempt_at, created_at, updated_at, sent_at
+              claim_token, send_random_id, message_id, last_error, next_attempt_at,
+              created_at, updated_at, sent_at
             )
             SELECT
               outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
-              'summary', chunk_index, chunk_count, content, status, attempts,
-              message_id, last_error, next_attempt_at, created_at, updated_at, sent_at
+              'summary', chunk_index, chunk_count, content,
+              CASE WHEN status = 'sending' THEN 'failed' ELSE status END,
+              attempts,
+              attempts,
+              NULL,
+              message_id,
+              CASE
+                WHEN status = 'sending' THEN COALESCE(last_error, 'migrated_in_flight_sending_uncertain')
+                ELSE last_error
+              END,
+              CASE WHEN status = 'sending' THEN NULL ELSE next_attempt_at END,
+              created_at, updated_at, sent_at
             FROM delivery_outbox
             """
         )
         connection.execute("DROP TABLE delivery_outbox")
         connection.execute("ALTER TABLE delivery_outbox_v20 RENAME TO delivery_outbox")
+        connection.execute(
+            """
+            UPDATE delivery_outbox
+            SET status = 'failed',
+                last_error = COALESCE(last_error, 'blocked by migrated_in_flight_sending_uncertain'),
+                next_attempt_at = NULL
+            WHERE status IN ('pending', 'retry')
+              AND EXISTS (
+                SELECT 1 FROM delivery_outbox earlier
+                WHERE earlier.summary_run_id = delivery_outbox.summary_run_id
+                  AND earlier.account_id = delivery_outbox.account_id
+                  AND earlier.origin_id = delivery_outbox.origin_id
+                  AND earlier.topic_id = delivery_outbox.topic_id
+                  AND earlier.content_kind = delivery_outbox.content_kind
+                  AND earlier.chunk_index < delivery_outbox.chunk_index
+                  AND earlier.status = 'failed'
+              )
+            """
+        )
+    else:
+        _ensure_column(connection, "delivery_outbox", "claim_token", "INTEGER NOT NULL DEFAULT 0")
+        _ensure_column(connection, "delivery_outbox", "send_random_id", "INTEGER")
+
+    missing_random = connection.execute(
+        "SELECT outbox_id FROM delivery_outbox WHERE send_random_id IS NULL"
+    ).fetchall()
+    for row in missing_random:
+        outbox_id = str(row[0])
+        connection.execute(
+            "UPDATE delivery_outbox SET send_random_id = ? WHERE outbox_id = ?",
+            (outbox_send_random_id(outbox_id), outbox_id),
+        )
+
     connection.execute(
         "CREATE INDEX IF NOT EXISTS idx_delivery_outbox_pending ON delivery_outbox(status, next_attempt_at, created_at)"
     )
@@ -364,6 +418,7 @@ def _migration_20(connection: sqlite3.Connection) -> None:
           OR NEW.chunk_count <= 0
           OR NEW.chunk_index > NEW.chunk_count
           OR NEW.attempts < 0
+          OR NEW.claim_token < 0
         BEGIN
           SELECT RAISE(ABORT, 'invalid delivery outbox state');
         END
@@ -379,6 +434,7 @@ def _migration_20(connection: sqlite3.Connection) -> None:
           OR NEW.chunk_count <= 0
           OR NEW.chunk_index > NEW.chunk_count
           OR NEW.attempts < 0
+          OR NEW.claim_token < 0
         BEGIN
           SELECT RAISE(ABORT, 'invalid delivery outbox state');
         END

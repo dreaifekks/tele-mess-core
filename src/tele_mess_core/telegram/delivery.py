@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import inspect
 import json
 import logging
 import re
@@ -31,6 +32,7 @@ class TelegramSummaryDeliveryService:
         content: str,
         *,
         client: Any,
+        random_id: int | None = None,
     ) -> dict[str, Any]:
         if delivery.origin_id is None:
             raise ValueError("daily.delivery.origin_id is required")
@@ -46,13 +48,13 @@ class TelegramSummaryDeliveryService:
             self._set_auth_state("authorized")
             entity = await client.get_entity(delivery.origin_id)
             body = telegram_markdown_for_send(content)
-            sent = await client.send_message(
+            message_id = await self._send_with_random_id(
+                client,
                 entity,
                 body,
-                reply_to=delivery.topic_id or None,
-                parse_mode=TELEGRAM_SUMMARY_PARSE_MODE,
+                topic_id=delivery.topic_id,
+                random_id=random_id,
             )
-            message_id = getattr(sent, "id", None)
             message_ids = [int(message_id)] if message_id is not None else []
             result = {
                 "account_id": self.account_id,
@@ -74,6 +76,55 @@ class TelegramSummaryDeliveryService:
             raise
         except Exception as exc:
             raise self.record_delivery_error(delivery, exc) from exc
+
+    async def _send_with_random_id(
+        self,
+        client: Any,
+        entity: Any,
+        body: str,
+        *,
+        topic_id: int,
+        random_id: int | None,
+    ) -> int | None:
+        if (
+            random_id is not None
+            and callable(client)
+            and callable(getattr(client, "get_input_entity", None))
+            and callable(getattr(client, "_get_response_message", None))
+        ):
+            from telethon.tl import functions, types
+
+            plain_text, entities = telethon_markdown.parse(body)
+            input_peer = await client.get_input_entity(entity)
+            reply_to = types.InputReplyToMessage(topic_id) if topic_id else None
+            request = functions.messages.SendMessageRequest(
+                peer=input_peer,
+                message=plain_text or body,
+                entities=entities or None,
+                reply_to=reply_to,
+                random_id=int(random_id),
+            )
+            response = await client(request)
+            if isinstance(response, types.UpdateShortSentMessage):
+                return getattr(response, "id", None)
+            sent = client._get_response_message(request, response, input_peer)
+            return getattr(sent, "id", None)
+
+        send_kwargs: dict[str, Any] = {
+            "reply_to": topic_id or None,
+            "parse_mode": TELEGRAM_SUMMARY_PARSE_MODE,
+        }
+        if random_id is not None:
+            try:
+                sig = inspect.signature(client.send_message)
+                if "random_id" in sig.parameters or any(
+                    p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+                ):
+                    send_kwargs["random_id"] = int(random_id)
+            except (TypeError, ValueError):
+                pass
+        sent = await client.send_message(entity, body, **send_kwargs)
+        return getattr(sent, "id", None)
 
     def record_delivery_error(
         self,

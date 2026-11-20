@@ -22,6 +22,11 @@ from tele_mess_core.telegram.ingest import TelegramArchiveService
 ClientFactory = Callable[[TelegramAccountConfig], Any]
 INGEST_RETRY_INITIAL_SECONDS = 1.0
 CONNECTION_RETRY_INITIAL_SECONDS = 1.0
+MANAGEMENT_OPERATIONS = frozenset(
+    {"auth_status", "request_code", "submit_code", "discover_origins", "refresh_participants"}
+)
+DEFAULT_MANAGEMENT_TIMEOUT_SECONDS = 20.0
+DEFAULT_DELIVERY_TIMEOUT_SECONDS = 60.0
 
 
 class TelegramAccountRuntime:
@@ -36,6 +41,8 @@ class TelegramAccountRuntime:
         client_factory: ClientFactory,
         ingest: bool = True,
         connect_wait_seconds: float = 5.0,
+        management_timeout_seconds: float = DEFAULT_MANAGEMENT_TIMEOUT_SECONDS,
+        delivery_timeout_seconds: float = DEFAULT_DELIVERY_TIMEOUT_SECONDS,
     ) -> None:
         self.config = config
         self.app_config = app_config
@@ -43,6 +50,8 @@ class TelegramAccountRuntime:
         self.client_factory = client_factory
         self.ingest = ingest
         self._connect_wait_seconds = max(0.0, float(connect_wait_seconds))
+        self._management_timeout_seconds = max(0.05, float(management_timeout_seconds))
+        self._delivery_timeout_seconds = max(0.05, float(delivery_timeout_seconds))
         self.logger = logging.getLogger(__name__)
         self.client: Any | None = None
         self._command_lock = asyncio.Lock()
@@ -50,6 +59,7 @@ class TelegramAccountRuntime:
         self._attempt_cv = asyncio.Condition()
         self._attempt_seq = 0
         self._reconnect_now = asyncio.Event()
+        self._force_disconnect = asyncio.Event()
         self._stopping = asyncio.Event()
         self._last_connect_error: Exception | None = None
         self._supervisor_task: asyncio.Task[None] | None = None
@@ -75,7 +85,7 @@ class TelegramAccountRuntime:
         client = self.client
         if client is not None:
             try:
-                await client.disconnect()
+                await asyncio.wait_for(client.disconnect(), timeout=2.0)
             except Exception:
                 self.logger.exception("Failed to disconnect Telegram account %s", self.config.account_id)
         task = self._supervisor_task
@@ -88,7 +98,40 @@ class TelegramAccountRuntime:
     async def execute(self, operation: str, **kwargs: Any) -> dict[str, Any]:
         if operation == "refresh_capture" and not self.ingest:
             return {"account_id": self.config.account_id, "status": "ingest_disabled"}
-        await self._wait_for_connection()
+        budget = self._operation_timeout(operation)
+        deadline = None if budget is None else time.monotonic() + budget
+        connect_timeout = self._connect_wait_seconds
+        if deadline is not None:
+            connect_timeout = min(connect_timeout, max(0.0, deadline - time.monotonic()))
+        await self._wait_for_connection(timeout=connect_timeout)
+        if deadline is None:
+            return await self._execute_under_lock(operation, **kwargs)
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
+            self._trigger_reconnect_after_timeout(timeout_exc)
+            return self._offline_result(operation, error=timeout_exc, **kwargs)
+        try:
+            return await asyncio.wait_for(self._execute_under_lock(operation, **kwargs), timeout=remaining)
+        except TimeoutError:
+            timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
+            self._trigger_reconnect_after_timeout(timeout_exc)
+            return self._offline_result(operation, error=timeout_exc, **kwargs)
+
+    def _operation_timeout(self, operation: str) -> float | None:
+        if operation in MANAGEMENT_OPERATIONS:
+            return self._management_timeout_seconds
+        if operation == "deliver_chunk":
+            return self._delivery_timeout_seconds
+        return None
+
+    def _trigger_reconnect_after_timeout(self, exc: Exception) -> None:
+        self._last_connect_error = exc
+        self._ready.clear()
+        self._reconnect_now.set()
+        self._force_disconnect.set()
+
+    async def _execute_under_lock(self, operation: str, **kwargs: Any) -> dict[str, Any]:
         async with self._command_lock:
             client = self.client
             if client is None or not self._ready.is_set():
@@ -131,6 +174,7 @@ class TelegramAccountRuntime:
                     kwargs["delivery"],
                     str(kwargs.get("content") or ""),
                     client=client,
+                    random_id=kwargs.get("random_id"),
                 )
             if operation == "refresh_capture":
                 if not await client.is_user_authorized():
@@ -150,10 +194,11 @@ class TelegramAccountRuntime:
             self._attempt_seq += 1
             self._attempt_cv.notify_all()
 
-    async def _wait_for_connection(self) -> None:
+    async def _wait_for_connection(self, *, timeout: float | None = None) -> None:
         if self._ready.is_set() or self._stopping.is_set():
             return
-        if self._connect_wait_seconds <= 0:
+        wait_seconds = self._connect_wait_seconds if timeout is None else max(0.0, float(timeout))
+        if wait_seconds <= 0:
             self._reconnect_now.set()
             return
         async with self._attempt_cv:
@@ -167,13 +212,19 @@ class TelegramAccountRuntime:
                     self._attempt_cv.wait_for(
                         lambda: self._ready.is_set() or self._stopping.is_set() or self._attempt_seq > seen
                     ),
-                    timeout=self._connect_wait_seconds,
+                    timeout=wait_seconds,
                 )
             except TimeoutError:
                 pass
 
-    def _offline_result(self, operation: str, **kwargs: Any) -> dict[str, Any]:
-        exc = self._last_connect_error or ConnectionError(
+    def _offline_result(
+        self,
+        operation: str,
+        *,
+        error: Exception | None = None,
+        **kwargs: Any,
+    ) -> dict[str, Any]:
+        exc = error or self._last_connect_error or ConnectionError(
             f"Telegram account {self.config.account_id} is not connected"
         )
         if operation == "auth_status":
@@ -224,22 +275,30 @@ class TelegramAccountRuntime:
                         client = await client
                     if self.ingest and callable(getattr(client, "on", None)):
                         self._prepare_ingestion(client)
-                    await client.connect()
+                    await self._await_supervised(
+                        client.connect(),
+                        timeout=max(10.0, self._connect_wait_seconds * 2.0),
+                        label="connect",
+                    )
                     self.client = client
                     self._last_connect_error = None
+                    self._force_disconnect.clear()
                     self._ready.set()
                     await self._notify_attempt()
                     delay = CONNECTION_RETRY_INITIAL_SECONDS
-                    authorized = await client.is_user_authorized()
+                    authorized = await self._await_supervised(
+                        client.is_user_authorized(),
+                        timeout=self._management_timeout_seconds,
+                        label="is_user_authorized",
+                    )
                     self._record_auth_state("authorized" if authorized else "needs_login")
                     if authorized:
                         self._schedule_ingestion(client)
-                    disconnected = getattr(client, "disconnected", None)
-                    if inspect.isawaitable(disconnected):
-                        await disconnected
-                    else:
-                        await self._stopping.wait()
+                    await self._wait_until_disconnected(client)
                     if not self._stopping.is_set():
+                        if self._force_disconnect.is_set():
+                            self._force_disconnect.clear()
+                            raise self._last_connect_error or TimeoutError("Telegram client timed out")
                         raise RuntimeError("Telegram client disconnected")
                 except asyncio.CancelledError:
                     raise
@@ -259,13 +318,61 @@ class TelegramAccountRuntime:
                         self._record_runtime_failure(exc, operation="ingest_stop")
                     if client is not None:
                         try:
-                            await client.disconnect()
+                            await asyncio.wait_for(client.disconnect(), timeout=2.0)
                         except Exception:
                             self.logger.debug("Telegram client disconnect cleanup failed", exc_info=True)
                     if self.client is client:
                         self.client = None
         finally:
             await self._notify_attempt()
+
+    async def _await_supervised(self, awaitable: Any, *, timeout: float, label: str) -> Any:
+        op_task = asyncio.ensure_future(awaitable)
+        force_task = asyncio.create_task(self._force_disconnect.wait())
+        stop_task = asyncio.create_task(self._stopping.wait())
+        waiters: set[asyncio.Task[Any]] = {op_task, force_task, stop_task}
+        try:
+            done, pending = await asyncio.wait(
+                waiters,
+                timeout=max(0.05, float(timeout)),
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if op_task in done:
+                return op_task.result()
+            if self._stopping.is_set():
+                raise asyncio.CancelledError()
+            if self._force_disconnect.is_set():
+                self._force_disconnect.clear()
+                raise self._last_connect_error or TimeoutError(f"Telegram {label} interrupted for reconnect")
+            raise TimeoutError(f"Telegram {label} timed out after {timeout:g} seconds")
+        except BaseException:
+            for task in waiters:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+            raise
+
+    async def _wait_until_disconnected(self, client: Any) -> None:
+        force_task = asyncio.create_task(self._force_disconnect.wait())
+        stop_task = asyncio.create_task(self._stopping.wait())
+        waiters: set[asyncio.Task[Any]] = {force_task, stop_task}
+        disconnected = getattr(client, "disconnected", None)
+        if inspect.isawaitable(disconnected):
+            waiters.add(asyncio.ensure_future(disconnected))
+        try:
+            _, pending = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+        except BaseException:
+            for task in waiters:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*waiters, return_exceptions=True)
+            raise
 
     async def _wait_retry_delay(self, delay: float) -> None:
         stop_task = asyncio.create_task(self._stopping.wait())
@@ -423,6 +530,8 @@ class TelegramRuntimeManager:
         call_timeout: float = 300.0,
         ingest: bool = True,
         connect_wait_seconds: float = 5.0,
+        management_timeout_seconds: float = DEFAULT_MANAGEMENT_TIMEOUT_SECONDS,
+        delivery_timeout_seconds: float = DEFAULT_DELIVERY_TIMEOUT_SECONDS,
         account_ids: set[str] | None = None,
     ) -> None:
         """Run one client per account; with ingest=False the clients serve commands without archiving."""
@@ -432,6 +541,8 @@ class TelegramRuntimeManager:
         self.call_timeout = call_timeout
         self.ingest = ingest
         self.connect_wait_seconds = max(0.0, float(connect_wait_seconds))
+        self.management_timeout_seconds = max(0.05, float(management_timeout_seconds))
+        self.delivery_timeout_seconds = max(0.05, float(delivery_timeout_seconds))
         self._account_ids = set(account_ids) if account_ids is not None else None
         self.logger = logging.getLogger(__name__)
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -469,7 +580,15 @@ class TelegramRuntimeManager:
         if threading.get_ident() == self._loop_thread_id:
             raise RuntimeError("Use execute() when calling TelegramRuntimeManager from its event loop")
         future = asyncio.run_coroutine_threadsafe(self.execute(account_id, operation, **kwargs), loop)
-        return self._wait_for_future(future, operation=operation, cancel_event=cancel_event)
+        try:
+            return self._wait_for_future(future, operation=operation, cancel_event=cancel_event)
+        except TimeoutError as exc:
+            if operation in MANAGEMENT_OPERATIONS:
+                runtime = self._runtimes.get(account_id)
+                if runtime is not None:
+                    loop.call_soon_threadsafe(runtime._trigger_reconnect_after_timeout, exc)
+                    return runtime._offline_result(operation, error=exc, **kwargs)
+            raise
 
     def notify(self, account_id: str, operation: str, **kwargs: Any) -> None:
         loop = self._require_loop()
@@ -518,6 +637,8 @@ class TelegramRuntimeManager:
             client_factory=self.client_factory,
             ingest=self.ingest,
             connect_wait_seconds=self.connect_wait_seconds,
+            management_timeout_seconds=self.management_timeout_seconds,
+            delivery_timeout_seconds=self.delivery_timeout_seconds,
         )
         self._runtimes[config.account_id] = runtime
         await runtime.start()

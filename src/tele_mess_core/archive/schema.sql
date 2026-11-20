@@ -287,6 +287,8 @@ CREATE TABLE IF NOT EXISTS delivery_outbox (
   content TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'pending',
   attempts INTEGER NOT NULL DEFAULT 0,
+  claim_token INTEGER NOT NULL DEFAULT 0,
+  send_random_id INTEGER,
   message_id INTEGER,
   last_error TEXT,
   next_attempt_at TEXT,
@@ -445,6 +447,7 @@ WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
   OR NEW.chunk_count <= 0
   OR NEW.chunk_index > NEW.chunk_count
   OR NEW.attempts < 0
+  OR NEW.claim_token < 0
 BEGIN
   SELECT RAISE(ABORT, 'invalid delivery outbox state');
 END;
@@ -457,6 +460,7 @@ WHEN NEW.status NOT IN ('pending', 'sending', 'retry', 'sent', 'failed')
   OR NEW.chunk_count <= 0
   OR NEW.chunk_index > NEW.chunk_count
   OR NEW.attempts < 0
+  OR NEW.claim_token < 0
 BEGIN
   SELECT RAISE(ABORT, 'invalid delivery outbox state');
 END;

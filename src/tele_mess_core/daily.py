@@ -749,59 +749,83 @@ def run_daily_summary(
         delivery_result: dict[str, Any] | None = None
         outbox_items: list[dict[str, Any]] = []
         if delivery.enabled:
-            from tele_mess_core.telegram.delivery import split_telegram_markdown
+            legacy_outbox = store.list_legacy_delivery_outbox(
+                summary_run_id=run_id,
+                job_id=job_owner[0] if job_owner is not None else None,
+            )
+            if legacy_outbox:
+                legacy_statuses = {str(row.get("status") or "") for row in legacy_outbox}
+                if legacy_statuses == {"sent"}:
+                    legacy_status = "sent"
+                elif "failed" in legacy_statuses:
+                    legacy_status = "failed"
+                else:
+                    legacy_status = "queued"
+                first_row = legacy_outbox[0]
+                delivery_result = {
+                    "enabled": True,
+                    "account_id": str(first_row.get("account_id") or delivery.account_id or ""),
+                    "origin_id": int(first_row["origin_id"]),
+                    "topic_id": int(first_row.get("topic_id") or 0),
+                    "status": legacy_status,
+                    "message_count": len(legacy_outbox),
+                    "outbox_ids": [str(row["outbox_id"]) for row in legacy_outbox],
+                    "delivery_kinds": sorted({str(row.get("content_kind") or "summary") for row in legacy_outbox}),
+                }
+            else:
+                from tele_mess_core.telegram.delivery import split_telegram_markdown
 
-            delivery_contents: list[tuple[str, str]] = []
-            if package_payload.get("important_origins"):
+                delivery_contents: list[tuple[str, str]] = []
+                if package_payload.get("important_origins"):
+                    delivery_contents.append(
+                        (
+                            "important_summary",
+                            _summary_delivery_markdown(
+                                package_run=package_run,
+                                package_payload=package_payload,
+                                provider=effective_provider,
+                                summary_text=important_summary_text,
+                                summary_kind="important",
+                            ),
+                        )
+                    )
                 delivery_contents.append(
                     (
-                        "important_summary",
+                        "point_summary",
                         _summary_delivery_markdown(
                             package_run=package_run,
                             package_payload=package_payload,
                             provider=effective_provider,
-                            summary_text=important_summary_text,
-                            summary_kind="important",
+                            summary_text=point_summary_text,
+                            summary_kind="point",
                         ),
                     )
                 )
-            delivery_contents.append(
-                (
-                    "point_summary",
-                    _summary_delivery_markdown(
-                        package_run=package_run,
-                        package_payload=package_payload,
-                        provider=effective_provider,
-                        summary_text=point_summary_text,
-                        summary_kind="point",
-                    ),
-                )
-            )
-            for kind, content in delivery_contents:
-                chunks = split_telegram_markdown(content)
-                for index, chunk in enumerate(chunks, start=1):
-                    body = f"[{index}/{len(chunks)}]\n\n{chunk}" if len(chunks) > 1 else chunk
-                    outbox_items.append(
-                        {
-                            "outbox_id": f"out_{run_id}_{kind}_{index}",
-                            "summary_run_id": run_id,
-                            "job_id": job_owner[0] if job_owner is not None else None,
-                            "account_id": delivery.account_id,
-                            "origin_id": delivery.origin_id,
-                            "topic_id": delivery.topic_id,
-                            "content_kind": kind,
-                            "chunk_index": index,
-                            "chunk_count": len(chunks),
-                            "content": body,
-                        }
-                    )
-            delivery_result = {
-                **_delivery_target_payload(delivery),
-                "status": "queued",
-                "message_count": len(outbox_items),
-                "outbox_ids": [item["outbox_id"] for item in outbox_items],
-                "delivery_kinds": [kind for kind, _ in delivery_contents],
-            }
+                for kind, content in delivery_contents:
+                    chunks = split_telegram_markdown(content)
+                    for index, chunk in enumerate(chunks, start=1):
+                        body = f"[{index}/{len(chunks)}]\n\n{chunk}" if len(chunks) > 1 else chunk
+                        outbox_items.append(
+                            {
+                                "outbox_id": f"out_{run_id}_{kind}_{index}",
+                                "summary_run_id": run_id,
+                                "job_id": job_owner[0] if job_owner is not None else None,
+                                "account_id": delivery.account_id,
+                                "origin_id": delivery.origin_id,
+                                "topic_id": delivery.topic_id,
+                                "content_kind": kind,
+                                "chunk_index": index,
+                                "chunk_count": len(chunks),
+                                "content": body,
+                            }
+                        )
+                delivery_result = {
+                    **_delivery_target_payload(delivery),
+                    "status": "queued",
+                    "message_count": len(outbox_items),
+                    "outbox_ids": [item["outbox_id"] for item in outbox_items],
+                    "delivery_kinds": [kind for kind, _ in delivery_contents],
+                }
         _write_summary_analysis_json(
             output_root / "summary.json",
             run_id=run_id,

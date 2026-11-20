@@ -33,7 +33,7 @@ from tele_mess_core.models import (
     UserRecord,
     utc_now_iso,
 )
-from tele_mess_core.archive.migrations import apply_migrations
+from tele_mess_core.archive.migrations import apply_migrations, outbox_send_random_id
 from tele_mess_core.media import (
     classify_media_type,
     media_file_extension,
@@ -95,6 +95,17 @@ class ArchiveStore:
             self._local.lock = lock
         return lock
 
+    def _open_connection(self, *, timeout: float = 30.0, busy_timeout_ms: int = 30000) -> sqlite3.Connection:
+        connection = sqlite3.connect(str(self.database_path), check_same_thread=False, timeout=timeout)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA foreign_keys = ON")
+        connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+        connection.create_function("tmc_media_filename", 1, media_filename, deterministic=True)
+        connection.create_function("tmc_media_file_extension", 1, media_file_extension, deterministic=True)
+        connection.create_function("tmc_media_type", 3, classify_media_type, deterministic=True)
+        connection.create_function("tmc_media_filename_contains", 2, media_filename_contains, deterministic=True)
+        return connection
+
     @property
     def _conn(self) -> sqlite3.Connection:
         if self._closed:
@@ -102,14 +113,7 @@ class ArchiveStore:
         connection = getattr(self._local, "connection", None)
         if connection is not None:
             return connection
-        connection = sqlite3.connect(str(self.database_path), check_same_thread=False, timeout=30.0)
-        connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA foreign_keys = ON")
-        connection.execute("PRAGMA busy_timeout = 30000")
-        connection.create_function("tmc_media_filename", 1, media_filename, deterministic=True)
-        connection.create_function("tmc_media_file_extension", 1, media_file_extension, deterministic=True)
-        connection.create_function("tmc_media_type", 3, classify_media_type, deterministic=True)
-        connection.create_function("tmc_media_filename_contains", 2, media_filename_contains, deterministic=True)
+        connection = self._open_connection()
         self._local.connection = connection
         with self._state_lock:
             if self._closed:
@@ -144,24 +148,40 @@ class ArchiveStore:
     def initialize(self) -> None:
         """Create or upgrade the archive schema; a current database is left untouched."""
         with self._lock:
-            try:
-                existing_schema_version = self._validate_existing_schema_version()
-                self._conn.execute("PRAGMA journal_mode = WAL")
-                if (
-                    existing_schema_version == SCHEMA_VERSION
-                    and self.get_meta(UPGRADE_PENDING_META) is None
-                    and self._has_schema_objects()
-                ):
-                    # An open of an earlier release interrupted after its last
-                    # migration can leave the archive without its ID.
+            existing_schema_version = self._validate_existing_schema_version()
+            self._conn.execute("PRAGMA journal_mode = WAL")
+            if (
+                existing_schema_version == SCHEMA_VERSION
+                and self.get_meta(UPGRADE_PENDING_META) is None
+                and self._has_schema_objects()
+            ):
+                # An open of an earlier release interrupted after its last
+                # migration can leave the archive without its ID.
+                if self.get_meta("database_id") is None:
+                    self.set_meta("database_id", str(uuid.uuid4()))
+                    self._conn.commit()
+                return
+            is_empty = self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None
+            if is_empty:
+                try:
+                    self._conn.executescript(_schema_sql())
                     if self.get_meta("database_id") is None:
                         self.set_meta("database_id", str(uuid.uuid4()))
-                        self._conn.commit()
-                    return
-                if self._conn.execute("SELECT 1 FROM sqlite_master LIMIT 1").fetchone() is None:
-                    self._conn.executescript(_schema_sql())
-                else:
-                    self._upgrade_schema(existing_schema_version)
+                    self.set_meta("schema_version", str(SCHEMA_VERSION))
+                    self._conn.execute("DELETE FROM meta WHERE key = ?", (UPGRADE_PENDING_META,))
+                    self._conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+                    self._conn.commit()
+                except Exception:
+                    self._conn.rollback()
+                    raise
+                return
+
+            if str(self.database_path) != ":memory:" and existing_schema_version < SCHEMA_VERSION:
+                self._initialize_exclusive_upgrade(existing_schema_version)
+                return
+
+            try:
+                self._upgrade_schema(existing_schema_version)
                 if self.get_meta("database_id") is None:
                     self.set_meta("database_id", str(uuid.uuid4()))
                 self.set_meta("schema_version", str(SCHEMA_VERSION))
@@ -171,6 +191,35 @@ class ArchiveStore:
             except Exception:
                 self._conn.rollback()
                 raise
+
+    def _initialize_exclusive_upgrade(self, existing_schema_version: int) -> None:
+        """Hold an exclusive SQLite lock across a schema upgrade so active older services are never broken."""
+        conn = self._conn
+        conn.execute("PRAGMA busy_timeout = 1500")
+        conn.execute("PRAGMA locking_mode = EXCLUSIVE")
+        try:
+            conn.execute("BEGIN EXCLUSIVE")
+        except sqlite3.OperationalError as exc:
+            conn.execute("PRAGMA locking_mode = NORMAL")
+            conn.execute("PRAGMA busy_timeout = 30000")
+            raise RuntimeError(
+                f"Cannot upgrade archive schema from v{existing_schema_version} to v{SCHEMA_VERSION} "
+                "while another process has the database open; stop running services before upgrading."
+            ) from exc
+        try:
+            self._upgrade_schema(existing_schema_version)
+            if self.get_meta("database_id") is None:
+                self.set_meta("database_id", str(uuid.uuid4()))
+            self.set_meta("schema_version", str(SCHEMA_VERSION))
+            conn.execute("DELETE FROM meta WHERE key = ?", (UPGRADE_PENDING_META,))
+            conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
+            conn.commit()
+        except Exception:
+            if conn.in_transaction:
+                conn.rollback()
+            raise
+        finally:
+            self.close_thread_connection()
 
     def _upgrade_schema(self, existing_schema_version: int) -> None:
         tables_sql, object_statements = _schema_sql_parts()
@@ -1650,9 +1699,11 @@ class ArchiveStore:
         job_id: str,
         worker_id: str,
         attempt: int,
+        now: str | None = None,
     ) -> dict[str, Any] | None:
         required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
         placeholders = ", ".join("?" for _ in required_statuses)
+        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1661,8 +1712,9 @@ class ArchiveStore:
                     SELECT 1 FROM daily_summary_jobs
                     WHERE job_id = ? AND worker_id = ? AND attempt = ?
                       AND status IN ({placeholders})
+                      AND lease_until IS NOT NULL AND lease_until >= ?
                     """,
-                    (job_id, worker_id, int(attempt), *required_statuses),
+                    (job_id, worker_id, int(attempt), *required_statuses, effective_now),
                 ).fetchone()
                 if owner is None:
                     self._conn.rollback()
@@ -1787,9 +1839,11 @@ class ArchiveStore:
         job_id: str,
         worker_id: str,
         attempt: int,
+        now: str | None = None,
     ) -> dict[str, Any] | None:
         required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
         placeholders = ", ".join("?" for _ in required_statuses)
+        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1798,8 +1852,9 @@ class ArchiveStore:
                     SELECT 1 FROM daily_summary_jobs
                     WHERE job_id = ? AND worker_id = ? AND attempt = ?
                       AND status IN ({placeholders})
+                      AND lease_until IS NOT NULL AND lease_until >= ?
                     """,
-                    (job_id, worker_id, int(attempt), *required_statuses),
+                    (job_id, worker_id, int(attempt), *required_statuses, effective_now),
                 ).fetchone()
                 if owner is None:
                     self._conn.rollback()
@@ -2098,6 +2153,7 @@ class ArchiveStore:
                     updated_at = ?
                 WHERE job_id = ? AND worker_id = ? AND attempt = ?
                   AND status IN ('running', 'cancel_requested')
+                  AND lease_until IS NOT NULL AND lease_until >= ?
                 """,
                 (
                     date,
@@ -2115,6 +2171,7 @@ class ArchiveStore:
                     job_id,
                     worker_id,
                     int(attempt),
+                    now,
                 ),
             )
             self._conn.commit()
@@ -2136,8 +2193,9 @@ class ArchiveStore:
                 SET heartbeat_at = ?, lease_until = ?, updated_at = ?
                 WHERE job_id = ? AND worker_id = ? AND attempt = ?
                   AND status IN ('running', 'cancel_requested')
+                  AND lease_until IS NOT NULL AND lease_until >= ?
                 """,
-                (now, lease_until, now, job_id, worker_id, int(attempt)),
+                (now, lease_until, now, job_id, worker_id, int(attempt), now),
             )
             self._conn.commit()
             return cur.rowcount > 0
@@ -2191,6 +2249,7 @@ class ArchiveStore:
                         updated_at = ?
                     WHERE job_id = ? AND worker_id = ? AND attempt = ?
                       AND status IN ({placeholders})
+                      AND lease_until IS NOT NULL AND lease_until >= ?
                     """,
                     (
                         status,
@@ -2211,6 +2270,7 @@ class ArchiveStore:
                         worker_id,
                         int(attempt),
                         *allowed,
+                        now,
                     ),
                 )
                 updated = cur.rowcount > 0
@@ -2269,8 +2329,9 @@ class ArchiveStore:
                         updated_at = ?
                     WHERE job_id = ? AND worker_id = ? AND attempt = ?
                       AND status IN ('running', 'cancel_requested')
+                      AND lease_until IS NOT NULL AND lease_until >= ?
                     """,
-                    (now, now, job_id, worker_id, int(attempt)),
+                    (now, now, job_id, worker_id, int(attempt), now),
                 )
                 requeued = cur.rowcount > 0
                 if requeued:
@@ -2327,6 +2388,7 @@ class ArchiveStore:
                     progress_label = ?, progress_json = ?, error = ?,
                     finished_at = NULL, updated_at = ?
                 WHERE job_id = ? AND worker_id = ? AND attempt = ? AND status = 'running'
+                  AND lease_until IS NOT NULL AND lease_until >= ?
                   AND cancel_requested_at IS NULL AND retry_count < ?
                 """,
                 (
@@ -2338,6 +2400,7 @@ class ArchiveStore:
                     job_id,
                     worker_id,
                     int(attempt),
+                    now,
                     int(max_retries),
                 ),
             )
@@ -2347,12 +2410,9 @@ class ArchiveStore:
     def request_daily_summary_job_cancel(self, job_id: str) -> dict[str, Any] | None:
         now = utc_now_iso()
         with self._lock:
-            row = self._conn.execute("SELECT status FROM daily_summary_jobs WHERE job_id = ?", (job_id,)).fetchone()
-            if row is None:
-                return None
-            status = str(row["status"])
-            if status not in {"completed", "failed", "canceled"}:
-                self._conn.execute(
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
                     """
                     UPDATE daily_summary_jobs
                     SET status = 'cancel_requested',
@@ -2360,14 +2420,19 @@ class ArchiveStore:
                         retry_at = NULL,
                         updated_at = ?
                     WHERE job_id = ?
+                      AND status IN ('queued', 'running', 'cancel_requested')
                     """,
                     (now, now, job_id),
                 )
-                self._conn.execute(
-                    "DELETE FROM delivery_outbox WHERE job_id = ? AND status NOT IN ('sent', 'failed')",
-                    (job_id,),
-                )
+                if cur.rowcount > 0:
+                    self._conn.execute(
+                        "DELETE FROM delivery_outbox WHERE job_id = ? AND status NOT IN ('sent', 'failed')",
+                        (job_id,),
+                    )
                 self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
         return self.get_daily_summary_job(job_id)
 
     def upsert_daily_message_point(
@@ -2709,20 +2774,26 @@ class ArchiveStore:
             content_kind = str(item.get("content_kind") or "summary")
             if content_kind != "summary" and (run_id in legacy_runs or (job_id is not None and job_id in legacy_jobs)):
                 continue
+            outbox_id = str(item.get("outbox_id") or f"out_{uuid.uuid4().hex[:16]}")
+            send_random_id = (
+                int(item["send_random_id"])
+                if item.get("send_random_id") is not None
+                else outbox_send_random_id(outbox_id)
+            )
             now = str(item.get("created_at") or utc_now_iso())
             self._conn.execute(
                 """
                 INSERT INTO delivery_outbox(
                   outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
                   content_kind, chunk_index, chunk_count, content, status, attempts,
-                  created_at, updated_at
+                  claim_token, send_random_id, created_at, updated_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, 0, ?, ?, ?)
                 ON CONFLICT(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
                 DO NOTHING
                 """,
                 (
-                    str(item.get("outbox_id") or f"out_{uuid.uuid4().hex[:16]}"),
+                    outbox_id,
                     run_id,
                     job_id,
                     str(item["account_id"]),
@@ -2732,10 +2803,40 @@ class ArchiveStore:
                     int(item["chunk_index"]),
                     int(item["chunk_count"]),
                     str(item["content"]),
+                    send_random_id,
                     now,
                     now,
                 ),
             )
+
+    def list_legacy_delivery_outbox(
+        self,
+        *,
+        summary_run_id: str | None = None,
+        job_id: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """Return pre-v20 ('summary') outbox rows associated with a summary run or job."""
+        match_clauses: list[str] = []
+        params: list[Any] = []
+        if summary_run_id:
+            match_clauses.append("summary_run_id = ?")
+            params.append(summary_run_id)
+        if job_id:
+            match_clauses.append("job_id = ?")
+            params.append(job_id)
+        if not match_clauses:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                f"""
+                SELECT * FROM delivery_outbox
+                WHERE content_kind = 'summary'
+                  AND ({' OR '.join(match_clauses)})
+                ORDER BY created_at, chunk_index
+                """,
+                tuple(params),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def publish_daily_summary(
         self,
@@ -2745,7 +2846,9 @@ class ArchiveStore:
         *,
         message_points: list[DailyMessagePointRecord] | None = None,
         job_owner: tuple[str, str, int] | None = None,
+        now: str | None = None,
     ) -> dict[str, Any] | None:
+        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -2756,8 +2859,9 @@ class ArchiveStore:
                         SELECT 1 FROM daily_summary_jobs
                         WHERE job_id = ? AND worker_id = ? AND attempt = ?
                           AND status = 'running'
+                          AND lease_until IS NOT NULL AND lease_until >= ?
                         """,
-                        (job_id, worker_id, int(attempt)),
+                        (job_id, worker_id, int(attempt), effective_now),
                     ).fetchone()
                     if owner is None:
                         self._conn.rollback()
@@ -2857,17 +2961,46 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
+    def reset_retry_backoff_for_summary(self, summary_run_id: str) -> int:
+        """Clear retry backoff timestamps for one summary run so standalone recovery retries immediately."""
+        with self._lock:
+            cur = self._conn.execute(
+                """
+                UPDATE delivery_outbox
+                SET next_attempt_at = NULL
+                WHERE summary_run_id = ? AND status = 'retry'
+                """,
+                (summary_run_id,),
+            )
+            self._conn.commit()
+            return max(cur.rowcount, 0)
+
     def claim_delivery_outbox(
         self,
         *,
         now: str,
         stale_before: str,
         summary_run_id: str | None = None,
+        job_owner: tuple[str, str, int] | None = None,
     ) -> dict[str, Any] | None:
-        outbox_id: str | None = None
+        claimed: dict[str, Any] | None = None
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if job_owner is not None:
+                    job_id, worker_id, attempt = job_owner
+                    owner = self._conn.execute(
+                        """
+                        SELECT 1 FROM daily_summary_jobs
+                        WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                          AND status = 'running'
+                          AND lease_until IS NOT NULL AND lease_until >= ?
+                        """,
+                        (job_id, worker_id, int(attempt), now),
+                    ).fetchone()
+                    if owner is None:
+                        self._conn.rollback()
+                        return None
                 clauses = [
                     "(o.status IN ('pending', 'retry') AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))",
                     "(o.status = 'sending' AND o.updated_at < ?)",
@@ -2902,20 +3035,25 @@ class ArchiveStore:
                     self._conn.execute(
                         """
                         UPDATE delivery_outbox
-                        SET status = 'sending', attempts = attempts + 1, updated_at = ?
+                        SET status = 'sending',
+                            attempts = attempts + 1,
+                            claim_token = claim_token + 1,
+                            updated_at = ?
                         WHERE outbox_id = ?
                         """,
                         (now, outbox_id),
                     )
+                    claimed_row = self._conn.execute(
+                        "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
+                        (outbox_id,),
+                    ).fetchone()
+                    if claimed_row is not None:
+                        claimed = dict(claimed_row)
                 self._conn.commit()
             except Exception:
                 self._conn.rollback()
                 raise
-        if outbox_id is None:
-            return None
-        with self._lock:
-            row = self._conn.execute("SELECT * FROM delivery_outbox WHERE outbox_id = ?", (outbox_id,)).fetchone()
-        return dict(row) if row is not None else None
+        return claimed
 
     def complete_delivery_outbox(
         self,
@@ -2923,29 +3061,18 @@ class ArchiveStore:
         *,
         message_id: int | None,
         now: str,
-        expected_attempt: int | None = None,
+        expected_claim_token: int,
     ) -> bool:
         with self._lock:
-            if expected_attempt is not None:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'sent', message_id = ?, last_error = NULL,
-                        next_attempt_at = NULL, sent_at = ?, updated_at = ?
-                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
-                    """,
-                    (message_id, now, now, outbox_id, int(expected_attempt)),
-                )
-            else:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'sent', message_id = ?, last_error = NULL,
-                        next_attempt_at = NULL, sent_at = ?, updated_at = ?
-                    WHERE outbox_id = ?
-                    """,
-                    (message_id, now, now, outbox_id),
-                )
+            cur = self._conn.execute(
+                """
+                UPDATE delivery_outbox
+                SET status = 'sent', message_id = ?, last_error = NULL,
+                    next_attempt_at = NULL, sent_at = ?, updated_at = ?
+                WHERE outbox_id = ? AND status = 'sending' AND claim_token = ?
+                """,
+                (message_id, now, now, outbox_id, int(expected_claim_token)),
+            )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -2956,27 +3083,17 @@ class ArchiveStore:
         error: str,
         next_attempt_at: str,
         now: str,
-        expected_attempt: int | None = None,
+        expected_claim_token: int,
     ) -> bool:
         with self._lock:
-            if expected_attempt is not None:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
-                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
-                    """,
-                    (error, next_attempt_at, now, outbox_id, int(expected_attempt)),
-                )
-            else:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
-                    WHERE outbox_id = ?
-                    """,
-                    (error, next_attempt_at, now, outbox_id),
-                )
+            cur = self._conn.execute(
+                """
+                UPDATE delivery_outbox
+                SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
+                WHERE outbox_id = ? AND status = 'sending' AND claim_token = ?
+                """,
+                (error, next_attempt_at, now, outbox_id, int(expected_claim_token)),
+            )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -2986,30 +3103,19 @@ class ArchiveStore:
         *,
         error: str,
         now: str,
-        expected_attempt: int | None = None,
+        expected_claim_token: int,
     ) -> bool:
-        """Return a chunk interrupted by shutdown to retry without spending an attempt."""
+        """Return a chunk interrupted by shutdown to retry without spending an attempt or reusing its claim token."""
         with self._lock:
-            if expected_attempt is not None:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'retry', attempts = MAX(0, attempts - 1), last_error = ?,
-                        next_attempt_at = NULL, updated_at = ?
-                    WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
-                    """,
-                    (error, now, outbox_id, int(expected_attempt)),
-                )
-            else:
-                cur = self._conn.execute(
-                    """
-                    UPDATE delivery_outbox
-                    SET status = 'retry', attempts = MAX(0, attempts - 1), last_error = ?,
-                        next_attempt_at = NULL, updated_at = ?
-                    WHERE outbox_id = ? AND status = 'sending'
-                    """,
-                    (error, now, outbox_id),
-                )
+            cur = self._conn.execute(
+                """
+                UPDATE delivery_outbox
+                SET status = 'retry', attempts = MAX(0, attempts - 1), last_error = ?,
+                    next_attempt_at = NULL, updated_at = ?
+                WHERE outbox_id = ? AND status = 'sending' AND claim_token = ?
+                """,
+                (error, now, outbox_id, int(expected_claim_token)),
+            )
             self._conn.commit()
             return cur.rowcount > 0
 
@@ -3019,30 +3125,20 @@ class ArchiveStore:
         *,
         error: str,
         now: str,
-        expected_attempt: int | None = None,
+        expected_claim_token: int,
     ) -> bool:
         """Mark a chunk and all remaining unsent chunks of the same report as failed."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
-                if expected_attempt is not None:
-                    row = self._conn.execute(
-                        """
-                        SELECT summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index
-                        FROM delivery_outbox
-                        WHERE outbox_id = ? AND status = 'sending' AND attempts = ?
-                        """,
-                        (outbox_id, int(expected_attempt)),
-                    ).fetchone()
-                else:
-                    row = self._conn.execute(
-                        """
-                        SELECT summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index
-                        FROM delivery_outbox
-                        WHERE outbox_id = ?
-                        """,
-                        (outbox_id,),
-                    ).fetchone()
+                row = self._conn.execute(
+                    """
+                    SELECT summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index
+                    FROM delivery_outbox
+                    WHERE outbox_id = ? AND status = 'sending' AND claim_token = ?
+                    """,
+                    (outbox_id, int(expected_claim_token)),
+                ).fetchone()
                 if row is None:
                     self._conn.rollback()
                     return False

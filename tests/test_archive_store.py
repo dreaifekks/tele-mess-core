@@ -1401,6 +1401,7 @@ class ArchiveStoreTest(unittest.TestCase):
                 job_id="job_retry",
                 status="running",
                 worker_id="worker_a",
+                lease_until="2026-07-03T00:10:00+00:00",
                 attempt=1,
                 progress_label="failed provider",
                 progress_json='{"stage":"summary"}',
@@ -2109,9 +2110,22 @@ class ArchiveMigrationTest(unittest.TestCase):
                 INSERT INTO delivery_outbox(
                   outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
                   chunk_index, chunk_count, content, status, attempts, created_at, updated_at
-                ) VALUES (
+                ) VALUES
+                (
                   'out_v19_1', 'sum_v19', 'job_v19', 'main', -9001, 0,
                   1, 2, 'legacy chunk', 'sent', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_v19_inflight_1', 'sum_v19_inflight', 'job_v19_inflight', 'main', -9001, 0,
+                  1, 2, 'in flight chunk', 'sending', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_v19_inflight_2', 'sum_v19_inflight', 'job_v19_inflight', 'main', -9001, 0,
+                  2, 2, 'trailing chunk', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_v19_pending', 'sum_v19_pending', 'job_v19_pending', 'main', -9001, 0,
+                  1, 1, 'pending chunk', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
                 );
                 PRAGMA user_version = 19;
                 """
@@ -2127,6 +2141,28 @@ class ArchiveMigrationTest(unittest.TestCase):
                 self.assertEqual(len(rows), 1)
                 self.assertEqual(rows[0]["content_kind"], "summary")
                 self.assertEqual(rows[0]["status"], "sent")
+                self.assertIsNotNone(rows[0]["send_random_id"])
+
+                inflight_rows = {
+                    row["outbox_id"]: row for row in store.list_delivery_outbox(summary_run_id="sum_v19_inflight")
+                }
+                self.assertEqual(inflight_rows["out_v19_inflight_1"]["status"], "failed")
+                self.assertEqual(
+                    inflight_rows["out_v19_inflight_1"]["last_error"],
+                    "migrated_in_flight_sending_uncertain",
+                )
+                self.assertEqual(inflight_rows["out_v19_inflight_2"]["status"], "failed")
+                self.assertIsNone(
+                    store.claim_delivery_outbox(
+                        now="2026-07-03T01:00:00+00:00",
+                        stale_before="2026-07-03T00:55:00+00:00",
+                        summary_run_id="sum_v19_inflight",
+                    )
+                )
+
+                pending_rows = store.list_delivery_outbox(summary_run_id="sum_v19_pending")
+                self.assertEqual(pending_rows[0]["status"], "pending")
+                self.assertIsNotNone(pending_rows[0]["send_random_id"])
 
                 store.persist_daily_summary_batch(
                     [],
@@ -2170,21 +2206,23 @@ class ArchiveMigrationTest(unittest.TestCase):
                 )
                 assert claimed is not None
                 self.assertEqual(claimed["outbox_id"], "out_new_imp_1")
+                self.assertEqual(claimed["claim_token"], 1)
+                self.assertIsNotNone(claimed["send_random_id"])
                 self.assertTrue(
                     store.fail_delivery_outbox(
                         "out_new_imp_1",
                         error="permanent",
                         now="2026-07-03T01:00:01+00:00",
-                        expected_attempt=claimed["attempts"],
+                        expected_claim_token=claimed["claim_token"],
                     )
                 )
-                # Stale attempt update after fail is rejected
+                # Stale claim token update after fail is rejected
                 self.assertFalse(
                     store.complete_delivery_outbox(
                         "out_new_imp_1",
                         message_id=99,
                         now="2026-07-03T01:00:02+00:00",
-                        expected_attempt=claimed["attempts"],
+                        expected_claim_token=claimed["claim_token"],
                     )
                 )
                 by_id = {row["outbox_id"]: row for row in store.list_delivery_outbox(summary_run_id="sum_v20")}
@@ -2199,6 +2237,297 @@ class ArchiveMigrationTest(unittest.TestCase):
                 )
                 assert next_claimed is not None
                 self.assertEqual(next_claimed["outbox_id"], "out_new_pt_1")
+            finally:
+                store.close()
+
+    def test_v20_upgrade_refuses_while_v19_writer_connection_is_open(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v19_live.db"
+            v19_conn = sqlite3.connect(str(db_path))
+            v19_conn.execute("PRAGMA journal_mode = WAL")
+            v19_conn.executescript(
+                """
+                CREATE TABLE meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                INSERT INTO meta(key, value) VALUES('schema_version', '19');
+                CREATE TABLE delivery_outbox (
+                  outbox_id TEXT PRIMARY KEY,
+                  summary_run_id TEXT NOT NULL,
+                  job_id TEXT,
+                  account_id TEXT NOT NULL,
+                  origin_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  chunk_index INTEGER NOT NULL,
+                  chunk_count INTEGER NOT NULL,
+                  content TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  message_id INTEGER,
+                  last_error TEXT,
+                  next_attempt_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  sent_at TEXT,
+                  UNIQUE(summary_run_id, account_id, origin_id, topic_id, chunk_index)
+                );
+                PRAGMA user_version = 19;
+                """
+            )
+            v19_conn.commit()
+            store = ArchiveStore(db_path)
+            try:
+                with self.assertRaisesRegex(RuntimeError, "stop running services before upgrading"):
+                    store.initialize()
+                # Existing v19 writer's ON CONFLICT clause continues to work untouched.
+                v19_conn.execute(
+                    """
+                    INSERT INTO delivery_outbox(
+                      outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+                      chunk_index, chunk_count, content, status, attempts, created_at, updated_at
+                    ) VALUES (
+                      'out_v19_live', 'sum_live', 'job_live', 'main', -9001, 0,
+                      1, 1, 'live v19 write', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                    )
+                    ON CONFLICT(summary_run_id, account_id, origin_id, topic_id, chunk_index) DO NOTHING
+                    """
+                )
+                v19_conn.commit()
+                v19_conn.close()
+
+                # Once the v19 service closes its connection, upgrade succeeds cleanly.
+                store.initialize()
+                self.assertEqual(store.state()["schema_version"], SCHEMA_VERSION)
+                rows = store.list_delivery_outbox(summary_run_id="sum_live")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["content_kind"], "summary")
+            finally:
+                try:
+                    v19_conn.close()
+                except Exception:
+                    pass
+                store.close()
+
+    def test_expired_lease_cannot_renew_publish_or_claim_outbox_without_successor(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArchiveStore(Path(tmp) / "archive.db")
+            store.initialize()
+            try:
+                store.insert_daily_summary_job(
+                    DailySummaryJobRecord(
+                        job_id="job_exp",
+                        status="running",
+                        worker_id="stale",
+                        lease_until="2026-07-03T00:05:00+00:00",
+                        attempt=1,
+                        started_at="2026-07-03T00:00:00+00:00",
+                    )
+                )
+                expired_now = "2026-07-03T00:06:00+00:00"
+                self.assertFalse(
+                    store.renew_daily_summary_job_lease(
+                        "job_exp",
+                        "stale",
+                        1,
+                        now=expired_now,
+                        lease_until="2026-07-03T00:16:00+00:00",
+                    )
+                )
+                self.assertFalse(
+                    store.update_daily_summary_job_progress(
+                        "job_exp",
+                        "stale",
+                        1,
+                        progress={"phase": "running", "label": "late"},
+                        lease_until="2026-07-03T00:16:00+00:00",
+                        now=expired_now,
+                    )
+                )
+                self.assertIsNone(
+                    store.upsert_daily_summary_run_for_job(
+                        DailySummaryRunRecord(
+                            run_id="sum_exp",
+                            status="completed",
+                            package_run_id="pkg_exp",
+                            date="2026-07-03",
+                            timezone="UTC",
+                            scope_json="{}",
+                            output_dir=tmp,
+                        ),
+                        job_id="job_exp",
+                        worker_id="stale",
+                        attempt=1,
+                        now=expired_now,
+                    )
+                )
+                self.assertIsNone(
+                    store.publish_daily_summary(
+                        DailySummaryRunRecord(
+                            run_id="sum_exp",
+                            status="completed",
+                            package_run_id="pkg_exp",
+                            date="2026-07-03",
+                            timezone="UTC",
+                            scope_json="{}",
+                            output_dir=tmp,
+                        ),
+                        [],
+                        [
+                            {
+                                "outbox_id": "out_exp_1",
+                                "summary_run_id": "sum_exp",
+                                "job_id": "job_exp",
+                                "account_id": "main",
+                                "origin_id": -9001,
+                                "content_kind": "point_summary",
+                                "chunk_index": 1,
+                                "chunk_count": 1,
+                                "content": "late publish",
+                            }
+                        ],
+                        job_owner=("job_exp", "stale", 1),
+                        now=expired_now,
+                    )
+                )
+                self.assertEqual(store.list_delivery_outbox(summary_run_id="sum_exp"), [])
+
+                store.persist_daily_summary_batch(
+                    [],
+                    [
+                        {
+                            "outbox_id": "out_exp_existing",
+                            "summary_run_id": "sum_exp",
+                            "job_id": "job_exp",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "point_summary",
+                            "chunk_index": 1,
+                            "chunk_count": 1,
+                            "content": "existing",
+                        }
+                    ],
+                )
+                self.assertIsNone(
+                    store.claim_delivery_outbox(
+                        now=expired_now,
+                        stale_before="2026-07-03T00:01:00+00:00",
+                        summary_run_id="sum_exp",
+                        job_owner=("job_exp", "stale", 1),
+                    )
+                )
+                self.assertFalse(
+                    store.finish_daily_summary_job(
+                        "job_exp",
+                        "stale",
+                        1,
+                        status="completed",
+                        progress={"phase": "completed", "label": "completed"},
+                        now=expired_now,
+                    )
+                )
+            finally:
+                store.close()
+
+    def test_cancel_request_does_not_overwrite_completed_job_or_delete_its_outbox(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArchiveStore(Path(tmp) / "archive.db")
+            store.initialize()
+            try:
+                store.insert_daily_summary_job(
+                    DailySummaryJobRecord(
+                        job_id="job_done",
+                        status="completed",
+                        summary_run_id="sum_done",
+                        started_at="2026-07-03T00:00:00+00:00",
+                        finished_at="2026-07-03T00:01:00+00:00",
+                    )
+                )
+                store.persist_daily_summary_batch(
+                    [],
+                    [
+                        {
+                            "outbox_id": "out_done_1",
+                            "summary_run_id": "sum_done",
+                            "job_id": "job_done",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "point_summary",
+                            "chunk_index": 1,
+                            "chunk_count": 1,
+                            "content": "pending retry",
+                        }
+                    ],
+                )
+                after = store.request_daily_summary_job_cancel("job_done")
+                assert after is not None
+                self.assertEqual(after["status"], "completed")
+                self.assertIsNone(after["cancel_requested_at"])
+                self.assertEqual(len(store.list_delivery_outbox(summary_run_id="sum_done")), 1)
+            finally:
+                store.close()
+
+    def test_outbox_release_keeps_monotonic_claim_token_and_rejects_stale_ack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = ArchiveStore(Path(tmp) / "archive.db")
+            store.initialize()
+            try:
+                store.persist_daily_summary_batch(
+                    [],
+                    [
+                        {
+                            "outbox_id": "out_tok_1",
+                            "summary_run_id": "sum_tok",
+                            "account_id": "main",
+                            "origin_id": -9001,
+                            "content_kind": "point_summary",
+                            "chunk_index": 1,
+                            "chunk_count": 1,
+                            "content": "chunk",
+                        }
+                    ],
+                )
+                first = store.claim_delivery_outbox(
+                    now="2026-07-03T00:00:01+00:00",
+                    stale_before="2026-07-02T23:55:00+00:00",
+                )
+                assert first is not None
+                self.assertEqual(first["attempts"], 1)
+                self.assertEqual(first["claim_token"], 1)
+
+                self.assertTrue(
+                    store.release_delivery_outbox(
+                        "out_tok_1",
+                        error="stopping",
+                        now="2026-07-03T00:00:02+00:00",
+                        expected_claim_token=1,
+                    )
+                )
+                second = store.claim_delivery_outbox(
+                    now="2026-07-03T00:00:03+00:00",
+                    stale_before="2026-07-02T23:55:00+00:00",
+                )
+                assert second is not None
+                self.assertEqual(second["attempts"], 1)
+                self.assertEqual(second["claim_token"], 2)
+
+                # Late ack from first claim (token=1) must be rejected while token=2 owns the row.
+                self.assertFalse(
+                    store.complete_delivery_outbox(
+                        "out_tok_1",
+                        message_id=101,
+                        now="2026-07-03T00:00:04+00:00",
+                        expected_claim_token=1,
+                    )
+                )
+                self.assertTrue(
+                    store.complete_delivery_outbox(
+                        "out_tok_1",
+                        message_id=202,
+                        now="2026-07-03T00:00:05+00:00",
+                        expected_claim_token=2,
+                    )
+                )
+                final = store.list_delivery_outbox(summary_run_id="sum_tok")[0]
+                self.assertEqual(final["status"], "sent")
+                self.assertEqual(final["message_id"], 202)
             finally:
                 store.close()
 

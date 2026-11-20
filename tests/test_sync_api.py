@@ -1466,6 +1466,139 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_hung_rpc_returns_http_200_structured_errors_and_recovers_after_reconnect(self) -> None:
+        import asyncio
+        import threading
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        should_hang = {"value": True}
+
+        class ToggleClient:
+            async def connect(self) -> None:
+                return None
+
+            async def disconnect(self) -> None:
+                return None
+
+            async def is_user_authorized(self) -> bool:
+                if should_hang["value"]:
+                    await asyncio.Future()
+                return True
+
+            async def get_me(self) -> object:
+                class Me:
+                    id = 777
+                    username = "recovered"
+                    first_name = "Recovered"
+                    last_name = None
+
+                return Me()
+
+            async def send_code_request(self, phone: str) -> object:
+                await asyncio.Future()
+
+            async def sign_in(self, *args: object, **kwargs: object) -> object:
+                await asyncio.Future()
+
+            async def iter_dialogs(self) -> object:
+                if False:
+                    yield None
+
+            async def get_entity(self, origin_id: int) -> object:
+                await asyncio.Future()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ArchiveStore(root / "archive.db")
+            store.initialize()
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=root / "archive.db"),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: ToggleClient(),
+                ingest=False,
+                connect_wait_seconds=0.3,
+                management_timeout_seconds=0.15,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                def post(path: str, body: dict) -> tuple[int, dict]:
+                    req = Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=json.dumps(body).encode("utf-8"),
+                        method="POST",
+                    )
+                    req.add_header("Authorization", "Bearer secret")
+                    req.add_header("Content-Type", "application/json")
+                    with urlopen(req, timeout=3) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+                # All 5 management endpoints return HTTP 200 structured errors on hung RPC.
+                status, auth_payload = post("/manage/accounts/auth/status", {"account_id": "main"})
+                self.assertEqual(status, 200)
+                self.assertEqual(auth_payload["item"]["error"]["code"], "auth_status_failed")
+
+                status, req_payload = post("/manage/accounts/auth/request-code", {"account_id": "main", "phone": "+1000"})
+                self.assertEqual(status, 200)
+                self.assertEqual(req_payload["item"]["error"]["code"], "request_code_failed")
+
+                status, sub_payload = post(
+                    "/manage/accounts/auth/submit-code",
+                    {"account_id": "main", "phone": "+1000", "code": "12345"},
+                )
+                self.assertEqual(status, 200)
+                self.assertEqual(sub_payload["item"]["error"]["code"], "submit_code_failed")
+
+                status, disc_payload = post("/manage/discover-origins", {"account_id": "main"})
+                self.assertEqual(status, 200)
+                self.assertEqual(disc_payload["item"]["errors"][0]["code"], "discover_origins_failed")
+
+                status, part_payload = post("/manage/participants/refresh", {"account_id": "main", "origin_id": -1001})
+                self.assertEqual(status, 200)
+                self.assertEqual(part_payload["item"]["errors"][0]["code"], "refresh_participants_failed")
+
+                # Once the network recovers, the same runtime reconnects and succeeds.
+                should_hang["value"] = False
+                status, recovered = post("/manage/accounts/auth/status", {"account_id": "main"})
+                self.assertEqual(status, 200)
+                self.assertTrue(recovered["item"]["authorized"])
+                self.assertEqual(recovered["item"]["auth_state"], "authorized")
+            finally:
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

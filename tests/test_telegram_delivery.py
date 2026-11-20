@@ -153,6 +153,61 @@ class TelegramSummaryDeliveryServiceTest(unittest.IsolatedAsyncioTestCase):
             self.assertNotIn("**", parsed)
             self.assertTrue(any(isinstance(entity, MessageEntityBold) for entity in entities))
 
+    async def test_send_chunk_passes_persisted_random_id_via_send_message_request(self) -> None:
+        from telethon.tl.functions.messages import SendMessageRequest
+
+        class SentMessage:
+            id = 91
+
+        class TelethonStyleClient:
+            def __init__(self) -> None:
+                self.requests: list[object] = []
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            async def get_entity(self, origin_id: int) -> str:
+                return f"entity:{origin_id}"
+
+            async def get_input_entity(self, entity: object) -> str:
+                return f"input:{entity}"
+
+            async def __call__(self, request: object) -> object:
+                self.requests.append(request)
+                return {"raw": True}
+
+            def _get_response_message(self, request: object, response: object, entity: object) -> SentMessage:
+                return SentMessage()
+
+        store = Mock()
+        account = TelegramAccountConfig(
+            account_id="main",
+            api_id=1,
+            api_hash="test",
+            session_name="main",
+            session_dir=Path("/tmp/tele-mess-core-test-sessions"),
+        )
+        client = TelethonStyleClient()
+        service = TelegramSummaryDeliveryService(account, store)
+
+        result = await service.send_chunk(
+            DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-1001, topic_id=7),
+            "# Heading\n\n**Bold** body",
+            client=client,
+            random_id=1234567890123456789,
+        )
+
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["message_ids"], [91])
+        self.assertEqual(len(client.requests), 1)
+        request = client.requests[0]
+        self.assertIsInstance(request, SendMessageRequest)
+        assert isinstance(request, SendMessageRequest)
+        self.assertEqual(request.random_id, 1234567890123456789)
+        self.assertEqual(request.peer, "input:entity:-1001")
+        self.assertIsNotNone(request.reply_to)
+        self.assertIn("Bold", request.message)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -4,10 +4,11 @@ import argparse
 import asyncio
 import json
 import logging
+import os
 import signal
 from pathlib import Path
 import sys
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 from tele_mess_core.archive import ArchiveStore
 from tele_mess_core.models import (
@@ -211,8 +212,7 @@ def main(argv: list[str] | None = None) -> int:
             _daily_package(config, store, args)
             return 0
         if args.command == "daily-summary":
-            _daily_summary(config, store, args)
-            return 0
+            return _daily_summary(config, store, args)
         if args.command == "daily-run":
             return _daily_run(config, store, args)
         if args.command == "daily-schedule":
@@ -407,9 +407,16 @@ async def _run_local(config: AppConfig, store: ArchiveStore, *, web: bool = Fals
 
 
 async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool, ingest: bool = True) -> None:
-    from tele_mess_core.daily_jobs import DailyJobWorker
+    from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyJobWorker, DailyWorkerLock
     from tele_mess_core.telegram.manager import TelegramRuntimeManager
 
+    storage = getattr(config, "storage", None)
+    data_dir = getattr(storage, "data_dir", None)
+    worker_lock = (
+        DailyWorkerLock(data_dir / DAILY_WORKER_LOCK_FILENAME, owner=f"core:{os.getpid()}")
+        if data_dir is not None
+        else None
+    )
     runtime = TelegramRuntimeManager(config, store, ingest=ingest)
     daily_worker: DailyJobWorker | None = None
     api: SyncApiServer | None = None
@@ -417,9 +424,21 @@ async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool, ingest
     _install_stop_handlers(stop_event)
     stop_task: asyncio.Task[bool] | None = None
     api_task: asyncio.Task[None] | None = None
+    lock_acquired = False
     try:
+        if worker_lock is not None:
+            while not stop_event.is_set():
+                lock_acquired = worker_lock.try_acquire()
+                if lock_acquired:
+                    break
+                await asyncio.sleep(0.05)
+            if not lock_acquired:
+                return
         await runtime.start()
-        daily_worker = DailyJobWorker(store, config, telegram_runtime=runtime)
+        if lock_acquired:
+            daily_worker = DailyJobWorker(store, config, telegram_runtime=runtime, use_process_lock=False)
+        else:
+            daily_worker = DailyJobWorker(store, config, telegram_runtime=runtime)
         daily_worker.start()
         stop_task = asyncio.create_task(stop_event.wait(), name="server-stop-signal")
         if web:
@@ -456,6 +475,8 @@ async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool, ingest
                 try:
                     await runtime.stop()
                 finally:
+                    if lock_acquired and worker_lock is not None:
+                        worker_lock.release()
                     for task in (stop_task, api_task):
                         if task is not None and not task.done():
                             task.cancel()
@@ -497,8 +518,31 @@ def _daily_package(config: AppConfig, store: ArchiveStore, args: argparse.Namesp
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
 
 
-def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:
-    from tele_mess_core.daily_jobs import enqueue_daily_summary_job, run_daily_summary_job_from_cli
+def _daily_cli_exit_code(store: ArchiveStore, config: AppConfig, terminal: dict[str, Any]) -> int:
+    from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyWorkerLock
+
+    if terminal.get("status") != "completed":
+        return 1
+    summary_run_id = str(terminal.get("summary_run_id") or "")
+    if not summary_run_id:
+        return 0
+    outbox = store.list_delivery_outbox(summary_run_id=summary_run_id)
+    if any(item.get("status") == "failed" for item in outbox):
+        return 1
+    if any(item.get("status") in {"pending", "retry", "sending"} for item in outbox):
+        probe = DailyWorkerLock(config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME, owner="cli:probe")
+        if probe.try_acquire():
+            probe.release()
+            return 1
+    return 0
+
+
+def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> int:
+    from tele_mess_core.daily_jobs import (
+        DailyJobCliInterrupted,
+        enqueue_daily_summary_job,
+        run_daily_summary_job_from_cli,
+    )
 
     scope = _daily_scope_from_args(args)
     job = enqueue_daily_summary_job(
@@ -510,18 +554,29 @@ def _daily_summary(config: AppConfig, store: ArchiveStore, args: argparse.Namesp
         scope=scope,
         force=bool(args.force),
     )
-    terminal = run_daily_summary_job_from_cli(
-        store,
-        config,
-        str(job["job_id"]),
-        timeout=max(300, config.daily.ai.timeout_seconds * 20),
-    )
-    item = store.get_daily_summary_run(str(terminal.get("summary_run_id") or "")) or terminal
+    try:
+        terminal = run_daily_summary_job_from_cli(
+            store,
+            config,
+            str(job["job_id"]),
+            timeout=max(300, config.daily.ai.timeout_seconds * 20),
+        )
+    except DailyJobCliInterrupted as exc:
+        return 128 + exc.signum
+    if terminal.get("status") == "completed":
+        item = store.get_daily_summary_run(str(terminal.get("summary_run_id") or "")) or terminal
+    else:
+        item = terminal
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
+    return _daily_cli_exit_code(store, config, terminal)
 
 
 def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> int:
-    from tele_mess_core.daily_jobs import enqueue_daily_summary_job, run_daily_summary_job_from_cli
+    from tele_mess_core.daily_jobs import (
+        DailyJobCliInterrupted,
+        enqueue_daily_summary_job,
+        run_daily_summary_job_from_cli,
+    )
 
     schedule = store.get_daily_package_schedule() if args.scheduled else {}
     scope = dict(schedule.get("scope") or {}) if args.scheduled else {}
@@ -548,12 +603,15 @@ def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace)
         }
         print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
         return 1 if item.get("status") in {"failed", "canceled"} else 0
-    terminal = run_daily_summary_job_from_cli(
-        store,
-        config,
-        str(job["job_id"]),
-        timeout=max(300, config.daily.ai.timeout_seconds * 20),
-    )
+    try:
+        terminal = run_daily_summary_job_from_cli(
+            store,
+            config,
+            str(job["job_id"]),
+            timeout=max(300, config.daily.ai.timeout_seconds * 20),
+        )
+    except DailyJobCliInterrupted as exc:
+        return 128 + exc.signum
     package = store.get_daily_package_run(str(terminal.get("package_run_id") or ""))
     summary = store.get_daily_summary_run(str(terminal.get("summary_run_id") or ""))
     item = {
@@ -566,7 +624,7 @@ def _daily_run(config: AppConfig, store: ArchiveStore, args: argparse.Namespace)
         "error": terminal.get("error"),
     }
     print(json.dumps(item, ensure_ascii=False, indent=2, default=str))
-    return 0 if item.get("status") == "completed" else 1
+    return _daily_cli_exit_code(store, config, terminal)
 
 
 def _daily_schedule(config: AppConfig, store: ArchiveStore, args: argparse.Namespace) -> None:

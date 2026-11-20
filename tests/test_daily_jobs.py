@@ -970,7 +970,7 @@ class DailyJobWorkerTest(unittest.TestCase):
 
         runtime = SelectiveRuntime()
         worker = DailyJobWorker(self.store, self.config, telegram_runtime=runtime)
-        self.assertFalse(worker._deliver_pending_once(summary_run_id="sum_split"))
+        self.assertTrue(worker._deliver_pending_once(summary_run_id="sum_split"))
         self.assertTrue(worker._deliver_pending_once(summary_run_id="sum_split"))
         self.assertFalse(worker._deliver_pending_once(summary_run_id="sum_split"))
 
@@ -1128,6 +1128,224 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(canceled["status"], "canceled")
         self.assertEqual(runtime.calls, 1)
         self.assertEqual(self.store.list_delivery_outbox(summary_run_id=canceled["summary_run_id"]), [])
+
+    def test_standalone_cli_drains_other_report_on_failure_and_recovers_on_rerun(self) -> None:
+        self.store.set_origin_important(SOURCE_TELEGRAM, "main", -1001, 0, True)
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+        fail_first = {"remaining": 1}
+        sent_contents: list[tuple[str, int | None]] = []
+
+        class FlakyRuntime:
+            def __enter__(self) -> FlakyRuntime:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
+                content = str(kwargs["content"])
+                random_id = kwargs.get("random_id")
+                if fail_first["remaining"] > 0:
+                    fail_first["remaining"] -= 1
+                    raise RuntimeError("temporary delivery failure")
+                sent_contents.append((content, int(random_id) if random_id is not None else None))
+                return {"status": "sent", "message_ids": [len(sent_contents)], "message_count": 1}
+
+        job = enqueue_daily_summary_job(
+            self.store,
+            delivery_config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        first = run_daily_summary_job_from_cli(
+            self.store,
+            delivery_config,
+            job["job_id"],
+            delivery_runtime_factory=lambda _cfg, _store, _ids: FlakyRuntime(),
+        )
+        self.assertEqual(first["status"], "completed")
+        outbox_after_first = {
+            row["content_kind"]: row
+            for row in self.store.list_delivery_outbox(summary_run_id=first["summary_run_id"])
+        }
+        # Point summary must have been delivered even though important_summary entered retry.
+        self.assertEqual(outbox_after_first["point_summary"]["status"], "sent")
+        self.assertEqual(outbox_after_first["important_summary"]["status"], "retry")
+        self.assertEqual(len(sent_contents), 1)
+
+        # Re-running the same request recovers the remaining undelivered outbox without re-running AI.
+        re_enqueued = enqueue_daily_summary_job(
+            self.store,
+            delivery_config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        self.assertEqual(re_enqueued["job_id"], first["job_id"])
+        second = run_daily_summary_job_from_cli(
+            self.store,
+            delivery_config,
+            re_enqueued["job_id"],
+            delivery_runtime_factory=lambda _cfg, _store, _ids: FlakyRuntime(),
+        )
+        self.assertEqual(second["status"], "completed")
+        outbox_after_second = {
+            row["content_kind"]: row
+            for row in self.store.list_delivery_outbox(summary_run_id=second["summary_run_id"])
+        }
+        self.assertEqual(outbox_after_second["important_summary"]["status"], "sent")
+        self.assertEqual(outbox_after_second["point_summary"]["status"], "sent")
+        self.assertEqual(len(sent_contents), 2)
+        self.assertIsNotNone(sent_contents[1][1])
+
+    def test_waiting_cli_takes_over_after_lock_holder_exits(self) -> None:
+        import time
+        from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyWorkerLock
+
+        holder = DailyWorkerLock(self.root / DAILY_WORKER_LOCK_FILENAME, owner="other-service")
+        self.assertTrue(holder.try_acquire())
+        job = enqueue_daily_summary_job(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        def release_soon() -> None:
+            time.sleep(0.15)
+            holder.release()
+
+        releaser = threading.Thread(target=release_soon, daemon=True)
+        releaser.start()
+        try:
+            finished = run_daily_summary_job_from_cli(
+                self.store,
+                self.config,
+                job["job_id"],
+                timeout=5.0,
+                poll_interval=0.02,
+            )
+        finally:
+            holder.release()
+            releaser.join(timeout=2)
+
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(finished["attempt"], 1)
+
+    def test_standalone_cli_stop_event_interrupts_and_requeues_job(self) -> None:
+        from tele_mess_core.daily_jobs import DailyJobCliInterrupted
+
+        entered = threading.Event()
+        stop_event = threading.Event()
+        job = enqueue_daily_summary_job(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+
+        def blocking_package(*args: object, cancel_check: object = None, **kwargs: object) -> dict[str, object]:
+            entered.set()
+            assert callable(cancel_check)
+            while True:
+                cancel_check()
+                stop_event.wait(0.02)
+
+        def trigger_stop() -> None:
+            if entered.wait(2.0):
+                stop_event.set()
+
+        stopper = threading.Thread(target=trigger_stop, daemon=True)
+        stopper.start()
+        try:
+            with patch("tele_mess_core.daily_jobs.build_daily_package", side_effect=blocking_package):
+                with self.assertRaises(DailyJobCliInterrupted):
+                    run_daily_summary_job_from_cli(
+                        self.store,
+                        self.config,
+                        job["job_id"],
+                        timeout=5.0,
+                        poll_interval=0.02,
+                        stop_event=stop_event,
+                    )
+        finally:
+            stopper.join(timeout=2)
+
+        after = self.store.get_daily_summary_job(job["job_id"])
+        assert after is not None
+        self.assertEqual(after["status"], "queued")
+        self.assertIsNone(after["worker_id"])
+
+    def test_recovering_v19_run_with_legacy_outbox_publishes_legacy_delivery_metadata(self) -> None:
+        import json as json_mod
+
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+        job = enqueue_daily_summary_job(
+            self.store,
+            delivery_config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            scope={"account_id": "main"},
+        )
+        with self.store._lock:
+            self.store._conn.execute(
+                """
+                INSERT INTO delivery_outbox(
+                  outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+                  content_kind, chunk_index, chunk_count, content, status, attempts,
+                  claim_token, send_random_id, created_at, updated_at
+                )
+                VALUES ('out_legacy_keep', 'sum_legacy_run', ?, 'main', -9001, 0,
+                        'summary', 1, 1, 'legacy body', 'sent', 1, 1, 999, ?, ?)
+                """,
+                (job["job_id"], utc_now_iso(), utc_now_iso()),
+            )
+            self.store._conn.execute(
+                "UPDATE daily_summary_jobs SET summary_run_id = 'sum_legacy_run' WHERE job_id = ?",
+                (job["job_id"],),
+            )
+            self.store._conn.commit()
+
+        worker = DailyJobWorker(self.store, delivery_config, telegram_runtime=None)
+        completed = worker.run_once(job_id=job["job_id"])
+        assert completed is not None
+        self.assertEqual(completed["status"], "completed")
+        summary_run = self.store.get_daily_summary_run("sum_legacy_run")
+        assert summary_run is not None
+        delivery_meta = summary_run["progress"]["delivery"]
+        self.assertEqual(delivery_meta["outbox_ids"], ["out_legacy_keep"])
+        self.assertEqual(delivery_meta["delivery_kinds"], ["summary"])
+        self.assertEqual(delivery_meta["message_count"], 1)
+        self.assertEqual(delivery_meta["status"], "sent")
+        summary_json = json_mod.loads((Path(str(summary_run["output_dir"])) / "summary.json").read_text(encoding="utf-8"))
+        self.assertEqual(summary_json["delivery"]["outbox_ids"], ["out_legacy_keep"])
+        self.assertEqual(
+            [row["outbox_id"] for row in self.store.list_delivery_outbox(summary_run_id="sum_legacy_run")],
+            ["out_legacy_keep"],
+        )
 
 
 if __name__ == "__main__":
