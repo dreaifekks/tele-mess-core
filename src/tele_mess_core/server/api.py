@@ -914,6 +914,20 @@ def _set_daily_summary_records_deleted(store: ArchiveStore, payload: dict[str, A
     return {"summary_ids": summary_ids, "deleted": deleted, "changed_rows": changed_rows}
 
 
+_ACCOUNT_MUTATION_LOCKS_GUARD = threading.Lock()
+_ACCOUNT_MUTATION_LOCKS: dict[tuple[str, str, str], threading.RLock] = {}
+
+
+def _account_mutation_lock(store: ArchiveStore, source: str, account_id: str) -> threading.RLock:
+    key = (str(store.database_path.resolve()), source, account_id)
+    with _ACCOUNT_MUTATION_LOCKS_GUARD:
+        lock = _ACCOUNT_MUTATION_LOCKS.get(key)
+        if lock is None:
+            lock = threading.RLock()
+            _ACCOUNT_MUTATION_LOCKS[key] = lock
+        return lock
+
+
 def _create_management_account(
     config: "AppConfig | None",
     store: ArchiveStore,
@@ -925,35 +939,36 @@ def _create_management_account(
     display_name = str(payload.get("display_name") or account_id)
     now = utc_now_iso()
     raw = _public_raw_json(payload, hidden={"api_hash", "password", "code"})
-    store.upsert_account(
-        AccountRecord(
-            source=source,
-            account_id=account_id,
-            display_name=display_name,
-            kind=str(payload.get("kind") or "telegram"),
-            updated_at=now,
-            raw_json=raw,
-        )
-    )
     session_dir = _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
-    store.upsert_account_auth(
-        AccountAuthRecord(
-            source=source,
-            account_id=account_id,
-            auth_state=str(payload.get("auth_state") or "pending_auth"),
-            phone=_optional_payload_str(payload, "phone"),
-            session_name=_optional_payload_str(payload, "session_name") or account_id,
-            session_dir=session_dir,
-            updated_at=now,
-            raw_json=raw,
+    with _account_mutation_lock(store, source, account_id):
+        store.upsert_account(
+            AccountRecord(
+                source=source,
+                account_id=account_id,
+                display_name=display_name,
+                kind=str(payload.get("kind") or "telegram"),
+                updated_at=now,
+                raw_json=raw,
+            )
         )
-    )
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.bump_auth_state_epoch(account_id)
-    item = _find_account(store, source, account_id)
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.register_account(_account_config(config, store, account_id))
-    return item
+        store.upsert_account_auth(
+            AccountAuthRecord(
+                source=source,
+                account_id=account_id,
+                auth_state=str(payload.get("auth_state") or "pending_auth"),
+                phone=_optional_payload_str(payload, "phone"),
+                session_name=_optional_payload_str(payload, "session_name") or account_id,
+                session_dir=session_dir,
+                updated_at=now,
+                raw_json=raw,
+            )
+        )
+        if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+            telegram_runtime.bump_auth_state_epoch(account_id)
+        item = _find_account(store, source, account_id)
+        if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+            telegram_runtime.register_account(_account_config(config, store, account_id))
+        return item
 
 
 def _update_account_auth(
@@ -966,50 +981,51 @@ def _update_account_auth(
 ) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
-    existing = store.get_management_account(source, account_id) if partial else None
-    now = utc_now_iso()
-    auth_state = str(
-        payload.get("auth_state")
-        or payload.get("status")
-        or (existing or {}).get("auth_state")
-        or "pending_auth"
-    )
-    phone = (
-        (existing or {}).get("phone")
-        if partial and "phone" not in payload
-        else _optional_payload_str(payload, "phone")
-    )
-    session_name = (
-        (existing or {}).get("session_name")
-        if partial and "session_name" not in payload
-        else _optional_payload_str(payload, "session_name")
-    )
-    session_dir = (
-        (existing or {}).get("session_dir")
-        if partial and "session_dir" not in payload
-        else _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
-    )
-    last_error = (
-        (existing or {}).get("last_error")
-        if partial and "last_error" not in payload
-        else _optional_payload_str(payload, "last_error")
-    )
-    store.upsert_account_auth(
-        AccountAuthRecord(
-            source=source,
-            account_id=account_id,
-            auth_state=auth_state,
-            phone=phone,
-            session_name=session_name,
-            session_dir=session_dir,
-            last_error=last_error,
-            updated_at=now,
-            raw_json=_public_raw_json(payload, hidden={"api_hash", "password", "code"}),
+    with _account_mutation_lock(store, source, account_id):
+        existing = store.get_management_account(source, account_id) if partial else None
+        now = utc_now_iso()
+        auth_state = str(
+            payload.get("auth_state")
+            or payload.get("status")
+            or (existing or {}).get("auth_state")
+            or "pending_auth"
         )
-    )
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.bump_auth_state_epoch(account_id)
-    return _find_account(store, source, account_id)
+        phone = (
+            (existing or {}).get("phone")
+            if partial and "phone" not in payload
+            else _optional_payload_str(payload, "phone")
+        )
+        session_name = (
+            (existing or {}).get("session_name")
+            if partial and "session_name" not in payload
+            else _optional_payload_str(payload, "session_name")
+        )
+        session_dir = (
+            (existing or {}).get("session_dir")
+            if partial and "session_dir" not in payload
+            else _normalized_session_dir(config, _optional_payload_str(payload, "session_dir"))
+        )
+        last_error = (
+            (existing or {}).get("last_error")
+            if partial and "last_error" not in payload
+            else _optional_payload_str(payload, "last_error")
+        )
+        store.upsert_account_auth(
+            AccountAuthRecord(
+                source=source,
+                account_id=account_id,
+                auth_state=auth_state,
+                phone=phone,
+                session_name=session_name,
+                session_dir=session_dir,
+                last_error=last_error,
+                updated_at=now,
+                raw_json=_public_raw_json(payload, hidden={"api_hash", "password", "code"}),
+            )
+        )
+        if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+            telegram_runtime.bump_auth_state_epoch(account_id)
+        return _find_account(store, source, account_id)
 
 
 def _delete_management_account(
@@ -1019,12 +1035,13 @@ def _delete_management_account(
 ) -> dict[str, Any]:
     source = _source(payload)
     account_id = _required_str(payload, "account_id")
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.unregister_account(account_id)
-    deleted_rows = store.delete_management_account(source, account_id)
-    if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.trigger_media_cleanup()
-    return {"source": source, "account_id": account_id, "deleted_rows": deleted_rows}
+    with _account_mutation_lock(store, source, account_id):
+        if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+            telegram_runtime.unregister_account(account_id)
+        deleted_rows = store.delete_management_account(source, account_id)
+        if telegram_runtime is not None and source == SOURCE_TELEGRAM:
+            telegram_runtime.trigger_media_cleanup()
+        return {"source": source, "account_id": account_id, "deleted_rows": deleted_rows}
 
 
 def _create_origin(store: ArchiveStore, payload: dict[str, Any]) -> dict[str, Any]:

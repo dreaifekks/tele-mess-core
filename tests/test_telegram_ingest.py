@@ -3697,6 +3697,264 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                     await manager.stop()
             local_store.close()
 
+    async def test_concurrent_create_and_delete_management_account_stay_consistent(self) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountRecord
+        from tele_mess_core.server.api import _create_management_account, _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "concurrent_create_delete.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "Main", "user"))
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            block_first_scan = {"active": True}
+
+            class MinimalAuthClient:
+                def __init__(self) -> None:
+                    self._connected = False
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_me(self):
+                    return SimpleNamespace(id=1, first_name="Main", last_name=None, username="main")
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            def blocking_first_scan(*args, **kwargs) -> bool:
+                if kwargs.get("deleted_accounts_only"):
+                    return False
+                if block_first_scan["active"]:
+                    block_first_scan["active"] = False
+                    entered.set()
+                    release.wait(timeout=5.0)
+                return False
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: MinimalAuthClient(),
+                ingest=True,
+            )
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_first_scan,
+            ):
+                await manager.start()
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                    # Begin stopping old runtime via unregister, then run concurrent POST and DELETE for "main".
+                    delete_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _delete_management_account,
+                            local_store,
+                            {"source": SOURCE_TELEGRAM, "account_id": "main"},
+                            manager,
+                        )
+                    )
+                    await asyncio.sleep(0.05)
+                    create_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _create_management_account,
+                            app_config,
+                            local_store,
+                            {
+                                "source": SOURCE_TELEGRAM,
+                                "account_id": "main",
+                                "display_name": "Main Recreated",
+                                "session_dir": str(self.config.session_dir),
+                            },
+                            manager,
+                        )
+                    )
+                    await asyncio.sleep(0.05)
+                    # Because mutations are serialized per (source, account_id), create cannot interleave mid-delete.
+                    self.assertFalse(delete_task.done())
+                    self.assertFalse(create_task.done())
+                    release.set()
+                    await asyncio.gather(delete_task, create_task)
+                    db_exists = local_store.get_management_account(SOURCE_TELEGRAM, "main") is not None
+                    runtime_exists = "main" in {s["account_id"] for s in manager.statuses()}
+                    self.assertEqual(db_exists, runtime_exists)
+                    self.assertTrue(db_exists)
+
+                    # Also verify POST followed concurrently by DELETE leaves neither DB record nor running runtime.
+                    c2 = asyncio.create_task(
+                        asyncio.to_thread(
+                            _create_management_account,
+                            app_config,
+                            local_store,
+                            {
+                                "source": SOURCE_TELEGRAM,
+                                "account_id": "main",
+                                "display_name": "Main Updated",
+                                "session_dir": str(self.config.session_dir),
+                            },
+                            manager,
+                        )
+                    )
+                    d2 = asyncio.create_task(
+                        asyncio.to_thread(
+                            _delete_management_account,
+                            local_store,
+                            {"source": SOURCE_TELEGRAM, "account_id": "main"},
+                            manager,
+                        )
+                    )
+                    await asyncio.gather(c2, d2)
+                    db_exists_2 = local_store.get_management_account(SOURCE_TELEGRAM, "main") is not None
+                    runtime_exists_2 = "main" in {s["account_id"] for s in manager.statuses()}
+                    self.assertEqual(db_exists_2, runtime_exists_2)
+                finally:
+                    release.set()
+                    await manager.stop()
+            local_store.close()
+
+    async def test_global_stop_rejects_concurrent_registration_and_waits_for_all_runtimes(self) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stop_rejects_register.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "Main", "user"))
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            created_clients: list[object] = []
+
+            class TrackedClient:
+                def __init__(self) -> None:
+                    self._connected = False
+                    created_clients.append(self)
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_me(self):
+                    return SimpleNamespace(id=1, first_name="Main", last_name=None, username="main")
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            def blocking_fs_scan(*args, **kwargs) -> bool:
+                if kwargs.get("deleted_accounts_only"):
+                    return False
+                entered.set()
+                release.wait(timeout=5.0)
+                return False
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: TrackedClient(),
+                ingest=True,
+            )
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_fs_scan,
+            ):
+                await manager.start()
+                self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                # Start unregistering old runtime so a concurrent _register_account suspends awaiting its stop task.
+                unreg_task = asyncio.create_task(manager._unregister_account("main"))
+                await asyncio.sleep(0.03)
+                suspended_reg = asyncio.create_task(manager._register_account(self.config))
+                await asyncio.sleep(0.03)
+                self.assertFalse(suspended_reg.done())
+
+                # Now start global stop() while old runtime is still stopping and suspended_reg is waiting.
+                stop_task = asyncio.create_task(manager.stop())
+                await asyncio.sleep(0.03)
+                # Direct registration during global stop is rejected immediately.
+                with self.assertRaises(RuntimeError):
+                    await asyncio.to_thread(manager.register_account, self.config)
+
+                release.set()
+                await asyncio.wait_for(stop_task, timeout=3.0)
+                await asyncio.gather(unreg_task, return_exceptions=True)
+                with self.assertRaises(RuntimeError):
+                    await suspended_reg
+
+            self.assertEqual(len(created_clients), 1)
+            self.assertEqual(manager.statuses(), [])
+            self.assertEqual(manager._runtimes, {})
+            self.assertEqual(manager._stopping_runtimes, {})
+            local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

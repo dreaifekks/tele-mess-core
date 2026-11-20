@@ -788,6 +788,7 @@ class TelegramRuntimeManager:
         self.logger = logging.getLogger(__name__)
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
+        self._stopping = False
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
         self._stopping_runtimes: dict[str, set[asyncio.Task[None]]] = {}
         self._media_cleanup_wakeup: asyncio.Event | None = None
@@ -798,6 +799,7 @@ class TelegramRuntimeManager:
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
+        self._stopping = False
         self._media_cleanup_stop.clear()
         self._media_cleanup_wakeup = asyncio.Event()
         configs = {item.account_id: item for item in self.config.telegram.accounts}
@@ -814,6 +816,7 @@ class TelegramRuntimeManager:
         )
 
     async def stop(self) -> None:
+        self._stopping = True
         self._media_cleanup_stop.set()
         wakeup = self._media_cleanup_wakeup
         if wakeup is not None:
@@ -832,13 +835,14 @@ class TelegramRuntimeManager:
                 await async_done.wait()
             if thread_done.is_set() and self._media_cleanup_inflight is inflight:
                 self._media_cleanup_inflight = None
-        for account_id, runtime in list(self._runtimes.items()):
-            if self._runtimes.get(account_id) is runtime:
-                del self._runtimes[account_id]
-                self._start_stop_runtime(account_id, runtime)
-        for tasks in list(self._stopping_runtimes.values()):
-            for stop_task in list(tasks):
-                await _await_shielded_task(stop_task)
+        while self._runtimes or self._stopping_runtimes:
+            for account_id, runtime in list(self._runtimes.items()):
+                if self._runtimes.get(account_id) is runtime:
+                    del self._runtimes[account_id]
+                    self._start_stop_runtime(account_id, runtime)
+            for tasks in list(self._stopping_runtimes.values()):
+                for stop_task in list(tasks):
+                    await _await_shielded_task(stop_task)
         self._media_cleanup_wakeup = None
         self._loop = None
         self._loop_thread_id = None
@@ -958,12 +962,16 @@ class TelegramRuntimeManager:
         future.add_done_callback(done)
 
     async def execute(self, account_id: str, operation: str, **kwargs: Any) -> dict[str, Any]:
+        if self._stopping:
+            raise RuntimeError("Telegram runtime manager is stopping")
         runtime = self._runtimes.get(account_id)
         if runtime is None:
             runtime = await self._register_account(resolve_account_config(self.config, self.store, account_id))
         return await runtime.execute(operation, **kwargs)
 
     def register_account(self, config: TelegramAccountConfig) -> dict[str, Any]:
+        if self._stopping:
+            raise RuntimeError("Telegram runtime manager is stopping")
         loop = self._require_loop()
         future = asyncio.run_coroutine_threadsafe(self._register_account(config), loop)
         runtime = self._wait_for_future(future)
@@ -1003,6 +1011,8 @@ class TelegramRuntimeManager:
 
     async def _register_account(self, config: TelegramAccountConfig) -> TelegramAccountRuntime:
         while True:
+            if self._stopping:
+                raise RuntimeError("Telegram runtime manager is stopping")
             existing = self._runtimes.get(config.account_id)
             if existing is not None:
                 return existing
@@ -1012,6 +1022,8 @@ class TelegramRuntimeManager:
                     await asyncio.shield(stop_task)
                 continue
             break
+        if self._stopping:
+            raise RuntimeError("Telegram runtime manager is stopping")
         runtime = TelegramAccountRuntime(
             config,
             self.config,
