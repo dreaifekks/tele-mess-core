@@ -15,7 +15,9 @@ validation rules.
   written to it.
 - Stopping the service requeues interrupted daily jobs and leaves their package
   and summary runs resumable instead of failing them. Only a package the job
-  planned itself is rebuilt; a requested package that is still running is not.
+  planned itself is rebuilt; a requested package that is still running is not. A
+  job that ends canceled while stopping drops its unsent delivery chunks and
+  closes its summary run instead of sending them on the next start.
 - Daily delivery accepts Telegram accounts that were added through the
   management API and exist only in SQLite.
 - Media responses send RFC 5987 filenames and only header-safe MIME types.

@@ -392,6 +392,38 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertIsNone(canceled["lease_until"])
         self.assertIsNotNone(canceled["finished_at"])
 
+    def test_cancel_and_stop_before_publish_leave_nothing_to_send(self) -> None:
+        delivery_config = AppConfig(
+            storage=self.config.storage,
+            telegram=self.config.telegram,
+            server=self.config.server,
+            logging=self.config.logging,
+            daily=DailyPackagingConfig(
+                output_dir=self.config.daily.output_dir,
+                ai=self.config.daily.ai,
+                delivery=DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001),
+            ),
+        )
+        worker = DailyJobWorker(self.store, delivery_config, worker_id="stopping")
+        job = worker.enqueue(run_date="2026-07-03", timezone_name="UTC", scope={"account_id": "main"})
+        publish = self.store.persist_daily_summary_batch
+
+        def cancel_and_stop_then_publish(*args: object, **kwargs: object) -> object:
+            self.store.request_daily_summary_job_cancel(job["job_id"])
+            worker._stop_event.set()
+            return publish(*args, **kwargs)
+
+        with patch.object(self.store, "persist_daily_summary_batch", side_effect=cancel_and_stop_then_publish):
+            canceled = worker.run_once()
+
+        assert canceled is not None
+        self.assertEqual(canceled["status"], "canceled")
+        outbox = self.store.list_delivery_outbox(summary_run_id=canceled["summary_run_id"])
+        self.assertEqual([item for item in outbox if item["status"] != "sent"], [])
+        summary = self.store.get_daily_summary_run(str(canceled["summary_run_id"]))
+        assert summary is not None
+        self.assertEqual(summary["status"], "canceled")
+
     def test_recovery_reuses_a_summary_completed_before_job_commit(self) -> None:
         first_worker = DailyJobWorker(self.store, self.config, worker_id="first")
         job = first_worker.enqueue(

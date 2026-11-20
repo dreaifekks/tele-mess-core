@@ -1981,6 +1981,7 @@ class ArchiveStore:
                     """,
                     (now, now, now),
                 )
+                self._close_canceled_job_runs(now)
                 row = self._conn.execute(
                     """
                     SELECT job_id
@@ -2065,8 +2066,37 @@ class ArchiveStore:
                 """,
                 (now, now, job_id, worker_id),
             )
+            requeued = cur.rowcount > 0
+            if requeued:
+                self._close_canceled_job_runs(now)
             self._conn.commit()
-            return cur.rowcount > 0
+            return requeued
+
+    def _close_canceled_job_runs(self, now: str) -> None:
+        """Drop the unsent chunks and close the running summary of jobs that ended canceled.
+
+        A cancel request already discards unsent chunks, but a worker stopped
+        while publishing can add new ones after it.
+        """
+        self._conn.execute(
+            """
+            DELETE FROM delivery_outbox
+            WHERE status != 'sent'
+              AND job_id IN (SELECT job_id FROM daily_summary_jobs WHERE status = 'canceled')
+            """
+        )
+        self._conn.execute(
+            """
+            UPDATE daily_summary_runs
+            SET status = 'canceled', progress_label = 'canceled', finished_at = COALESCE(finished_at, ?)
+            WHERE status = 'running'
+              AND run_id IN (
+                SELECT summary_run_id FROM daily_summary_jobs
+                WHERE status = 'canceled' AND summary_run_id IS NOT NULL
+              )
+            """,
+            (now,),
+        )
 
     def schedule_daily_summary_job_retry(
         self,
