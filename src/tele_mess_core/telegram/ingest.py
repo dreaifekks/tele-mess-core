@@ -6,7 +6,6 @@ import json
 import logging
 import os
 import shutil
-import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -253,6 +252,14 @@ class TelegramArchiveService:
 
     async def _media_worker_loop(self) -> None:
         try:
+            try:
+                self._cleanup_orphan_media_artifacts()
+            except Exception as exc:
+                self.logger.warning(
+                    "Failed to clean up orphan media artifacts for account=%s: %s",
+                    self.account_id,
+                    exc,
+                )
             while not self._closed:
                 self._media_wakeup.clear()
                 if self.client is None:
@@ -277,7 +284,18 @@ class TelegramArchiveService:
                     await self._wait_media_wakeup(1.0)
                     continue
                 if job is not None:
-                    await self._execute_media_download_job(job)
+                    try:
+                        await self._execute_media_download_job(job)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception as exc:
+                        self.logger.warning(
+                            "Media download job %s failed during state persistence for account=%s: %s",
+                            job.get("job_id"),
+                            self.account_id,
+                            exc,
+                        )
+                        await self._wait_media_wakeup(1.0)
                     continue
                 try:
                     next_due = self.store.next_media_download_due_at(
@@ -305,6 +323,56 @@ class TelegramArchiveService:
             if self._media_worker_task is asyncio.current_task():
                 self._media_worker_task = None
 
+    def _cleanup_orphan_media_artifacts(self) -> None:
+        """Remove stale job staging directories and uncommitted pending publish files after crashes."""
+        account_media_dir = self.store.database_path.parent / "media" / self.account_id
+        stale_seconds = max(0.0, float(self.media_download.stale_seconds))
+        stale_before = (
+            datetime.now(dt_timezone.utc) - timedelta(seconds=stale_seconds)
+        ).isoformat()
+        if account_media_dir.exists():
+            for chat_dir in account_media_dir.iterdir():
+                if not chat_dir.is_dir():
+                    continue
+                for entry in chat_dir.iterdir():
+                    if not entry.is_dir() or not entry.name.startswith(".part-"):
+                        continue
+                    parsed = _parse_staging_dir_name(entry.name)
+                    if parsed is None:
+                        continue
+                    job_id, token = parsed
+                    job = self.store.get_media_download_job(job_id)
+                    if job is None:
+                        shutil.rmtree(entry, ignore_errors=True)
+                        continue
+                    status = str(job.get("status") or "")
+                    current_token = int(job.get("claim_token") or 0)
+                    updated_at = str(job.get("updated_at") or "")
+                    if status != "downloading" or current_token > token or updated_at <= stale_before:
+                        shutil.rmtree(entry, ignore_errors=True)
+        for pending in self.store.list_media_jobs_with_pending_paths(
+            account_id=self.account_id,
+            source=SOURCE_TELEGRAM,
+            stale_seconds=stale_seconds,
+        ):
+            self.store.cleanup_media_download_pending_path(
+                str(pending["job_id"]),
+                expected_claim_token=int(pending["claim_token"]),
+                require_downloading=False,
+                stale_seconds=stale_seconds,
+            )
+
+    def _cleanup_prior_job_staging_dirs(self, target_dir: Path, job_id: str, current_token: int) -> None:
+        if not target_dir.exists():
+            return
+        prefix = f".part-{job_id}-t"
+        for entry in target_dir.iterdir():
+            if not entry.is_dir() or not entry.name.startswith(prefix):
+                continue
+            parsed = _parse_staging_dir_name(entry.name)
+            if parsed is not None and parsed[0] == job_id and parsed[1] < current_token:
+                shutil.rmtree(entry, ignore_errors=True)
+
     async def _wait_media_wakeup(self, timeout: float) -> None:
         if timeout <= 0:
             return
@@ -315,6 +383,7 @@ class TelegramArchiveService:
 
     async def process_pending_media_downloads(self, *, max_jobs: int | None = None) -> int:
         """Deterministically drain currently due media download jobs for this account."""
+        self._cleanup_orphan_media_artifacts()
         processed = 0
         while max_jobs is None or processed < max_jobs:
             job = self.store.claim_media_download_job(
@@ -521,6 +590,8 @@ class TelegramArchiveService:
                     "media_kind": record.media_kind,
                     "is_sticker_like": is_sticker_like,
                     "max_attempts": self.media_download.effective_max_attempts(),
+                    "replace_existing": event_type == "edit",
+                    "target_edited_at": record.edited_at,
                 }
 
             result = self.store.upsert_message_if_policy_enabled(
@@ -557,13 +628,15 @@ class TelegramArchiveService:
         message_id = int(job["message_id"])
         topic_id = int(job.get("topic_id") or 0)
         is_sticker_like = bool(job.get("is_sticker_like", False))
+        replace_existing = bool(job.get("replace_existing", False))
         effective_is_sticker = is_sticker_like
         media_kind = job.get("media_kind")
+        target_dir = self.store.database_path.parent / "media" / self.account_id / str(chat_id)
         attempt_dir: Path | None = None
         heartbeat_task: asyncio.Task[None] | None = None
 
         async def _heartbeat_loop() -> None:
-            interval = max(0.05, float(self.media_download.stale_seconds) / 3.0)
+            interval = max(0.05, min(float(self.media_download.stale_seconds) / 3.0, 30.0))
             while True:
                 await asyncio.sleep(interval)
                 try:
@@ -577,14 +650,28 @@ class TelegramArchiveService:
                     return
 
         try:
-            existing_media = self.store.list_media_files(
-                account_id=self.account_id,
-                chat_id=chat_id,
-                message_id=message_id,
+            # Start lease heartbeat immediately upon claim so slow get_messages() RPCs never expire the lease.
+            heartbeat_task = asyncio.create_task(
+                _heartbeat_loop(),
+                name=f"media-download-heartbeat-{job_id}",
             )
-            if existing_media:
-                self.store.complete_media_download_job(job_id, expected_claim_token=claim_token)
-                return
+            self._cleanup_prior_job_staging_dirs(target_dir, job_id, claim_token)
+            if job.get("pending_file_path"):
+                self.store.cleanup_media_download_pending_path(
+                    job_id,
+                    expected_claim_token=claim_token,
+                    require_downloading=True,
+                )
+
+            if not replace_existing:
+                existing_media = self.store.list_media_files(
+                    account_id=self.account_id,
+                    chat_id=chat_id,
+                    message_id=message_id,
+                )
+                if existing_media:
+                    self.store.complete_media_download_job(job_id, expected_claim_token=claim_token)
+                    return
 
             stored_message = self.store.get_message(SOURCE_TELEGRAM, self.account_id, chat_id, message_id)
             if stored_message is None or stored_message.get("deleted_at") is not None:
@@ -665,15 +752,12 @@ class TelegramArchiveService:
                 if getattr(refreshed_msg, "media", None) is not None
                 else media_kind
             )
-            target_dir = self.store.database_path.parent / "media" / self.account_id / str(chat_id)
             target_dir.mkdir(parents=True, exist_ok=True)
-            attempt_dir = target_dir / f".part-{uuid.uuid4().hex}"
+            attempt_dir = target_dir / f".part-{job_id}-t{claim_token}"
+            if attempt_dir.exists():
+                shutil.rmtree(attempt_dir, ignore_errors=True)
             attempt_dir.mkdir(parents=True, exist_ok=True)
 
-            heartbeat_task = asyncio.create_task(
-                _heartbeat_loop(),
-                name=f"media-download-heartbeat-{job_id}",
-            )
             downloaded = await refreshed_msg.download_media(file=str(attempt_dir))
             if not downloaded:
                 raise _MediaDownloadResultError(
@@ -687,21 +771,28 @@ class TelegramArchiveService:
                     "download_media file path does not exist",
                 )
 
+            planned_final_path = _unique_media_target_path(target_dir, staged_path.name, message_id)
+            if not self.store.record_media_download_pending_path(
+                job_id,
+                expected_claim_token=claim_token,
+                pending_file_path=str(planned_final_path),
+            ):
+                return
+
             def _prepare_media() -> MediaFileRecord:
                 file_size = staged_path.stat().st_size
-                final_path = _unique_media_target_path(target_dir, staged_path.name, message_id)
                 media_record = MediaFileRecord(
                     source=SOURCE_TELEGRAM,
                     account_id=self.account_id,
                     chat_id=chat_id,
                     message_id=message_id,
-                    file_path=str(final_path),
+                    file_path=str(planned_final_path),
                     media_kind=refreshed_media_kind,
                     file_size=file_size,
                     downloaded_at=utc_now_iso(),
-                    raw_json=json.dumps({"downloaded": str(final_path)}, ensure_ascii=False),
+                    raw_json=json.dumps({"downloaded": str(planned_final_path)}, ensure_ascii=False),
                 )
-                os.replace(staged_path, final_path)
+                os.replace(staged_path, planned_final_path)
                 return media_record
 
             def _rollback_media(media_record: MediaFileRecord) -> None:
@@ -1292,6 +1383,16 @@ def _coerce_messages(value: Any) -> list[Any]:
         return [item for item in value if item is not None]
     except TypeError:
         return [value]
+
+
+def _parse_staging_dir_name(name: str) -> tuple[str, int] | None:
+    if not name.startswith(".part-"):
+        return None
+    body = name[len(".part-") :]
+    job_id, sep, token_str = body.rpartition("-t")
+    if not sep or not job_id or not token_str.isdigit():
+        return None
+    return job_id, int(token_str)
 
 
 def _seconds_until_iso(iso_timestamp: str) -> float:

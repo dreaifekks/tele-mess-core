@@ -13,7 +13,8 @@ telegram:
     # Restart catch-up page size, not a total cap; <= 0 uses a safe 1000-message page.
     catch_up_limit: 1000
   media_download:
-    retries: 2
+    # Default is max_attempts: 8 with exponential backoff; legacy `retries` overrides it as retries + 1.
+    max_attempts: 8
     retry_delay_seconds: 1.0
   accounts:
     - account_id: "main"

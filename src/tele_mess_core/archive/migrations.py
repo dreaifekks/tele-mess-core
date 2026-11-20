@@ -484,6 +484,9 @@ def _migration_21(connection: sqlite3.Connection) -> None:
           topic_id INTEGER NOT NULL DEFAULT 0,
           media_kind TEXT,
           is_sticker_like INTEGER NOT NULL DEFAULT 0,
+          replace_existing INTEGER NOT NULL DEFAULT 0,
+          target_edited_at TEXT,
+          pending_file_path TEXT,
           status TEXT NOT NULL DEFAULT 'pending',
           attempts INTEGER NOT NULL DEFAULT 0,
           max_attempts INTEGER NOT NULL DEFAULT 8,
@@ -521,6 +524,7 @@ def _migration_21(connection: sqlite3.Connection) -> None:
           OR NEW.max_attempts <= 0
           OR NEW.claim_token < 0
           OR NEW.is_sticker_like NOT IN (0, 1)
+          OR NEW.replace_existing NOT IN (0, 1)
         BEGIN
           SELECT RAISE(ABORT, 'invalid media download job state');
         END
@@ -535,6 +539,7 @@ def _migration_21(connection: sqlite3.Connection) -> None:
           OR NEW.max_attempts <= 0
           OR NEW.claim_token < 0
           OR NEW.is_sticker_like NOT IN (0, 1)
+          OR NEW.replace_existing NOT IN (0, 1)
         BEGIN
           SELECT RAISE(ABORT, 'invalid media download job state');
         END

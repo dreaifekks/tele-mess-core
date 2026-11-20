@@ -1816,6 +1816,260 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(client.refresh_calls, [])
         self.assertEqual(self.store.state()["media_download_pending"], 0)
 
+    async def test_media_worker_survives_sqlite_lock_on_retry_write_and_recovers_after_unlock(self) -> None:
+        import sqlite3
+        from unittest import mock
+
+        chat_id = -1092
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=Path(self.tmp.name),
+            ),
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0, stale_seconds=0.15),
+        )
+        msg1 = FakeMessage(201, chat_id, media=MessageMediaDocument(), fail_download_times=1)
+        msg2 = FakeMessage(202, chat_id, media=MessageMediaDocument())
+
+        class LiveClient(FakeMediaClient):
+            def on(self, event_builder: object):
+                return lambda fn: fn
+
+            async def is_user_authorized(self) -> bool:
+                return True
+
+            def is_connected(self) -> bool:
+                return True
+
+            def iter_messages(self, cid: int, **kwargs):
+                return FakeBackfillIterator(messages=[])
+
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                if ids is not None:
+                    return await super().get_messages(cid, ids=ids, **kwargs)
+                return []
+
+        client = LiveClient(msg1, msg2)
+        orig_retry = self.store.retry_media_download_job
+        lock_once = {"raised": False}
+
+        def flaky_retry(*args, **kwargs):
+            if not lock_once["raised"]:
+                lock_once["raised"] = True
+                raise sqlite3.OperationalError("database is locked")
+            return orig_retry(*args, **kwargs)
+
+        try:
+            with mock.patch.object(self.store, "retry_media_download_job", side_effect=flaky_retry):
+                await service.activate(client)
+                self.assertTrue(await service._store_message(msg1, event_type="new"))
+                # Wait until the simulated SQLite lock error fires inside the worker.
+                deadline = asyncio.get_running_loop().time() + 3.0
+                while not lock_once["raised"] and asyncio.get_running_loop().time() < deadline:
+                    await asyncio.sleep(0.02)
+                self.assertTrue(lock_once["raised"])
+                # Worker task must still be alive; enqueue msg2 and wake worker.
+                self.assertIsNotNone(service._media_worker_task)
+                assert service._media_worker_task is not None
+                self.assertFalse(service._media_worker_task.done())
+                self.assertTrue(await service._store_message(msg2, event_type="new"))
+
+                # Wait for both msg2 (new) and msg1 (stale lease reclaim after 0.15s) to complete.
+                deadline = asyncio.get_running_loop().time() + 4.0
+                while asyncio.get_running_loop().time() < deadline:
+                    files = self.store.list_media_files(account_id="main", chat_id=chat_id)
+                    if {item["message_id"] for item in files} == {201, 202}:
+                        break
+                    await asyncio.sleep(0.05)
+                files = self.store.list_media_files(account_id="main", chat_id=chat_id)
+                self.assertEqual({item["message_id"] for item in files}, {201, 202})
+        finally:
+            await service.stop()
+
+    async def test_edited_message_replaces_existing_media_and_removes_superseded_file(self) -> None:
+        chat_id = -1091
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+
+        class VersionedMediaMessage(FakeMessage):
+            def __init__(self, *args, filename: str, payload: bytes, **kwargs):
+                super().__init__(*args, **kwargs)
+                self._filename = filename
+                self._payload = payload
+
+            async def download_media(self, file: str) -> str:
+                self.download_attempts += 1
+                path = Path(file) / self._filename
+                path.write_bytes(self._payload)
+                return str(path)
+
+        v1 = VersionedMediaMessage(
+            210,
+            chat_id,
+            text="original",
+            media=MessageMediaDocument(),
+            filename="photo.bin",
+            payload=b"old-v1",
+        )
+        client = FakeMediaClient(v1)
+        self.service.client = client
+
+        self.assertTrue(await self.service._store_message(v1, event_type="new"))
+        await self.service.process_pending_media_downloads()
+        files_v1 = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=210)
+        self.assertEqual(len(files_v1), 1)
+        old_path = Path(files_v1[0]["file_path"])
+        self.assertEqual(old_path.read_bytes(), b"old-v1")
+
+        # Edit message with a replacement attachment and newer edit_date.
+        v2 = VersionedMediaMessage(
+            210,
+            chat_id,
+            text="edited caption",
+            media=MessageMediaDocument(),
+            filename="photo.bin",
+            payload=b"replaced-v2-bytes",
+        )
+        v2.edit_date = datetime(2026, 4, 2, 12, 0, tzinfo=timezone.utc)
+        client.add(v2)
+        self.assertTrue(await self.service._store_message(v2, event_type="edit"))
+        await self.service.process_pending_media_downloads()
+
+        self.assertEqual(v2.download_attempts, 1)
+        files_v2 = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=210)
+        self.assertEqual(len(files_v2), 1)
+        new_path = Path(files_v2[0]["file_path"])
+        self.assertEqual(new_path.read_bytes(), b"replaced-v2-bytes")
+        self.assertEqual(files_v2[0]["file_size"], len(b"replaced-v2-bytes"))
+        if new_path != old_path:
+            self.assertFalse(old_path.exists())
+
+    async def test_crash_recovery_cleans_up_leftover_part_dir_and_uncommitted_published_file(self) -> None:
+        chat_id = -1090
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        target_dir.mkdir(parents=True, exist_ok=True)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        msg = FakeMessage(220, chat_id, media=MessageMediaDocument())
+        self.service.client = FakeMediaClient(msg)
+
+        self.assertTrue(await self.service._store_message(msg, event_type="new"))
+        claimed = self.store.claim_media_download_job("main")
+        assert claimed is not None
+        job_id = claimed["job_id"]
+
+        # Simulate crash leaving both a job-scoped staging dir AND an uncommitted os.replace target file.
+        stale_part_dir = target_dir / f".part-{job_id}-t1"
+        stale_part_dir.mkdir(parents=True, exist_ok=True)
+        (stale_part_dir / "half.bin").write_bytes(b"half")
+        orphan_published = target_dir / f"{msg.id}.bin"
+        orphan_published.write_bytes(b"uncommitted-crash-file")
+        self.assertTrue(
+            self.store.record_media_download_pending_path(
+                job_id,
+                expected_claim_token=1,
+                pending_file_path=str(orphan_published),
+            )
+        )
+        # Backdate lease to simulate restart after crash.
+        self.store._conn.execute(
+            "UPDATE media_download_jobs SET updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+            (job_id,),
+        )
+        self.store._conn.commit()
+
+        await self.service.process_pending_media_downloads()
+
+        self.assertFalse(stale_part_dir.exists())
+        files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=220)
+        self.assertEqual(len(files), 1)
+        self.assertEqual(Path(files[0]["file_path"]), orphan_published)
+        self.assertEqual(orphan_published.read_bytes(), b"media")
+        # Exactly one indexed file remains on disk — zero leftover .part dirs or duplicate filenames.
+        self.assertEqual(list(target_dir.iterdir()), [orphan_published])
+
+    async def test_media_worker_heartbeats_during_slow_get_messages_preventing_stale_expiry(self) -> None:
+        chat_id = -1089
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=Path(self.tmp.name),
+            ),
+            self.store,
+            media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0, stale_seconds=0.3),
+        )
+        msg = FakeMessage(230, chat_id, media=MessageMediaDocument())
+        entered_rpc = asyncio.Event()
+
+        class SlowRefreshClient(FakeMediaClient):
+            async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                if ids is not None:
+                    entered_rpc.set()
+                    await asyncio.sleep(0.55)
+                return await super().get_messages(cid, ids=ids, **kwargs)
+
+        service.client = SlowRefreshClient(msg)
+        self.assertTrue(await service._store_message(msg, event_type="new"))
+
+        second_store = ArchiveStore(self.store.database_path)
+        second_store.initialize()
+        try:
+            drain_task = asyncio.create_task(service.process_pending_media_downloads())
+            await asyncio.wait_for(entered_rpc.wait(), timeout=1.0)
+            # Wait longer than stale_seconds while get_messages() is still running.
+            await asyncio.sleep(0.42)
+            # Second connection must NOT consider the active claim stale or transition it to failed.
+            self.assertIsNone(second_store.claim_media_download_job("main", stale_seconds=0.3))
+            jobs_mid = second_store.list_media_download_jobs(account_id="main")
+            self.assertEqual(jobs_mid[0]["status"], "downloading")
+
+            await asyncio.wait_for(drain_task, timeout=2.0)
+            files = self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=230)
+            self.assertEqual(len(files), 1)
+            self.assertEqual(self.store.state()["media_download_failed"], 0)
+        finally:
+            second_store.close()
+
+    async def test_media_completion_emits_incremental_sync_event_for_after_cursor(self) -> None:
+        chat_id = -1088
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        msg = FakeMessage(240, chat_id, text="async photo", media=MessageMediaDocument())
+        self.service.client = FakeMediaClient(msg)
+
+        self.assertTrue(await self.service._store_message(msg, event_type="new"))
+        first_page = self.store.list_messages_after(after_event_seq=0)
+        self.assertEqual(len(first_page["items"]), 1)
+        cursor_before_download = first_page["next_cursor"]
+        self.assertEqual(self.store.state()["last_event_seq"], cursor_before_download)
+
+        await self.service.process_pending_media_downloads()
+
+        self.assertGreater(self.store.state()["last_event_seq"], cursor_before_download)
+        next_page = self.store.list_messages_after(after_event_seq=cursor_before_download)
+        self.assertEqual(len(next_page["items"]), 1)
+        self.assertEqual(next_page["items"][0]["message_id"], 240)
+        events = self.store.list_events(after=cursor_before_download)["items"]
+        self.assertEqual(events[0]["event_type"], "media_ready")
+        media_map = self.store.list_media_files_for_messages(next_page["items"])
+        self.assertEqual(len(media_map[(SOURCE_TELEGRAM, "main", chat_id, 240)]), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
