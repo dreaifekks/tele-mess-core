@@ -265,7 +265,7 @@ class DailyJobWorkerTest(unittest.TestCase):
         self.assertEqual(completed["status"], "completed")
         self.assertEqual(completed["attempt"], 2)
 
-    def test_worker_interruption_requeues_and_reuses_planned_package_id(self) -> None:
+    def test_job_requeued_before_its_package_exists_builds_under_a_new_id(self) -> None:
         worker = DailyJobWorker(self.store, self.config, worker_id="stopping")
         job = worker.enqueue(
             run_date="2026-07-03",
@@ -295,9 +295,10 @@ class DailyJobWorkerTest(unittest.TestCase):
 
         assert completed is not None
         self.assertEqual(completed["status"], "completed")
-        self.assertEqual(completed["package_run_id"], planned_package_id)
+        self.assertNotEqual(completed["package_run_id"], planned_package_id)
+        self.assertIsNone(self.store.get_daily_package_run(planned_package_id))
 
-    def test_expired_running_package_is_rebuilt_with_same_run_id(self) -> None:
+    def test_lease_takeover_does_not_rebuild_a_package_still_being_built(self) -> None:
         old_worker = DailyJobWorker(self.store, self.config, worker_id="old")
         job = old_worker.enqueue(
             run_date="2026-07-03",
@@ -336,11 +337,10 @@ class DailyJobWorkerTest(unittest.TestCase):
         ).run_once()
 
         assert recovered is not None
-        self.assertEqual(recovered["status"], "completed")
-        self.assertEqual(recovered["package_run_id"], package_run_id)
-        rebuilt = self.store.get_daily_package_run(package_run_id)
-        assert rebuilt is not None
-        self.assertEqual(rebuilt["status"], "completed")
+        self.assertEqual(recovered["status"], "failed")
+        package = self.store.get_daily_package_run(package_run_id)
+        assert package is not None
+        self.assertEqual(package["status"], "running")
 
     def test_requested_package_that_is_still_running_is_not_rebuilt(self) -> None:
         package_run_id = "pkg_other_job_running"

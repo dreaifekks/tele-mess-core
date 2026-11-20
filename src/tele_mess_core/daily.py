@@ -488,8 +488,6 @@ def build_daily_package(
                 totals=totals,
             )
         )
-    except DailyJobInterrupted:
-        raise
     except DailyJobCancelled as exc:
         error = str(exc) or "canceled"
         return store.upsert_daily_package_run(

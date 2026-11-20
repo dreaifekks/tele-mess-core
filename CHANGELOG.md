@@ -13,11 +13,12 @@ validation rules.
 - Full-text search treats invalid FTS syntax as literal text.
 - An archive from a newer schema version is rejected before anything is
   written to it.
-- Stopping the service requeues interrupted daily jobs and leaves their package
-  and summary runs resumable instead of failing them. Only a package the job
-  planned itself is rebuilt; a requested package that is still running is not. A
-  job that ends canceled while stopping drops its unsent delivery chunks and
-  closes its summary run instead of sending them on the next start.
+- Stopping the service while a daily summary runs requeues the job and leaves
+  its summary run resumable instead of failing it. A job stopped while its
+  package is being built still fails, and a package that is still running is
+  never rebuilt by another job. A job that ends canceled while stopping drops
+  its unsent delivery chunks and closes its summary run instead of sending them
+  on the next start.
 - Daily delivery accepts Telegram accounts that were added through the
   management API and exist only in SQLite.
 - Media responses send RFC 5987 filenames and only header-safe MIME types.

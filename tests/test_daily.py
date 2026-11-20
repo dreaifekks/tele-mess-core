@@ -76,7 +76,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.store.close()
         self.tmp.cleanup()
 
-    def test_worker_interruption_does_not_fail_package_run(self) -> None:
+    def test_worker_interruption_fails_the_package_run(self) -> None:
         checks = 0
 
         def interrupt_after_start() -> None:
@@ -86,21 +86,19 @@ class DailyPackagingTest(unittest.TestCase):
                 raise DailyJobInterrupted("worker stopping")
 
         run_id = "pkg_interrupted"
-        with self.assertRaises(DailyJobInterrupted):
-            build_daily_package(
-                self.store,
-                self.config,
-                run_date="2026-07-03",
-                timezone_name="UTC",
-                run_id=run_id,
-                cancel_check=interrupt_after_start,
-            )
+        build_daily_package(
+            self.store,
+            self.config,
+            run_date="2026-07-03",
+            timezone_name="UTC",
+            run_id=run_id,
+            cancel_check=interrupt_after_start,
+        )
 
         package = self.store.get_daily_package_run(run_id)
         assert package is not None
-        self.assertEqual(package["status"], "running")
-        self.assertIsNone(package["error"])
-        self.assertIsNone(package["finished_at"])
+        self.assertEqual(package["status"], "failed")
+        self.assertIsNotNone(package["finished_at"])
 
     def test_worker_interruption_does_not_fail_summary_run(self) -> None:
         package = build_daily_package(
