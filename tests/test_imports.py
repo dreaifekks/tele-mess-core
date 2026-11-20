@@ -50,3 +50,27 @@ class OptionalTelethonImportTest(unittest.TestCase):
 
         self.assertNotEqual(result.returncode, 0)
         self.assertRegex(result.stderr, r"discovery\.py\", line \d+, in <module>\n\s+from telethon import functions")
+
+class TelegramPackageExportTest(unittest.TestCase):
+    def test_package_lists_its_exports_before_they_are_loaded(self) -> None:
+        result = _run_without_telethon(
+            "import tele_mess_core.telegram as telegram\n"
+            "sys.exit(sorted(set(telegram.__all__) - set(dir(telegram))) != [])\n"
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_package_exports_stay_importable(self) -> None:
+        from tele_mess_core.telegram import (
+            TelegramArchiveService,
+            TelegramAuthService,
+            TelegramDiscoveryService,
+            TelegramRuntimeManager,
+        )
+        from tele_mess_core.telegram.auth import TelegramAuthService as auth_service
+
+        self.assertIs(TelegramAuthService, auth_service)
+        self.assertEqual(
+            {TelegramArchiveService.__name__, TelegramDiscoveryService.__name__, TelegramRuntimeManager.__name__},
+            {"TelegramArchiveService", "TelegramDiscoveryService", "TelegramRuntimeManager"},
+        )

@@ -42,7 +42,8 @@ validation rules.
   participant refresh requests for a source other than `telegram` are rejected
   instead of reaching the Telegram account with the same ID.
 - Importing the HTTP API, MCP endpoint, daily worker, or CLI no longer loads
-  Telethon; only the Telegram runtime and services do. A missing Telethon in
+  Telethon; only the Telegram runtime and services do. The services stay
+  importable from `tele_mess_core.telegram` and load on first access. A missing Telethon in
   origin discovery now raises instead of being reported as a partial topic
   discovery result.
 - HTTP GET endpoints read query parameters and their defaults from the API
