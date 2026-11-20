@@ -115,9 +115,12 @@ class TelegramAccountRuntime:
             except Exception:
                 self.logger.exception("Failed to disconnect Telegram account %s", self.config.account_id)
         task = self._supervisor_task
-        if task is not None and not task.done():
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+        if task is not None:
+            if not task.done():
+                task.cancel()
+            await _await_shielded_task(task)
+            if self._supervisor_task is task and task.done():
+                self._supervisor_task = None
         self.client = None
         self._ready.clear()
         with self._diagnostic_lock:
@@ -786,7 +789,7 @@ class TelegramRuntimeManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
-        self._stopping_runtimes: set[TelegramAccountRuntime] = set()
+        self._stopping_runtimes: dict[str, set[asyncio.Task[None]]] = {}
         self._media_cleanup_wakeup: asyncio.Event | None = None
         self._media_cleanup_task: asyncio.Task[None] | None = None
         self._media_cleanup_stop = threading.Event()
@@ -830,12 +833,12 @@ class TelegramRuntimeManager:
             if thread_done.is_set() and self._media_cleanup_inflight is inflight:
                 self._media_cleanup_inflight = None
         for account_id, runtime in list(self._runtimes.items()):
-            self._stopping_runtimes.add(runtime)
             if self._runtimes.get(account_id) is runtime:
                 del self._runtimes[account_id]
-        for runtime in list(self._stopping_runtimes):
-            await runtime.stop()
-            self._stopping_runtimes.discard(runtime)
+                self._start_stop_runtime(account_id, runtime)
+        for tasks in list(self._stopping_runtimes.values()):
+            for stop_task in list(tasks):
+                await _await_shielded_task(stop_task)
         self._media_cleanup_wakeup = None
         self._loop = None
         self._loop_thread_id = None
@@ -979,10 +982,36 @@ class TelegramRuntimeManager:
         if runtime is not None:
             runtime._next_auth_state_epoch()
 
+    def _start_stop_runtime(
+        self,
+        account_id: str,
+        runtime: TelegramAccountRuntime,
+    ) -> asyncio.Task[None]:
+        async def _run_stop() -> None:
+            try:
+                await runtime.stop()
+            finally:
+                tasks = self._stopping_runtimes.get(account_id)
+                if tasks is not None:
+                    tasks.discard(stop_task)
+                    if not tasks:
+                        self._stopping_runtimes.pop(account_id, None)
+
+        stop_task = asyncio.create_task(_run_stop(), name=f"telegram-stop-{account_id}")
+        self._stopping_runtimes.setdefault(account_id, set()).add(stop_task)
+        return stop_task
+
     async def _register_account(self, config: TelegramAccountConfig) -> TelegramAccountRuntime:
-        existing = self._runtimes.get(config.account_id)
-        if existing is not None:
-            return existing
+        while True:
+            existing = self._runtimes.get(config.account_id)
+            if existing is not None:
+                return existing
+            stopping = list(self._stopping_runtimes.get(config.account_id) or ())
+            if stopping:
+                for stop_task in stopping:
+                    await asyncio.shield(stop_task)
+                continue
+            break
         runtime = TelegramAccountRuntime(
             config,
             self.config,
@@ -999,11 +1028,13 @@ class TelegramRuntimeManager:
 
     async def _unregister_account(self, account_id: str) -> dict[str, Any]:
         runtime = self._runtimes.pop(account_id, None)
-        if runtime is None:
+        if runtime is not None:
+            self._start_stop_runtime(account_id, runtime)
+        tasks = list(self._stopping_runtimes.get(account_id) or ())
+        if not tasks:
             return {"account_id": account_id, "stopped": False}
-        self._stopping_runtimes.add(runtime)
-        await runtime.stop()
-        self._stopping_runtimes.discard(runtime)
+        for stop_task in tasks:
+            await asyncio.shield(stop_task)
         return {"account_id": account_id, "stopped": True}
 
     def _require_loop(self) -> asyncio.AbstractEventLoop:

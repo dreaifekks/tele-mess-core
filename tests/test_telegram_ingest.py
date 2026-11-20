@@ -3568,6 +3568,135 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             local_store.close()
             self.assertEqual(thread_errors, [])
 
+    async def test_delete_management_account_retry_after_unregister_timeout_waits_for_old_runtime_to_stop(
+        self,
+    ) -> None:
+        import threading
+        from unittest import mock
+
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountRecord
+        from tele_mess_core.server.api import _delete_management_account
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "unregister_retry.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "Main", "user"))
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(
+                    accounts=[self.config],
+                    media_download=MediaDownloadConfig(max_attempts=3, retry_delay_seconds=0.05, stale_seconds=60.0),
+                ),
+            )
+            entered = threading.Event()
+            release = threading.Event()
+            thread_exited = threading.Event()
+
+            class AuthorizedFakeClient:
+                def __init__(self) -> None:
+                    self._connected = False
+                    self.disconnected = False
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+                    self.disconnected = True
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_me(self):
+                    return SimpleNamespace(id=1, first_name="Main", last_name=None, username="main")
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            client = AuthorizedFakeClient()
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda _cfg: client,
+                call_timeout=0.12,
+                ingest=True,
+            )
+
+            def blocking_fs_scan(*args, **kwargs) -> bool:
+                if kwargs.get("deleted_accounts_only"):
+                    return False
+                entered.set()
+                release.wait(timeout=5.0)
+                thread_exited.set()
+                return False
+
+            with mock.patch.object(
+                local_store,
+                "cleanup_orphan_media_staging_dirs",
+                side_effect=blocking_fs_scan,
+            ):
+                await manager.start()
+                try:
+                    self.assertTrue(await asyncio.to_thread(entered.wait, 2.0))
+                    # First delete call times out while unregister_account waits for the paused cleanup thread.
+                    with self.assertRaises(TimeoutError):
+                        await asyncio.to_thread(
+                            _delete_management_account,
+                            local_store,
+                            {"source": SOURCE_TELEGRAM, "account_id": "main"},
+                            manager,
+                        )
+                    self.assertIsNotNone(local_store.get_management_account(SOURCE_TELEGRAM, "main"))
+                    self.assertFalse(client.disconnected)
+                    self.assertFalse(thread_exited.is_set())
+
+                    # Retry delete with a normal timeout: MUST block until the old runtime finishes stopping.
+                    manager.call_timeout = 5.0
+                    retry_task = asyncio.create_task(
+                        asyncio.to_thread(
+                            _delete_management_account,
+                            local_store,
+                            {"source": SOURCE_TELEGRAM, "account_id": "main"},
+                            manager,
+                        )
+                    )
+                    await asyncio.sleep(0.08)
+                    self.assertFalse(retry_task.done())
+                    self.assertIsNotNone(local_store.get_management_account(SOURCE_TELEGRAM, "main"))
+                    self.assertFalse(client.disconnected)
+
+                    # Release the paused cleanup thread; old runtime stops cleanly and retry commits deletion.
+                    release.set()
+                    result = await asyncio.wait_for(retry_task, timeout=3.0)
+                    self.assertEqual(result["account_id"], "main")
+                    self.assertTrue(thread_exited.is_set())
+                    self.assertTrue(client.disconnected)
+                    self.assertIsNone(local_store.get_management_account(SOURCE_TELEGRAM, "main"))
+                finally:
+                    release.set()
+                    await manager.stop()
+            local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
