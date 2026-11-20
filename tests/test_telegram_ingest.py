@@ -1441,6 +1441,61 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(attempts, [1])
         self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=96), [])
 
+    async def test_failed_and_policy_rejected_media_downloads_leave_no_partial_or_published_files(self) -> None:
+        chat_id = -1097
+        target_dir = self.store.database_path.parent / "media" / "main" / str(chat_id)
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        service = TelegramArchiveService(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=Path(self.tmp.name),
+            ),
+            self.store,
+            media_download=MediaDownloadConfig(retries=2, retry_delay_seconds=0),
+        )
+
+        # 1) Partial write before failure leaves zero files or staging directories behind.
+        class PartialFailMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                partial = Path(file) / "partial.bin"
+                partial.write_bytes(b"half-written")
+                self.store_ref.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=False)
+                )
+                raise RuntimeError("interrupted mid-transfer")
+
+        msg1 = PartialFailMessage(97, chat_id, text="partial fail", media=MessageMediaDocument())
+        msg1.store_ref = self.store
+        self.assertTrue(await service._store_message(msg1, event_type="new"))
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=97), [])
+        self.assertEqual(list(target_dir.iterdir()), [])
+
+        # 2) Policy disabled concurrently right before atomic publish leaves zero files and zero media rows.
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+
+        class DisableBeforePublishMessage(FakeMessage):
+            async def download_media(self, file: str) -> str:
+                staged = Path(file) / "finished.bin"
+                staged.write_bytes(b"complete-bytes")
+                self.store_ref.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=False)
+                )
+                return str(staged)
+
+        msg2 = DisableBeforePublishMessage(98, chat_id, text="disabled before publish", media=MessageMediaDocument())
+        msg2.store_ref = self.store
+        self.assertTrue(await service._store_message(msg2, event_type="new"))
+        self.assertEqual(self.store.list_media_files(account_id="main", chat_id=chat_id, message_id=98), [])
+        self.assertEqual(list(target_dir.iterdir()), [])
+        self.assertFalse(self.store._conn.in_transaction)
+
 
 if __name__ == "__main__":
     unittest.main()

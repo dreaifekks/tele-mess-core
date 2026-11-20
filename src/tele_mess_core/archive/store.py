@@ -1640,39 +1640,84 @@ class ArchiveStore:
                 raise
 
 
-    def upsert_media_file(self, media_file: MediaFileRecord) -> None:
+    def _upsert_media_file_row_unlocked(self, media_file: MediaFileRecord) -> None:
         downloaded_at = media_file.downloaded_at or utc_now_iso()
-        with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO media_files(
-                  source, account_id, chat_id, message_id, file_index, file_path,
-                  media_kind, mime_type, file_size, downloaded_at, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id, chat_id, message_id, file_index) DO UPDATE SET
-                  file_path = excluded.file_path,
-                  media_kind = excluded.media_kind,
-                  mime_type = excluded.mime_type,
-                  file_size = excluded.file_size,
-                  downloaded_at = excluded.downloaded_at,
-                  raw_json = excluded.raw_json
-                """,
-                (
-                    media_file.source,
-                    media_file.account_id,
-                    media_file.chat_id,
-                    media_file.message_id,
-                    media_file.file_index,
-                    media_file.file_path,
-                    media_file.media_kind,
-                    media_file.mime_type,
-                    media_file.file_size,
-                    downloaded_at,
-                    media_file.raw_json,
-                ),
+        self._conn.execute(
+            """
+            INSERT INTO media_files(
+              source, account_id, chat_id, message_id, file_index, file_path,
+              media_kind, mime_type, file_size, downloaded_at, raw_json
             )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id, chat_id, message_id, file_index) DO UPDATE SET
+              file_path = excluded.file_path,
+              media_kind = excluded.media_kind,
+              mime_type = excluded.mime_type,
+              file_size = excluded.file_size,
+              downloaded_at = excluded.downloaded_at,
+              raw_json = excluded.raw_json
+            """,
+            (
+                media_file.source,
+                media_file.account_id,
+                media_file.chat_id,
+                media_file.message_id,
+                media_file.file_index,
+                media_file.file_path,
+                media_file.media_kind,
+                media_file.mime_type,
+                media_file.file_size,
+                downloaded_at,
+                media_file.raw_json,
+            ),
+        )
+
+    def upsert_media_file(self, media_file: MediaFileRecord) -> None:
+        with self._lock:
+            self._upsert_media_file_row_unlocked(media_file)
             self._conn.commit()
+
+    def upsert_media_file_if_policy_allows(
+        self,
+        *,
+        source: str,
+        account_id: str,
+        chat_id: int,
+        topic_id: int = 0,
+        is_sticker_like: bool = False,
+        prepare_media: Callable[[], MediaFileRecord],
+        rollback_media: Callable[[MediaFileRecord], None] | None = None,
+    ) -> MediaFileRecord | None:
+        """Atomically verify effective media policy, publish staged media, and insert media_files in one transaction."""
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            published: MediaFileRecord | None = None
+            try:
+                effective_policy, _policy_source = self._resolve_effective_backup_policy_unlocked(
+                    source,
+                    account_id,
+                    chat_id,
+                    topic_id=int(topic_id or 0),
+                )
+                allowed = bool(effective_policy.get("enabled")) and bool(
+                    effective_policy.get("download_stickers" if is_sticker_like else "download_media")
+                )
+                if not allowed:
+                    self._conn.rollback()
+                    return None
+                published = prepare_media()
+                self._upsert_media_file_row_unlocked(published)
+                self._conn.commit()
+                return published
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                if published is not None and rollback_media is not None:
+                    try:
+                        rollback_media(published)
+                    except OSError:
+                        pass
+                raise
 
     def list_media_files(
         self,

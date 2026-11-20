@@ -3,6 +3,9 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import shutil
+import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -441,81 +444,112 @@ class TelegramArchiveService:
     ) -> None:
         target_dir = self.store.database_path.parent / "media" / self.account_id / str(record.chat_id)
         target_dir.mkdir(parents=True, exist_ok=True)
-        downloaded = None
+        downloaded: str | None = None
+        staging_dir: Path | None = None
         attempts = max(1, self.media_download.retries + 1)
         success_attempt = 0
-        for attempt in range(1, attempts + 1):
-            if not self._should_download_media_for(
-                record.chat_id,
-                record.topic_id,
-                is_sticker_like=is_sticker_like,
-            ):
-                return
-            try:
-                downloaded = await message.download_media(file=str(target_dir))
-                success_attempt = attempt
-                break
-            except Exception as exc:
-                error = classify_telegram_exception(exc, default_code="media_download_failed")
-                self.logger.warning(
-                    "Failed to download media for account=%s chat=%s message=%s attempt=%s/%s: %s",
-                    self.account_id,
+        try:
+            for attempt in range(1, attempts + 1):
+                if not self._should_download_media_for(
                     record.chat_id,
-                    record.message_id,
-                    attempt,
-                    attempts,
-                    error.message,
-                )
-                if attempt >= attempts:
-                    self._record_operation(
-                        "media_download",
-                        "failed",
-                        subject_type="message",
-                        subject_id=f"{record.chat_id}/{record.message_id}",
-                        error=error.to_public_dict() | {"attempts": attempts},
-                    )
+                    record.topic_id,
+                    is_sticker_like=is_sticker_like,
+                ):
                     return
-                if self.media_download.retry_delay_seconds > 0:
-                    await asyncio.sleep(self.media_download.retry_delay_seconds)
-        if not downloaded:
-            self._record_operation(
-                "media_download",
-                "failed",
-                subject_type="message",
-                subject_id=f"{record.chat_id}/{record.message_id}",
-                error={"code": "media_download_empty", "message": "download_media returned no file path", "attempts": attempts},
-            )
-            return
-        path = Path(downloaded)
-        if not self._should_download_media_for(
-            record.chat_id,
-            record.topic_id,
-            is_sticker_like=is_sticker_like,
-        ):
-            path.unlink(missing_ok=True)
-            return
-        file_size = path.stat().st_size if path.exists() else None
-        self.store.upsert_media_file(
-            MediaFileRecord(
+                attempt_dir = target_dir / f".part-{uuid.uuid4().hex}"
+                attempt_dir.mkdir(parents=True, exist_ok=True)
+                try:
+                    downloaded = await message.download_media(file=str(attempt_dir))
+                    staging_dir = attempt_dir
+                    success_attempt = attempt
+                    break
+                except Exception as exc:
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    error = classify_telegram_exception(exc, default_code="media_download_failed")
+                    self.logger.warning(
+                        "Failed to download media for account=%s chat=%s message=%s attempt=%s/%s: %s",
+                        self.account_id,
+                        record.chat_id,
+                        record.message_id,
+                        attempt,
+                        attempts,
+                        error.message,
+                    )
+                    if attempt >= attempts:
+                        self._record_operation(
+                            "media_download",
+                            "failed",
+                            subject_type="message",
+                            subject_id=f"{record.chat_id}/{record.message_id}",
+                            error=error.to_public_dict() | {"attempts": attempts},
+                        )
+                        return
+                    if self.media_download.retry_delay_seconds > 0:
+                        await asyncio.sleep(self.media_download.retry_delay_seconds)
+                except BaseException:
+                    shutil.rmtree(attempt_dir, ignore_errors=True)
+                    raise
+            if not downloaded:
+                self._record_operation(
+                    "media_download",
+                    "failed",
+                    subject_type="message",
+                    subject_id=f"{record.chat_id}/{record.message_id}",
+                    error={"code": "media_download_empty", "message": "download_media returned no file path", "attempts": attempts},
+                )
+                return
+            staged_path = Path(downloaded)
+            if not staged_path.exists():
+                self._record_operation(
+                    "media_download",
+                    "failed",
+                    subject_type="message",
+                    subject_id=f"{record.chat_id}/{record.message_id}",
+                    error={"code": "media_download_missing", "message": "download_media file path does not exist", "attempts": attempts},
+                )
+                return
+
+            def _prepare_media() -> MediaFileRecord:
+                final_path = _unique_media_target_path(target_dir, staged_path.name, record.message_id)
+                os.replace(staged_path, final_path)
+                file_size = final_path.stat().st_size if final_path.exists() else None
+                return MediaFileRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id=self.account_id,
+                    chat_id=record.chat_id,
+                    message_id=record.message_id,
+                    file_path=str(final_path),
+                    media_kind=record.media_kind,
+                    file_size=file_size,
+                    downloaded_at=utc_now_iso(),
+                    raw_json=json.dumps({"downloaded": str(final_path)}, ensure_ascii=False),
+                )
+
+            def _rollback_media(media_record: MediaFileRecord) -> None:
+                Path(media_record.file_path).unlink(missing_ok=True)
+
+            published = self.store.upsert_media_file_if_policy_allows(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
                 chat_id=record.chat_id,
-                message_id=record.message_id,
-                file_path=str(path),
-                media_kind=record.media_kind,
-                file_size=file_size,
-                downloaded_at=utc_now_iso(),
-                raw_json=json.dumps({"downloaded": str(path)}, ensure_ascii=False),
+                topic_id=record.topic_id,
+                is_sticker_like=is_sticker_like,
+                prepare_media=_prepare_media,
+                rollback_media=_rollback_media,
             )
-        )
-        if success_attempt > 1:
-            self._record_operation(
-                "media_download",
-                "ok",
-                subject_type="message",
-                subject_id=f"{record.chat_id}/{record.message_id}",
-                error={"attempts": success_attempt},
-            )
+            if published is None:
+                return
+            if success_attempt > 1:
+                self._record_operation(
+                    "media_download",
+                    "ok",
+                    subject_type="message",
+                    subject_id=f"{record.chat_id}/{record.message_id}",
+                    error={"attempts": success_attempt},
+                )
+        finally:
+            if staging_dir is not None:
+                shutil.rmtree(staging_dir, ignore_errors=True)
 
 
     async def _backfill_capture_targets(self, targets: list[CaptureTarget]) -> list[CaptureTarget]:
@@ -1109,6 +1143,26 @@ def _message_reactions(message: Any) -> Any:
 def _reaction_payload(event: Any) -> dict[str, Any]:
     reactions = getattr(event, "reactions", None)
     return _safe_dict(reactions) if reactions else {}
+
+
+def _unique_media_target_path(target_dir: Path, filename: str, message_id: int) -> Path:
+    clean_name = Path(filename).name if filename else ""
+    if not clean_name or clean_name in {".", ".."}:
+        clean_name = f"msg-{message_id}.bin"
+    candidate = target_dir / clean_name
+    if not candidate.exists():
+        return candidate
+    stem = candidate.stem or f"msg-{message_id}"
+    suffix = candidate.suffix
+    numbered = target_dir / f"{stem}_m{message_id}{suffix}"
+    if not numbered.exists():
+        return numbered
+    index = 1
+    while True:
+        alt = target_dir / f"{stem}_m{message_id}_{index}{suffix}"
+        if not alt.exists():
+            return alt
+        index += 1
 
 
 def _safe_dict(obj: Any) -> Any:
