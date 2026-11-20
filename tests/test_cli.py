@@ -494,6 +494,55 @@ daily:
             self.assertIn("runtime_start", events)
             self.assertLess(events.index("cli_lock_release"), events.index("runtime_start"))
 
+    def test_real_sigterm_interrupts_waiting_standalone_cli_without_deadlock(self) -> None:
+        import os
+        import signal
+        import subprocess
+        import sys
+        import time
+        from tele_mess_core.config import load_config
+        from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyWorkerLock
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config_path = self._config_file(root)
+            config = load_config(config_path)
+            holder = DailyWorkerLock(config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME, owner="svc", mode="service")
+            self.assertTrue(holder.try_acquire())
+            env = {**os.environ, "PYTHONPATH": str(Path(__file__).resolve().parents[1] / "src")}
+            proc = subprocess.Popen(
+                [
+                    sys.executable,
+                    "-m",
+                    "tele_mess_core",
+                    "--config",
+                    str(config_path),
+                    "daily-run",
+                    "--date",
+                    "2026-07-03",
+                    "--timezone",
+                    "UTC",
+                ],
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+            try:
+                # Wait briefly so the child enters the waiting loop before sending real SIGTERM.
+                time.sleep(0.4)
+                proc.send_signal(signal.SIGTERM)
+                exit_code = proc.wait(timeout=5.0)
+                self.assertEqual(exit_code, 128 + int(signal.SIGTERM))
+            finally:
+                if proc.poll() is None:
+                    proc.kill()
+                    proc.wait(timeout=2.0)
+                if proc.stdout is not None:
+                    proc.stdout.close()
+                if proc.stderr is not None:
+                    proc.stderr.close()
+                holder.release()
+
 
 if __name__ == "__main__":
     unittest.main()

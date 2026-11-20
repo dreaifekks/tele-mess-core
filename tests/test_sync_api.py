@@ -1599,6 +1599,117 @@ class TelegramOperationSourceTest(unittest.TestCase):
                 thread.join(timeout=3)
                 store.close()
 
+    def test_offline_endpoints_return_http_200_even_when_sqlite_write_is_locked(self) -> None:
+        import asyncio
+        import sqlite3
+        import threading
+        from unittest.mock import patch
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        class OfflineClient:
+            async def connect(self) -> None:
+                raise ConnectionError("network unreachable")
+
+            async def disconnect(self) -> None:
+                return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            store = ArchiveStore(root / "archive.db")
+            store.initialize()
+            account = TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="hash",
+                session_name="main",
+                session_dir=root / "sessions",
+            )
+            config = AppConfig(
+                storage=StorageConfig(data_dir=root, database=root / "archive.db"),
+                telegram=TelegramConfig(accounts=[account]),
+                server=ServerConfig(token="secret"),
+                logging=LoggingConfig(file=None),
+            )
+            runtime = TelegramRuntimeManager(
+                config,
+                store,
+                client_factory=lambda _cfg: OfflineClient(),
+                ingest=False,
+                connect_wait_seconds=0.2,
+                management_timeout_seconds=0.5,
+            )
+            loop = asyncio.new_event_loop()
+            started = threading.Event()
+
+            def run_loop() -> None:
+                asyncio.set_event_loop(loop)
+                loop.run_until_complete(runtime.start())
+                started.set()
+                loop.run_forever()
+                loop.run_until_complete(runtime.stop())
+                loop.close()
+
+            thread = threading.Thread(target=run_loop, daemon=True)
+            thread.start()
+            started.wait(2)
+            api = SyncApiServer(store, "127.0.0.1", 0, token="secret", config=config, telegram_runtime=runtime)
+            api.start_background()
+            try:
+                assert api._httpd is not None
+                port = api._httpd.server_address[1]
+
+                def post(path: str, body: dict) -> tuple[int, dict]:
+                    req = Request(
+                        f"http://127.0.0.1:{port}{path}",
+                        data=json.dumps(body).encode("utf-8"),
+                        method="POST",
+                    )
+                    req.add_header("Authorization", "Bearer secret")
+                    req.add_header("Content-Type", "application/json")
+                    with urlopen(req, timeout=3) as resp:
+                        return resp.status, json.loads(resp.read().decode("utf-8"))
+
+                def raise_locked(*_args: object, **_kwargs: object) -> None:
+                    raise sqlite3.OperationalError("database is locked")
+
+                with (
+                    patch.object(store, "upsert_account_auth", side_effect=raise_locked),
+                    patch.object(store, "add_operation_event", side_effect=raise_locked),
+                ):
+                    for path, body, expected_key, expected_code in (
+                        ("/manage/accounts/auth/status", {"account_id": "main"}, "error", "auth_status_failed"),
+                        (
+                            "/manage/accounts/auth/request-code",
+                            {"account_id": "main", "phone": "+1000"},
+                            "error",
+                            "request_code_failed",
+                        ),
+                        (
+                            "/manage/accounts/auth/submit-code",
+                            {"account_id": "main", "phone": "+1000", "code": "12345"},
+                            "error",
+                            "submit_code_failed",
+                        ),
+                        ("/manage/discover-origins", {"account_id": "main"}, "errors", "discover_origins_failed"),
+                        (
+                            "/manage/participants/refresh",
+                            {"account_id": "main", "origin_id": -1001},
+                            "errors",
+                            "refresh_participants_failed",
+                        ),
+                    ):
+                        status, payload = post(path, body)
+                        self.assertEqual(status, 200)
+                        if expected_key == "error":
+                            self.assertEqual(payload["item"]["error"]["code"], expected_code)
+                        else:
+                            self.assertEqual(payload["item"]["errors"][0]["code"], expected_code)
+            finally:
+                api.stop()
+                loop.call_soon_threadsafe(loop.stop)
+                thread.join(timeout=3)
+                store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

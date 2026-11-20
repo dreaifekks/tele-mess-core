@@ -2124,6 +2124,14 @@ class ArchiveMigrationTest(unittest.TestCase):
                   2, 2, 'trailing chunk', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
                 ),
                 (
+                  'out_v19_retry_1', 'sum_v19_retry', 'job_v19_retry', 'main', -9001, 0,
+                  1, 2, 'attempted retry chunk', 'retry', 1, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
+                  'out_v19_retry_2', 'sum_v19_retry', 'job_v19_retry', 'main', -9001, 0,
+                  2, 2, 'retry trailing chunk', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                ),
+                (
                   'out_v19_pending', 'sum_v19_pending', 'job_v19_pending', 'main', -9001, 0,
                   1, 1, 'pending chunk', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
                 );
@@ -2157,6 +2165,23 @@ class ArchiveMigrationTest(unittest.TestCase):
                         now="2026-07-03T01:00:00+00:00",
                         stale_before="2026-07-03T00:55:00+00:00",
                         summary_run_id="sum_v19_inflight",
+                    )
+                )
+
+                retry_rows = {
+                    row["outbox_id"]: row for row in store.list_delivery_outbox(summary_run_id="sum_v19_retry")
+                }
+                self.assertEqual(retry_rows["out_v19_retry_1"]["status"], "failed")
+                self.assertEqual(
+                    retry_rows["out_v19_retry_1"]["last_error"],
+                    "migrated_attempted_delivery_uncertain",
+                )
+                self.assertEqual(retry_rows["out_v19_retry_2"]["status"], "failed")
+                self.assertIsNone(
+                    store.claim_delivery_outbox(
+                        now="2026-07-03T01:00:00+00:00",
+                        stale_before="2026-07-03T00:55:00+00:00",
+                        summary_run_id="sum_v19_retry",
                     )
                 )
 
@@ -2530,6 +2555,137 @@ class ArchiveMigrationTest(unittest.TestCase):
                 self.assertEqual(final["message_id"], 202)
             finally:
                 store.close()
+
+    def test_publish_and_renew_evaluate_lease_expiry_after_acquiring_write_lock(self) -> None:
+        import threading
+        import time
+        from datetime import datetime, timedelta, timezone
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "lock_expiry.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            try:
+                now_dt = datetime.now(timezone.utc)
+                lease_until = (now_dt + timedelta(milliseconds=150)).isoformat()
+                store.insert_daily_summary_job(
+                    DailySummaryJobRecord(
+                        job_id="job_lock_exp",
+                        status="running",
+                        worker_id="stale",
+                        lease_until=lease_until,
+                        attempt=1,
+                        started_at=now_dt.isoformat(),
+                    )
+                )
+                blocker = sqlite3.connect(str(db_path), isolation_level=None, check_same_thread=False)
+                blocker.execute("BEGIN IMMEDIATE")
+
+                def release_after_expiry() -> None:
+                    time.sleep(0.30)
+                    blocker.execute("ROLLBACK")
+                    blocker.close()
+
+                releaser = threading.Thread(target=release_after_expiry, daemon=True)
+                releaser.start()
+                try:
+                    # Call starts BEFORE lease_until, but write lock is granted AFTER lease_until.
+                    published = store.publish_daily_summary(
+                        DailySummaryRunRecord(
+                            run_id="sum_lock_exp",
+                            status="completed",
+                            package_run_id="pkg_lock_exp",
+                            date="2026-07-03",
+                            timezone="UTC",
+                            scope_json="{}",
+                            output_dir=tmp,
+                        ),
+                        [],
+                        [
+                            {
+                                "outbox_id": "out_lock_exp_1",
+                                "summary_run_id": "sum_lock_exp",
+                                "job_id": "job_lock_exp",
+                                "account_id": "main",
+                                "origin_id": -9001,
+                                "content_kind": "point_summary",
+                                "chunk_index": 1,
+                                "chunk_count": 1,
+                                "content": "late publish",
+                            }
+                        ],
+                        job_owner=("job_lock_exp", "stale", 1),
+                    )
+                    self.assertIsNone(published)
+                    self.assertEqual(store.list_delivery_outbox(summary_run_id="sum_lock_exp"), [])
+                    self.assertFalse(
+                        store.renew_daily_summary_job_lease(
+                            "job_lock_exp",
+                            "stale",
+                            1,
+                            lease_seconds=60.0,
+                        )
+                    )
+                finally:
+                    releaser.join(timeout=2)
+            finally:
+                store.close()
+
+    def test_intermediate_v20_without_claim_token_repairs_on_initialize(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v20_partial.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            store.close()
+            # Simulate a pre-claim_token v20 delivery_outbox table.
+            conn = sqlite3.connect(str(db_path))
+            conn.executescript(
+                """
+                DROP TRIGGER IF EXISTS delivery_outbox_validate_insert;
+                DROP TRIGGER IF EXISTS delivery_outbox_validate_update;
+                DROP TABLE delivery_outbox;
+                CREATE TABLE delivery_outbox (
+                  outbox_id TEXT PRIMARY KEY,
+                  summary_run_id TEXT NOT NULL,
+                  job_id TEXT,
+                  account_id TEXT NOT NULL,
+                  origin_id INTEGER NOT NULL,
+                  topic_id INTEGER NOT NULL DEFAULT 0,
+                  content_kind TEXT NOT NULL DEFAULT 'summary',
+                  chunk_index INTEGER NOT NULL,
+                  chunk_count INTEGER NOT NULL,
+                  content TEXT NOT NULL,
+                  status TEXT NOT NULL DEFAULT 'pending',
+                  attempts INTEGER NOT NULL DEFAULT 0,
+                  message_id INTEGER,
+                  last_error TEXT,
+                  next_attempt_at TEXT,
+                  created_at TEXT NOT NULL,
+                  updated_at TEXT NOT NULL,
+                  sent_at TEXT,
+                  UNIQUE(summary_run_id, account_id, origin_id, topic_id, content_kind, chunk_index)
+                );
+                INSERT INTO delivery_outbox(
+                  outbox_id, summary_run_id, account_id, origin_id, content_kind,
+                  chunk_index, chunk_count, content, status, attempts, created_at, updated_at
+                ) VALUES (
+                  'out_partial_1', 'sum_partial', 'main', -9001, 'point_summary',
+                  1, 1, 'hello', 'pending', 0, '2026-07-03T00:00:00+00:00', '2026-07-03T00:00:00+00:00'
+                );
+                """
+            )
+            conn.commit()
+            conn.close()
+
+            reopened = ArchiveStore(db_path)
+            try:
+                reopened.initialize()
+                rows = reopened.list_delivery_outbox(summary_run_id="sum_partial")
+                self.assertEqual(len(rows), 1)
+                self.assertEqual(rows[0]["claim_token"], 0)
+                self.assertIsNotNone(rows[0]["send_random_id"])
+            finally:
+                reopened.close()
 
 
 if __name__ == "__main__":

@@ -413,7 +413,11 @@ async def _run_core(config: AppConfig, store: ArchiveStore, *, web: bool, ingest
     storage = getattr(config, "storage", None)
     data_dir = getattr(storage, "data_dir", None)
     worker_lock = (
-        DailyWorkerLock(data_dir / DAILY_WORKER_LOCK_FILENAME, owner=f"core:{os.getpid()}")
+        DailyWorkerLock(
+            data_dir / DAILY_WORKER_LOCK_FILENAME,
+            owner=f"core:{os.getpid()}",
+            mode="service",
+        )
         if data_dir is not None
         else None
     )
@@ -523,16 +527,24 @@ def _daily_cli_exit_code(store: ArchiveStore, config: AppConfig, terminal: dict[
 
     if terminal.get("status") != "completed":
         return 1
-    summary_run_id = str(terminal.get("summary_run_id") or "")
-    if not summary_run_id:
+    summary_run_id = str(terminal.get("summary_run_id") or "") or None
+    job_id = str(terminal.get("job_id") or "") or None
+    if not summary_run_id and not job_id:
         return 0
-    outbox = store.list_delivery_outbox(summary_run_id=summary_run_id)
+    outbox = store.list_delivery_outbox(summary_run_id=summary_run_id, job_id=job_id)
     if any(item.get("status") == "failed" for item in outbox):
         return 1
     if any(item.get("status") in {"pending", "retry", "sending"} for item in outbox):
-        probe = DailyWorkerLock(config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME, owner="cli:probe")
+        probe = DailyWorkerLock(
+            config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME,
+            owner="cli:probe",
+            mode="cli",
+        )
         if probe.try_acquire():
             probe.release()
+            return 1
+        holder = probe.read_holder()
+        if holder is None or holder.get("mode") != "service":
             return 1
     return 0
 

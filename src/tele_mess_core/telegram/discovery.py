@@ -116,11 +116,10 @@ class TelegramDiscoveryService:
         except Exception as exc:
             return self.discover_origins_error_result(exc)
 
-    def discover_origins_error_result(self, exc: Exception) -> dict[str, Any]:
+    def discover_origins_error_result(self, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="discover_origins_failed")
         payload = error.to_public_dict()
-        self._record_operation("discover_origins", "failed", error=payload)
-        return {
+        result = {
             "account_id": self.account_id,
             "authorized": False,
             "status": "failed",
@@ -129,6 +128,16 @@ class TelegramDiscoveryService:
             "errors": [payload],
             "topics_truncated": False,
         }
+        if persist:
+            try:
+                self._record_operation("discover_origins", "failed", error=payload)
+            except Exception:
+                self.logger.warning(
+                    "Failed to persist discover_origins error for account %s",
+                    self.account_id,
+                    exc_info=True,
+                )
+        return result
 
     async def refresh_participants(
         self,
@@ -205,17 +214,16 @@ class TelegramDiscoveryService:
         except Exception as exc:
             return self.refresh_participants_error_result(origin_id, exc)
 
-    def refresh_participants_error_result(self, origin_id: int, exc: Exception) -> dict[str, Any]:
+    def refresh_participants_error_result(
+        self,
+        origin_id: int,
+        exc: Exception,
+        *,
+        persist: bool = True,
+    ) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="refresh_participants_failed")
         payload = error.to_public_dict()
-        self._record_operation(
-            "refresh_participants",
-            "failed",
-            subject_type="origin",
-            subject_id=str(origin_id),
-            error=payload,
-        )
-        return {
+        result = {
             "account_id": self.account_id,
             "origin_id": origin_id,
             "authorized": False,
@@ -223,6 +231,22 @@ class TelegramDiscoveryService:
             "participants": 0,
             "errors": [payload],
         }
+        if persist:
+            try:
+                self._record_operation(
+                    "refresh_participants",
+                    "failed",
+                    subject_type="origin",
+                    subject_id=str(origin_id),
+                    error=payload,
+                )
+            except Exception:
+                self.logger.warning(
+                    "Failed to persist refresh_participants error for account %s",
+                    self.account_id,
+                    exc_info=True,
+                )
+        return result
 
     async def _discover_topics(self, client: Any, entity: Any, origin_id: int, topic_limit: int) -> dict[str, Any]:
         errors: list[dict[str, Any]] = []

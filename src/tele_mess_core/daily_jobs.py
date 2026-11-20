@@ -55,9 +55,10 @@ class DailyJobCliInterrupted(Exception):
 class DailyWorkerLock:
     """Process-level advisory file lock ensuring at most one daily job executor."""
 
-    def __init__(self, path: Path, *, owner: str = "") -> None:
+    def __init__(self, path: Path, *, owner: str = "", mode: str = "service") -> None:
         self.path = path
         self.owner = owner
+        self.mode = mode
         self._fd: int | None = None
 
     def try_acquire(self) -> bool:
@@ -71,7 +72,12 @@ class DailyWorkerLock:
             os.ftruncate(fd, 0)
             os.lseek(fd, 0, os.SEEK_SET)
             payload = json.dumps(
-                {"pid": os.getpid(), "owner": self.owner, "acquired_at": utc_now_iso()},
+                {
+                    "pid": os.getpid(),
+                    "owner": self.owner,
+                    "mode": self.mode,
+                    "acquired_at": utc_now_iso(),
+                },
                 ensure_ascii=False,
             )
             os.write(fd, payload.encode("utf-8"))
@@ -83,6 +89,16 @@ class DailyWorkerLock:
         except Exception:
             os.close(fd)
             raise
+
+    def read_holder(self) -> dict[str, Any] | None:
+        try:
+            raw = self.path.read_text(encoding="utf-8").strip()
+            if not raw:
+                return None
+            data = json.loads(raw)
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
 
     def release(self) -> None:
         fd = self._fd
@@ -266,12 +282,20 @@ def wait_for_daily_summary_job(
         time.sleep(interval)
 
 
-def _has_undelivered_outbox(store: ArchiveStore, summary_run_id: str | None) -> bool:
-    if not summary_run_id:
+def _has_undelivered_outbox(
+    store: ArchiveStore,
+    summary_run_id: str | None,
+    *,
+    job_id: str | None = None,
+) -> bool:
+    if not summary_run_id and not job_id:
         return False
     return any(
         item.get("status") in {"pending", "retry", "sending"}
-        for item in store.list_delivery_outbox(summary_run_id=str(summary_run_id))
+        for item in store.list_delivery_outbox(
+            summary_run_id=str(summary_run_id) if summary_run_id else None,
+            job_id=job_id,
+        )
     )
 
 
@@ -295,13 +319,22 @@ def run_daily_summary_job_from_cli(
     active_worker: list[DailyJobWorker] = []
     previous_handlers: dict[int, Any] = {}
     install_signals = stop_event is None and threading.current_thread() is threading.main_thread()
+    watcher_done = threading.Event()
+    watcher_thread: threading.Thread | None = None
 
     if install_signals:
         def _handle_signal(signum: int, _frame: Any) -> None:
+            # Signal handlers must not acquire threading locks (such as Event._cond);
+            # record the signal and let the dedicated watcher thread stop the worker.
             interrupted_signal.append(signum)
-            effective_stop.set()
-            if active_worker:
-                active_worker[0].request_stop()
+
+        def _watch_signals() -> None:
+            while not watcher_done.wait(0.02):
+                if interrupted_signal:
+                    effective_stop.set()
+                    if active_worker:
+                        active_worker[0].request_stop()
+                    return
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -309,18 +342,34 @@ def run_daily_summary_job_from_cli(
                 signal.signal(sig, _handle_signal)
             except (OSError, ValueError):
                 pass
+        watcher_thread = threading.Thread(
+            target=_watch_signals,
+            name=f"cli-signal-watcher-{job_id}",
+            daemon=True,
+        )
+        watcher_thread.start()
 
-    lock = DailyWorkerLock(config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME, owner=f"cli:{job_id}")
+    lock = DailyWorkerLock(
+        config.storage.data_dir / DAILY_WORKER_LOCK_FILENAME,
+        owner=f"cli:{job_id}",
+        mode="cli",
+    )
     runtime_factory = delivery_runtime_factory or _ScopedTelegramRuntime
     deadline = None if timeout is None else time.monotonic() + timeout
     interval = max(0.01, float(poll_interval))
     worker: DailyJobWorker | None = None
     lock_held = False
 
+    def _raise_if_interrupted() -> None:
+        if interrupted_signal:
+            effective_stop.set()
+            raise DailyJobCliInterrupted(interrupted_signal[0])
+        if effective_stop.is_set():
+            raise DailyJobCliInterrupted(int(signal.SIGINT))
+
     try:
         while True:
-            if effective_stop.is_set():
-                raise DailyJobCliInterrupted(interrupted_signal[0] if interrupted_signal else int(signal.SIGINT))
+            _raise_if_interrupted()
 
             item = store.get_daily_summary_job(job_id)
             if item is None:
@@ -331,29 +380,37 @@ def run_daily_summary_job_from_cli(
                 return item
 
             if status == "completed":
-                summary_run_id = str(item.get("summary_run_id") or "")
-                if not _has_undelivered_outbox(store, summary_run_id):
+                summary_run_id = str(item.get("summary_run_id") or "") or None
+                if not _has_undelivered_outbox(store, summary_run_id, job_id=job_id):
                     return item
                 if not lock_held:
                     lock_held = lock.try_acquire()
-                if not lock_held:
+                if lock_held:
+                    store.reset_retry_backoff_for_summary(summary_run_id, job_id=job_id)
+                    if worker is None:
+                        worker = DailyJobWorker(
+                            store,
+                            config,
+                            telegram_runtime=None,
+                            use_process_lock=False,
+                            standalone_delivery_factory=runtime_factory,
+                            stop_event=effective_stop,
+                        )
+                        active_worker[:] = [worker]
+                    worker.drain_summary_delivery(summary_run_id, job_id=job_id)
+                    _raise_if_interrupted()
+                    return store.get_daily_summary_job(job_id) or item
+                holder = lock.read_holder()
+                if holder is not None and holder.get("mode") == "service":
                     # A running service holds the worker lock and owns background delivery retries.
                     return item
-                store.reset_retry_backoff_for_summary(summary_run_id)
-                if worker is None:
-                    worker = DailyJobWorker(
-                        store,
-                        config,
-                        telegram_runtime=None,
-                        use_process_lock=False,
-                        standalone_delivery_factory=runtime_factory,
-                        stop_event=effective_stop,
-                    )
-                    active_worker[:] = [worker]
-                worker.drain_summary_delivery(summary_run_id)
-                if effective_stop.is_set():
-                    raise DailyJobCliInterrupted(interrupted_signal[0] if interrupted_signal else int(signal.SIGINT))
-                return store.get_daily_summary_job(job_id) or item
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError(f"Timed out waiting for daily summary delivery for job {job_id}")
+                if install_signals:
+                    time.sleep(min(interval, 0.05))
+                else:
+                    effective_stop.wait(interval)
+                continue
 
             if not lock_held:
                 lock_held = lock.try_acquire()
@@ -369,15 +426,20 @@ def run_daily_summary_job_from_cli(
                     )
                     active_worker[:] = [worker]
                 ran = worker.run_once(job_id=job_id)
-                if effective_stop.is_set():
-                    raise DailyJobCliInterrupted(interrupted_signal[0] if interrupted_signal else int(signal.SIGINT))
+                _raise_if_interrupted()
                 if ran is not None and ran["status"] in TERMINAL_JOB_STATUSES:
                     return ran
 
             if deadline is not None and time.monotonic() >= deadline:
                 raise TimeoutError(f"Timed out waiting for daily summary job {job_id}")
-            effective_stop.wait(interval)
+            if install_signals:
+                time.sleep(min(interval, 0.05))
+            else:
+                effective_stop.wait(interval)
     finally:
+        watcher_done.set()
+        if watcher_thread is not None:
+            watcher_thread.join(timeout=1.0)
         if install_signals:
             for signum, handler in previous_handlers.items():
                 try:
@@ -569,14 +631,12 @@ class DailyJobWorker:
                 while not heartbeat_stop.wait(self._heartbeat_interval):
                     if self._stop_event.is_set() or lease_lost.is_set():
                         return
-                    now, lease_until = self._lease_window()
                     try:
                         renewed = self.store.renew_daily_summary_job_lease(
                             job_id,
                             self.worker_id,
                             attempt,
-                            now=now,
-                            lease_until=lease_until,
+                            lease_seconds=self._lease_seconds,
                         )
                     except sqlite3.OperationalError:
                         continue
@@ -611,14 +671,12 @@ class DailyJobWorker:
             package_id: str | None = None,
             summary_id: str | None = None,
         ) -> None:
-            now, lease_until = self._lease_window()
             updated = self.store.update_daily_summary_job_progress(
                 job_id,
                 self.worker_id,
                 attempt,
                 progress=progress,
-                lease_until=lease_until,
-                now=now,
+                lease_seconds=self._lease_seconds,
                 package_run_id=package_id,
                 summary_run_id=summary_id,
                 date=str(progress.get("date") or run_date or "") or None,
@@ -644,7 +702,6 @@ class DailyJobWorker:
                 attempt,
                 status=status,
                 progress=progress,
-                now=utc_now_iso(),
                 package_run_id=package_id,
                 summary_run_id=summary_id,
                 date=str(progress.get("date") or run_date or "") or None,
@@ -755,12 +812,11 @@ class DailyJobWorker:
                         job_id,
                         self.worker_id,
                         attempt,
-                        retry_at=retry_at,
+                        retry_delay_seconds=retry_delay_seconds,
                         max_retries=max_retries,
                         progress_label=str(retry_progress["label"]),
                         progress_json=json.dumps(retry_progress, ensure_ascii=False, sort_keys=True),
                         error=str(summary.get("error") or error_kind),
-                        now=now_dt.isoformat(),
                     )
                     if scheduled:
                         return
@@ -771,6 +827,7 @@ class DailyJobWorker:
             check_cancel()
             self._drain_summary_delivery(
                 str(summary["run_id"]),
+                job_id=job_id,
                 cancel_check=check_cancel,
                 job_owner=job_owner,
             )
@@ -795,7 +852,7 @@ class DailyJobWorker:
         except DailyJobLeaseLost:
             LOGGER.warning("Daily job %s attempt %s lost its lease; stopping stale worker", job_id, attempt)
         except DailyJobInterrupted:
-            self.store.requeue_daily_summary_job(job_id, self.worker_id, attempt, now=utc_now_iso())
+            self.store.requeue_daily_summary_job(job_id, self.worker_id, attempt)
         except DailyJobCancelled as exc:
             current = self.store.get_daily_summary_job(job_id) or {}
             finish_job(
@@ -826,13 +883,14 @@ class DailyJobWorker:
         now = datetime.now(timezone.utc)
         return now.isoformat(), (now + timedelta(seconds=self._lease_seconds)).isoformat()
 
-    def drain_summary_delivery(self, summary_run_id: str) -> None:
-        self._drain_summary_delivery(summary_run_id)
+    def drain_summary_delivery(self, summary_run_id: str | None, *, job_id: str | None = None) -> None:
+        self._drain_summary_delivery(summary_run_id, job_id=job_id)
 
     def _drain_summary_delivery(
         self,
-        summary_run_id: str,
+        summary_run_id: str | None,
         *,
+        job_id: str | None = None,
         cancel_check: Callable[[], None] | None = None,
         job_owner: tuple[str, str, int] | None = None,
     ) -> None:
@@ -840,7 +898,11 @@ class DailyJobWorker:
             while not self._stop_event.is_set():
                 if cancel_check:
                     cancel_check()
-                if not self._deliver_pending_once(summary_run_id=summary_run_id, job_owner=job_owner):
+                if not self._deliver_pending_once(
+                    summary_run_id=summary_run_id,
+                    job_id=job_id,
+                    job_owner=job_owner,
+                ):
                     return
             return
 
@@ -848,7 +910,7 @@ class DailyJobWorker:
             return
         pending = [
             item
-            for item in self.store.list_delivery_outbox(summary_run_id=summary_run_id)
+            for item in self.store.list_delivery_outbox(summary_run_id=summary_run_id, job_id=job_id)
             if item.get("status") in {"pending", "retry", "sending"}
         ]
         if not pending:
@@ -860,6 +922,7 @@ class DailyJobWorker:
                     cancel_check()
                 if not self._deliver_pending_once(
                     summary_run_id=summary_run_id,
+                    job_id=job_id,
                     telegram_runtime=runtime,
                     job_owner=job_owner,
                 ):
@@ -869,17 +932,17 @@ class DailyJobWorker:
         self,
         summary_run_id: str | None = None,
         *,
+        job_id: str | None = None,
         telegram_runtime: Any | None = None,
         job_owner: tuple[str, str, int] | None = None,
     ) -> bool:
         runtime = telegram_runtime if telegram_runtime is not None else self.telegram_runtime
         if runtime is None or self._stop_event.is_set():
             return False
-        now_dt = datetime.now(timezone.utc)
         item = self.store.claim_delivery_outbox(
-            now=now_dt.isoformat(),
-            stale_before=(now_dt - timedelta(minutes=5)).isoformat(),
+            stale_seconds=300.0,
             summary_run_id=summary_run_id,
+            job_id=job_id,
             job_owner=job_owner,
         )
         if item is None:
@@ -923,6 +986,20 @@ class DailyJobWorker:
                     expected_claim_token=claim_token,
                 )
                 return False
+            if _is_random_id_duplicate_error(exc):
+                # Telegram reports RANDOM_ID_DUPLICATE while an earlier request with the
+                # same random_id is still executing on the server; keep the same random_id
+                # and retry after a short delay without failing trailing chunks.
+                retry_at = datetime.now(timezone.utc) + timedelta(seconds=15)
+                self.store.retry_delivery_outbox(
+                    str(item["outbox_id"]),
+                    error=str(exc),
+                    next_attempt_at=retry_at.isoformat(),
+                    now=utc_now_iso(),
+                    expected_claim_token=claim_token,
+                    preserve_attempt_budget=True,
+                )
+                return True
             if attempts >= DELIVERY_MAX_ATTEMPTS:
                 self.store.fail_delivery_outbox(
                     str(item["outbox_id"]),
@@ -940,6 +1017,14 @@ class DailyJobWorker:
                 expected_claim_token=claim_token,
             )
             return True
+
+
+def _is_random_id_duplicate_error(exc: Exception) -> bool:
+    if getattr(exc, "code", None) == "random_id_duplicate":
+        return True
+    name = exc.__class__.__name__.lower()
+    message = str(exc).lower()
+    return "randomidduplicate" in name or "random_id_duplicate" in message
 
 
 def _is_sqlite_lock_error(exc: sqlite3.OperationalError) -> bool:

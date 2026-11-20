@@ -1347,6 +1347,206 @@ class DailyJobWorkerTest(unittest.TestCase):
             ["out_legacy_keep"],
         )
 
+    def test_completed_job_delivery_recovery_waits_for_other_cli_lock_and_drains(self) -> None:
+        import time
+        from tele_mess_core.cli import _daily_cli_exit_code
+        from tele_mess_core.daily_jobs import DAILY_WORKER_LOCK_FILENAME, DailyWorkerLock
+        from tele_mess_core.models import DailySummaryJobRecord
+
+        self.store.insert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_done_undelivered",
+                status="completed",
+                summary_run_id="sum_done_undelivered",
+                started_at=utc_now_iso(),
+                finished_at=utc_now_iso(),
+            )
+        )
+        self.store.persist_daily_summary_batch(
+            [],
+            [
+                {
+                    "outbox_id": "out_wait_cli_1",
+                    "summary_run_id": "sum_done_undelivered",
+                    "job_id": "job_done_undelivered",
+                    "account_id": "main",
+                    "origin_id": -9001,
+                    "content_kind": "point_summary",
+                    "chunk_index": 1,
+                    "chunk_count": 1,
+                    "content": "needs delivery",
+                }
+            ],
+        )
+
+        # Another CLI holds the lock for a different job: exit code must NOT treat this as service-owned!
+        other_cli_lock = DailyWorkerLock(self.root / DAILY_WORKER_LOCK_FILENAME, owner="cli:other", mode="cli")
+        self.assertTrue(other_cli_lock.try_acquire())
+        try:
+            self.assertEqual(
+                _daily_cli_exit_code(
+                    self.store,
+                    self.config,
+                    {"status": "completed", "job_id": "job_done_undelivered", "summary_run_id": "sum_done_undelivered"},
+                ),
+                1,
+            )
+        finally:
+            other_cli_lock.release()
+
+        # Re-acquire as another CLI, release after 0.15s, and verify recovering CLI waits and drains.
+        self.assertTrue(other_cli_lock.try_acquire())
+        sent: list[str] = []
+
+        class OkRuntime:
+            def __enter__(self) -> OkRuntime:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
+                sent.append(str(kwargs["content"]))
+                return {"status": "sent", "message_ids": [11], "message_count": 1}
+
+        def release_soon() -> None:
+            time.sleep(0.15)
+            other_cli_lock.release()
+
+        releaser = threading.Thread(target=release_soon, daemon=True)
+        releaser.start()
+        try:
+            finished = run_daily_summary_job_from_cli(
+                self.store,
+                self.config,
+                "job_done_undelivered",
+                timeout=5.0,
+                poll_interval=0.02,
+                delivery_runtime_factory=lambda _cfg, _store, _ids: OkRuntime(),
+            )
+        finally:
+            other_cli_lock.release()
+            releaser.join(timeout=2)
+
+        self.assertEqual(finished["status"], "completed")
+        self.assertEqual(sent, ["needs delivery"])
+        rows = self.store.list_delivery_outbox(summary_run_id="sum_done_undelivered")
+        self.assertEqual(rows[0]["status"], "sent")
+
+    def test_random_id_duplicate_on_last_attempt_retries_without_failing_trailing_chunks(self) -> None:
+        from tele_mess_core.telegram.runtime import TelegramOperationError
+
+        self.store.persist_daily_summary_batch(
+            [],
+            [
+                {
+                    "outbox_id": "out_dup_1",
+                    "summary_run_id": "sum_dup",
+                    "account_id": "main",
+                    "origin_id": -9001,
+                    "content_kind": "point_summary",
+                    "chunk_index": 1,
+                    "chunk_count": 2,
+                    "content": "chunk 1",
+                },
+                {
+                    "outbox_id": "out_dup_2",
+                    "summary_run_id": "sum_dup",
+                    "account_id": "main",
+                    "origin_id": -9001,
+                    "content_kind": "point_summary",
+                    "chunk_index": 2,
+                    "chunk_count": 2,
+                    "content": "chunk 2",
+                },
+            ],
+        )
+        with self.store._lock:
+            self.store._conn.execute(
+                "UPDATE delivery_outbox SET attempts = ? WHERE outbox_id = 'out_dup_1'",
+                (DELIVERY_MAX_ATTEMPTS - 1,),
+            )
+            self.store._conn.commit()
+        initial_random_id = self.store.list_delivery_outbox(summary_run_id="sum_dup")[0]["send_random_id"]
+        seen_random_ids: list[int] = []
+        dup_once = {"value": True}
+
+        class DupThenOkRuntime:
+            def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
+                seen_random_ids.append(int(kwargs["random_id"]))
+                if dup_once["value"]:
+                    dup_once["value"] = False
+                    raise TelegramOperationError("random_id_duplicate", "RANDOM_ID_DUPLICATE")
+                return {"status": "sent", "message_ids": [len(seen_random_ids)], "message_count": 1}
+
+        worker = DailyJobWorker(self.store, self.config, telegram_runtime=DupThenOkRuntime())
+        self.assertTrue(worker._deliver_pending_once(summary_run_id="sum_dup"))
+        mid = {row["outbox_id"]: row for row in self.store.list_delivery_outbox(summary_run_id="sum_dup")}
+        self.assertEqual(mid["out_dup_1"]["status"], "retry")
+        self.assertEqual(mid["out_dup_1"]["attempts"], DELIVERY_MAX_ATTEMPTS - 1)
+        self.assertEqual(mid["out_dup_1"]["send_random_id"], initial_random_id)
+        self.assertEqual(mid["out_dup_2"]["status"], "pending")
+
+        # After backoff clears, retry reuses exact same send_random_id and unblocks chunk 2.
+        self.store.reset_retry_backoff_for_summary("sum_dup")
+        self.assertTrue(worker._deliver_pending_once(summary_run_id="sum_dup"))
+        self.assertTrue(worker._deliver_pending_once(summary_run_id="sum_dup"))
+        self.assertFalse(worker._deliver_pending_once(summary_run_id="sum_dup"))
+        final = {row["outbox_id"]: row for row in self.store.list_delivery_outbox(summary_run_id="sum_dup")}
+        self.assertEqual(final["out_dup_1"]["status"], "sent")
+        self.assertEqual(final["out_dup_2"]["status"], "sent")
+        self.assertEqual(seen_random_ids[0], initial_random_id)
+        self.assertEqual(seen_random_ids[1], initial_random_id)
+
+    def test_standalone_cli_recovers_legacy_outbox_matched_by_job_id(self) -> None:
+        from tele_mess_core.models import DailySummaryJobRecord
+
+        self.store.insert_daily_summary_job(
+            DailySummaryJobRecord(
+                job_id="job_legacy_split",
+                status="completed",
+                summary_run_id="sum_new_ref",
+                started_at=utc_now_iso(),
+                finished_at=utc_now_iso(),
+            )
+        )
+        with self.store._lock:
+            self.store._conn.execute(
+                """
+                INSERT INTO delivery_outbox(
+                  outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
+                  content_kind, chunk_index, chunk_count, content, status, attempts,
+                  claim_token, send_random_id, created_at, updated_at
+                )
+                VALUES ('out_old_run_pending', 'sum_old_ref', 'job_legacy_split', 'main', -9001, 0,
+                        'summary', 1, 1, 'legacy pending', 'pending', 0, 0, 555, ?, ?)
+                """,
+                (utc_now_iso(), utc_now_iso()),
+            )
+            self.store._conn.commit()
+        sent: list[str] = []
+
+        class OkRuntime:
+            def __enter__(self) -> OkRuntime:
+                return self
+
+            def __exit__(self, *args: object) -> None:
+                return None
+
+            def call(self, account_id: str, operation: str, **kwargs: object) -> dict[str, object]:
+                sent.append(str(kwargs["content"]))
+                return {"status": "sent", "message_ids": [90], "message_count": 1}
+
+        run_daily_summary_job_from_cli(
+            self.store,
+            self.config,
+            "job_legacy_split",
+            delivery_runtime_factory=lambda _cfg, _store, _ids: OkRuntime(),
+        )
+        self.assertEqual(sent, ["legacy pending"])
+        rows = self.store.list_delivery_outbox(job_id="job_legacy_split")
+        self.assertEqual(rows[0]["status"], "sent")
+
 
 if __name__ == "__main__":
     unittest.main()

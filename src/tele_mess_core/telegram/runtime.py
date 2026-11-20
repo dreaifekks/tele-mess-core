@@ -64,6 +64,14 @@ def classify_telegram_exception(
         return TelegramOperationError("invalid_password", message, "password_needed", HTTPStatus.BAD_REQUEST, error_type=error_type)
     if "sessionpasswordneeded" in lower_name:
         return TelegramOperationError("password_needed", message, "password_needed", HTTPStatus.OK, error_type=error_type)
+    if "randomidduplicate" in lower_name or "random_id_duplicate" in lower_message:
+        return TelegramOperationError(
+            code="random_id_duplicate",
+            message=message,
+            auth_state=default_auth_state,
+            http_status=HTTPStatus.CONFLICT,
+            error_type=error_type,
+        )
     if any(key in lower_name for key in ("authkey", "sessionrevoked", "unauthorized")):
         return TelegramOperationError("needs_login", message, "needs_login", HTTPStatus.UNAUTHORIZED, error_type=error_type)
     if any(key in lower_name for key in ("chatadminrequired", "userprivacyrestricted", "channelprivate")):

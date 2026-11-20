@@ -68,6 +68,8 @@ class TelegramAccountRuntime:
         self._ingest_service: TelegramArchiveService | None = None
         self._ingest_active = False
         self._ingest_retry_delay = INGEST_RETRY_INITIAL_SECONDS
+        self._diagnostic_lock = threading.Lock()
+        self._diagnostic_threads: set[threading.Thread] = set()
 
     async def start(self) -> None:
         if self._supervisor_task and not self._supervisor_task.done():
@@ -94,6 +96,10 @@ class TelegramAccountRuntime:
             await asyncio.gather(task, return_exceptions=True)
         self.client = None
         self._ready.clear()
+        with self._diagnostic_lock:
+            threads = list(self._diagnostic_threads)
+        for thread in threads:
+            thread.join(timeout=2.0)
 
     async def execute(self, operation: str, **kwargs: Any) -> dict[str, Any]:
         if operation == "refresh_capture" and not self.ingest:
@@ -105,17 +111,26 @@ class TelegramAccountRuntime:
             connect_timeout = min(connect_timeout, max(0.0, deadline - time.monotonic()))
         await self._wait_for_connection(timeout=connect_timeout)
         if deadline is None:
-            return await self._execute_under_lock(operation, **kwargs)
+            async with self._command_lock:
+                return await self._execute_locked(operation, **kwargs)
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
-            self._trigger_reconnect_after_timeout(timeout_exc)
             return self._offline_result(operation, error=timeout_exc, **kwargs)
+        lock_acquired = False
+
+        async def run_with_lock() -> dict[str, Any]:
+            nonlocal lock_acquired
+            async with self._command_lock:
+                lock_acquired = True
+                return await self._execute_locked(operation, **kwargs)
+
         try:
-            return await asyncio.wait_for(self._execute_under_lock(operation, **kwargs), timeout=remaining)
+            return await asyncio.wait_for(run_with_lock(), timeout=remaining)
         except TimeoutError:
             timeout_exc = TimeoutError(f"Telegram {operation} timed out after {budget:g} seconds")
-            self._trigger_reconnect_after_timeout(timeout_exc)
+            if lock_acquired:
+                self._trigger_reconnect_after_timeout(timeout_exc)
             return self._offline_result(operation, error=timeout_exc, **kwargs)
 
     def _operation_timeout(self, operation: str) -> float | None:
@@ -131,63 +146,62 @@ class TelegramAccountRuntime:
         self._reconnect_now.set()
         self._force_disconnect.set()
 
-    async def _execute_under_lock(self, operation: str, **kwargs: Any) -> dict[str, Any]:
-        async with self._command_lock:
-            client = self.client
-            if client is None or not self._ready.is_set():
-                return self._offline_result(operation, **kwargs)
-            if operation == "auth_status":
-                result = await TelegramAuthService(self.config, self.store).status(client=client)
-                if result.get("authorized"):
-                    self._schedule_ingestion(client)
-                return result
-            if operation == "request_code":
-                return await TelegramAuthService(self.config, self.store).request_code(
-                    str(kwargs["phone"]),
-                    client=client,
-                )
-            if operation == "submit_code":
-                result = await TelegramAuthService(self.config, self.store).submit_code(
-                    str(kwargs["phone"]),
-                    str(kwargs["code"]),
-                    kwargs.get("password"),
-                    client=client,
-                )
-                if result.get("authorized"):
-                    self._schedule_ingestion(client)
-                return result
-            if operation == "discover_origins":
-                return await TelegramDiscoveryService(self.config, self.store).discover_origins(
-                    include_topics=bool(kwargs.get("include_topics", True)),
-                    topic_limit=int(kwargs.get("topic_limit", 100)),
-                    include_private=bool(kwargs.get("include_private", False)),
-                    client=client,
-                )
-            if operation == "refresh_participants":
-                return await TelegramDiscoveryService(self.config, self.store).refresh_participants(
-                    int(kwargs["origin_id"]),
-                    int(kwargs.get("limit", 500)),
-                    client=client,
-                )
-            if operation == "deliver_chunk":
-                return await TelegramSummaryDeliveryService(self.config, self.store).send_chunk(
-                    kwargs["delivery"],
-                    str(kwargs.get("content") or ""),
-                    client=client,
-                    random_id=kwargs.get("random_id"),
-                )
-            if operation == "refresh_capture":
-                if not await client.is_user_authorized():
-                    return {"account_id": self.config.account_id, "status": "needs_login"}
-                was_attached = self._ingest_active
+    async def _execute_locked(self, operation: str, **kwargs: Any) -> dict[str, Any]:
+        client = self.client
+        if client is None or not self._ready.is_set():
+            return self._offline_result(operation, **kwargs)
+        if operation == "auth_status":
+            result = await TelegramAuthService(self.config, self.store).status(client=client)
+            if result.get("authorized"):
                 self._schedule_ingestion(client)
-                task = self._ingest_task
-                if task is not None:
-                    await asyncio.shield(task)
-                if was_attached and self._ingest_service is not None:
-                    await self._ingest_service.refresh_capture_targets()
-                return {"account_id": self.config.account_id, "status": "refreshed"}
-            raise ValueError(f"Unknown Telegram runtime operation: {operation}")
+            return result
+        if operation == "request_code":
+            return await TelegramAuthService(self.config, self.store).request_code(
+                str(kwargs["phone"]),
+                client=client,
+            )
+        if operation == "submit_code":
+            result = await TelegramAuthService(self.config, self.store).submit_code(
+                str(kwargs["phone"]),
+                str(kwargs["code"]),
+                kwargs.get("password"),
+                client=client,
+            )
+            if result.get("authorized"):
+                self._schedule_ingestion(client)
+            return result
+        if operation == "discover_origins":
+            return await TelegramDiscoveryService(self.config, self.store).discover_origins(
+                include_topics=bool(kwargs.get("include_topics", True)),
+                topic_limit=int(kwargs.get("topic_limit", 100)),
+                include_private=bool(kwargs.get("include_private", False)),
+                client=client,
+            )
+        if operation == "refresh_participants":
+            return await TelegramDiscoveryService(self.config, self.store).refresh_participants(
+                int(kwargs["origin_id"]),
+                int(kwargs.get("limit", 500)),
+                client=client,
+            )
+        if operation == "deliver_chunk":
+            return await TelegramSummaryDeliveryService(self.config, self.store).send_chunk(
+                kwargs["delivery"],
+                str(kwargs.get("content") or ""),
+                client=client,
+                random_id=kwargs.get("random_id"),
+            )
+        if operation == "refresh_capture":
+            if not await client.is_user_authorized():
+                return {"account_id": self.config.account_id, "status": "needs_login"}
+            was_attached = self._ingest_active
+            self._schedule_ingestion(client)
+            task = self._ingest_task
+            if task is not None:
+                await asyncio.shield(task)
+            if was_attached and self._ingest_service is not None:
+                await self._ingest_service.refresh_capture_targets()
+            return {"account_id": self.config.account_id, "status": "refreshed"}
+        raise ValueError(f"Unknown Telegram runtime operation: {operation}")
 
     async def _notify_attempt(self) -> None:
         async with self._attempt_cv:
@@ -228,24 +242,35 @@ class TelegramAccountRuntime:
             f"Telegram account {self.config.account_id} is not connected"
         )
         if operation == "auth_status":
-            return TelegramAuthService(self.config, self.store).status_error_result(exc)
+            service = TelegramAuthService(self.config, self.store)
+            result = service.status_error_result(exc, persist=False)
+            self._schedule_offline_diagnostic(lambda: service.status_error_result(exc, persist=True))
+            return result
         if operation == "request_code":
-            return TelegramAuthService(self.config, self.store).request_code_error_result(
-                str(kwargs["phone"]),
-                exc,
-            )
+            phone = str(kwargs["phone"])
+            service = TelegramAuthService(self.config, self.store)
+            result = service.request_code_error_result(phone, exc, persist=False)
+            self._schedule_offline_diagnostic(lambda: service.request_code_error_result(phone, exc, persist=True))
+            return result
         if operation == "submit_code":
-            return TelegramAuthService(self.config, self.store).submit_code_error_result(
-                str(kwargs["phone"]),
-                exc,
-            )
+            phone = str(kwargs["phone"])
+            service = TelegramAuthService(self.config, self.store)
+            result = service.submit_code_error_result(phone, exc, persist=False)
+            self._schedule_offline_diagnostic(lambda: service.submit_code_error_result(phone, exc, persist=True))
+            return result
         if operation == "discover_origins":
-            return TelegramDiscoveryService(self.config, self.store).discover_origins_error_result(exc)
+            service = TelegramDiscoveryService(self.config, self.store)
+            result = service.discover_origins_error_result(exc, persist=False)
+            self._schedule_offline_diagnostic(lambda: service.discover_origins_error_result(exc, persist=True))
+            return result
         if operation == "refresh_participants":
-            return TelegramDiscoveryService(self.config, self.store).refresh_participants_error_result(
-                int(kwargs["origin_id"]),
-                exc,
+            origin_id = int(kwargs["origin_id"])
+            service = TelegramDiscoveryService(self.config, self.store)
+            result = service.refresh_participants_error_result(origin_id, exc, persist=False)
+            self._schedule_offline_diagnostic(
+                lambda: service.refresh_participants_error_result(origin_id, exc, persist=True)
             )
+            return result
         if operation == "deliver_chunk":
             raise TelegramSummaryDeliveryService(self.config, self.store).record_delivery_error(
                 kwargs["delivery"],
@@ -254,6 +279,37 @@ class TelegramAccountRuntime:
         if operation == "refresh_capture":
             return {"account_id": self.config.account_id, "status": "offline"}
         raise ValueError(f"Unknown Telegram runtime operation: {operation}")
+
+    def _schedule_offline_diagnostic(self, writer: Callable[[], Any]) -> None:
+        """Persist offline diagnostic state off the HTTP response path so SQLite contention never blocks or fails it."""
+        if self._stopping.is_set():
+            return
+
+        def run() -> None:
+            try:
+                conn = getattr(self.store, "_conn", None)
+                if conn is not None:
+                    conn.execute("PRAGMA busy_timeout = 200")
+                writer()
+            except Exception:
+                self.logger.debug("Best-effort offline diagnostic write failed", exc_info=True)
+            finally:
+                try:
+                    self.store.close_thread_connection()
+                except Exception:
+                    pass
+                with self._diagnostic_lock:
+                    self._diagnostic_threads.discard(threading.current_thread())
+
+        thread = threading.Thread(
+            target=run,
+            name=f"telegram-offline-diag-{self.config.account_id}",
+            daemon=True,
+        )
+        with self._diagnostic_lock:
+            self._diagnostic_threads = {item for item in self._diagnostic_threads if item.is_alive()}
+            self._diagnostic_threads.add(thread)
+        thread.start()
 
     def status(self) -> dict[str, Any]:
         supervisor = self._supervisor_task
@@ -586,7 +642,6 @@ class TelegramRuntimeManager:
             if operation in MANAGEMENT_OPERATIONS:
                 runtime = self._runtimes.get(account_id)
                 if runtime is not None:
-                    loop.call_soon_threadsafe(runtime._trigger_reconnect_after_timeout, exc)
                     return runtime._offline_result(operation, error=exc, **kwargs)
             raise
 

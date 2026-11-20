@@ -26,16 +26,17 @@ class TelegramAuthService:
         except Exception as exc:
             return self.status_error_result(exc)
 
-    def status_error_result(self, exc: Exception) -> dict[str, Any]:
+    def status_error_result(self, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="auth_status_failed")
-        self._record_state(error.auth_state, last_error=error.message)
-        self._record_operation("auth_status", "failed", error=error)
-        return {
+        result = {
             "account_id": self.account_id,
             "auth_state": error.auth_state,
             "authorized": False,
             "error": error.to_public_dict(),
         }
+        if persist:
+            self._persist_error_diagnostic("auth_status", "failed", error)
+        return result
 
     async def request_code(self, phone: str, client: Any) -> dict[str, Any]:
         try:
@@ -52,17 +53,23 @@ class TelegramAuthService:
         except Exception as exc:
             return self.request_code_error_result(phone, exc)
 
-    def request_code_error_result(self, phone: str, exc: Exception) -> dict[str, Any]:
+    def request_code_error_result(self, phone: str, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="request_code_failed")
-        self._record_state(error.auth_state, phone=phone, last_error=error.message)
-        self._record_operation("request_code", "rate_limited" if error.code == "flood_wait" else "failed", error=error)
-        return {
+        result = {
             "account_id": self.account_id,
             "auth_state": error.auth_state,
             "phone": phone,
             "sent": False,
             "error": error.to_public_dict(),
         }
+        if persist:
+            self._persist_error_diagnostic(
+                "request_code",
+                "rate_limited" if error.code == "flood_wait" else "failed",
+                error,
+                phone=phone,
+            )
+        return result
 
     async def submit_code(
         self,
@@ -95,20 +102,49 @@ class TelegramAuthService:
         self._record_state("authorized", phone=phone)
         return {"account_id": self.account_id, "auth_state": "authorized", "authorized": True}
 
-    def submit_code_error_result(self, phone: str, exc: Exception) -> dict[str, Any]:
+    def submit_code_error_result(self, phone: str, exc: Exception, *, persist: bool = True) -> dict[str, Any]:
         error = classify_telegram_exception(exc, default_code="submit_code_failed")
-        self._record_state(error.auth_state, phone=phone, last_error=error.message)
-        self._record_operation(
-            "submit_code",
-            "rate_limited" if error.code == "flood_wait" else "failed",
-            error=error,
-        )
-        return {
+        result = {
             "account_id": self.account_id,
             "auth_state": error.auth_state,
             "authorized": False,
             "error": error.to_public_dict(),
         }
+        if persist:
+            self._persist_error_diagnostic(
+                "submit_code",
+                "rate_limited" if error.code == "flood_wait" else "failed",
+                error,
+                phone=phone,
+            )
+        return result
+
+    def _persist_error_diagnostic(
+        self,
+        operation: str,
+        status: str,
+        error: Any,
+        *,
+        phone: str | None = None,
+    ) -> None:
+        try:
+            self._record_state(error.auth_state, phone=phone, last_error=error.message)
+        except Exception:
+            self.logger.warning(
+                "Failed to persist auth error state for account %s (%s)",
+                self.account_id,
+                operation,
+                exc_info=True,
+            )
+        try:
+            self._record_operation(operation, status, error=error)
+        except Exception:
+            self.logger.warning(
+                "Failed to persist auth operation event for account %s (%s)",
+                self.account_id,
+                operation,
+                exc_info=True,
+            )
 
     def _record_state(
         self,

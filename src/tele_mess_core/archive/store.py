@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone as dt_timezone
 import functools
 import json
 import re
@@ -33,7 +34,7 @@ from tele_mess_core.models import (
     UserRecord,
     utc_now_iso,
 )
-from tele_mess_core.archive.migrations import apply_migrations, outbox_send_random_id
+from tele_mess_core.archive.migrations import _migration_20, apply_migrations, outbox_send_random_id
 from tele_mess_core.media import (
     classify_media_type,
     media_file_extension,
@@ -254,7 +255,11 @@ class ArchiveStore:
         """Whether every table, index, and trigger of the snapshot exists; an older
         release recreated them on each open, so an interrupted open can leave one missing."""
         existing = {str(row[0]) for row in self._conn.execute("SELECT name FROM sqlite_master")}
-        return _schema_object_names() <= existing
+        return (
+            _schema_object_names() <= existing
+            and self._has_column("delivery_outbox", "claim_token")
+            and self._has_column("delivery_outbox", "send_random_id")
+        )
 
     def _rebuild_message_fts(self) -> None:
         self._conn.execute("INSERT INTO message_fts(message_fts) VALUES('rebuild')")
@@ -1703,10 +1708,10 @@ class ArchiveStore:
     ) -> dict[str, Any] | None:
         required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
         placeholders = ", ".join("?" for _ in required_statuses)
-        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                effective_now = now or utc_now_iso()
                 owner = self._conn.execute(
                     f"""
                     SELECT 1 FROM daily_summary_jobs
@@ -1843,10 +1848,10 @@ class ArchiveStore:
     ) -> dict[str, Any] | None:
         required_statuses = ("running",) if run.status == "completed" else ("running", "cancel_requested")
         placeholders = ", ".join("?" for _ in required_statuses)
-        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                effective_now = now or utc_now_iso()
                 owner = self._conn.execute(
                     f"""
                     SELECT 1 FROM daily_summary_jobs
@@ -2123,8 +2128,9 @@ class ArchiveStore:
         attempt: int,
         *,
         progress: dict[str, Any],
-        lease_until: str,
-        now: str,
+        lease_until: str | None = None,
+        now: str | None = None,
+        lease_seconds: float | None = None,
         package_run_id: str | None = None,
         summary_run_id: str | None = None,
         date: str | None = None,
@@ -2136,46 +2142,59 @@ class ArchiveStore:
         progress_label = str(progress.get("label") or "running")
         progress_json = json.dumps(progress, ensure_ascii=False, sort_keys=True)
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE daily_summary_jobs
-                SET date = COALESCE(?, date),
-                    timezone = COALESCE(?, timezone),
-                    package_run_id = COALESCE(?, package_run_id),
-                    summary_run_id = COALESCE(?, summary_run_id),
-                    provider = COALESCE(?, provider),
-                    progress_total = ?,
-                    progress_current = ?,
-                    progress_label = ?,
-                    progress_json = ?,
-                    lease_until = ?,
-                    heartbeat_at = ?,
-                    updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND attempt = ?
-                  AND status IN ('running', 'cancel_requested')
-                  AND lease_until IS NOT NULL AND lease_until >= ?
-                """,
-                (
-                    date,
-                    timezone,
-                    package_run_id,
-                    summary_run_id,
-                    provider,
-                    progress_total,
-                    progress_current,
-                    progress_label,
-                    progress_json,
-                    lease_until,
-                    now,
-                    now,
-                    job_id,
-                    worker_id,
-                    int(attempt),
-                    now,
-                ),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now_dt = datetime.now(dt_timezone.utc)
+                effective_now = now or now_dt.isoformat()
+                if lease_until is not None:
+                    effective_lease_until = lease_until
+                elif lease_seconds is not None:
+                    effective_lease_until = (now_dt + timedelta(seconds=float(lease_seconds))).isoformat()
+                else:
+                    raise ValueError("lease_until or lease_seconds is required")
+                cur = self._conn.execute(
+                    """
+                    UPDATE daily_summary_jobs
+                    SET date = COALESCE(?, date),
+                        timezone = COALESCE(?, timezone),
+                        package_run_id = COALESCE(?, package_run_id),
+                        summary_run_id = COALESCE(?, summary_run_id),
+                        provider = COALESCE(?, provider),
+                        progress_total = ?,
+                        progress_current = ?,
+                        progress_label = ?,
+                        progress_json = ?,
+                        lease_until = ?,
+                        heartbeat_at = ?,
+                        updated_at = ?
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ('running', 'cancel_requested')
+                      AND lease_until IS NOT NULL AND lease_until >= ?
+                    """,
+                    (
+                        date,
+                        timezone,
+                        package_run_id,
+                        summary_run_id,
+                        provider,
+                        progress_total,
+                        progress_current,
+                        progress_label,
+                        progress_json,
+                        effective_lease_until,
+                        effective_now,
+                        effective_now,
+                        job_id,
+                        worker_id,
+                        int(attempt),
+                        effective_now,
+                    ),
+                )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def renew_daily_summary_job_lease(
         self,
@@ -2183,22 +2202,36 @@ class ArchiveStore:
         worker_id: str,
         attempt: int,
         *,
-        now: str,
-        lease_until: str,
+        now: str | None = None,
+        lease_until: str | None = None,
+        lease_seconds: float | None = None,
     ) -> bool:
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE daily_summary_jobs
-                SET heartbeat_at = ?, lease_until = ?, updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND attempt = ?
-                  AND status IN ('running', 'cancel_requested')
-                  AND lease_until IS NOT NULL AND lease_until >= ?
-                """,
-                (now, lease_until, now, job_id, worker_id, int(attempt), now),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now_dt = datetime.now(dt_timezone.utc)
+                effective_now = now or now_dt.isoformat()
+                if lease_until is not None:
+                    effective_lease_until = lease_until
+                elif lease_seconds is not None:
+                    effective_lease_until = (now_dt + timedelta(seconds=float(lease_seconds))).isoformat()
+                else:
+                    raise ValueError("lease_until or lease_seconds is required")
+                cur = self._conn.execute(
+                    """
+                    UPDATE daily_summary_jobs
+                    SET heartbeat_at = ?, lease_until = ?, updated_at = ?
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ?
+                      AND status IN ('running', 'cancel_requested')
+                      AND lease_until IS NOT NULL AND lease_until >= ?
+                    """,
+                    (effective_now, effective_lease_until, effective_now, job_id, worker_id, int(attempt), effective_now),
+                )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def finish_daily_summary_job(
         self,
@@ -2208,7 +2241,7 @@ class ArchiveStore:
         *,
         status: str,
         progress: dict[str, Any],
-        now: str,
+        now: str | None = None,
         package_run_id: str | None = None,
         summary_run_id: str | None = None,
         date: str | None = None,
@@ -2228,6 +2261,7 @@ class ArchiveStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                effective_now = now or utc_now_iso()
                 cur = self._conn.execute(
                     f"""
                     UPDATE daily_summary_jobs
@@ -2263,14 +2297,14 @@ class ArchiveStore:
                         progress_label,
                         progress_json,
                         error,
-                        now,
-                        now,
-                        now,
+                        effective_now,
+                        effective_now,
+                        effective_now,
                         job_id,
                         worker_id,
                         int(attempt),
                         *allowed,
-                        now,
+                        effective_now,
                     ),
                 )
                 updated = cur.rowcount > 0
@@ -2280,7 +2314,7 @@ class ArchiveStore:
                         (job_id,),
                     )
                 if updated and status == "canceled":
-                    self._close_canceled_job_runs(now)
+                    self._close_canceled_job_runs(effective_now)
                 self._conn.commit()
                 return updated
             except Exception:
@@ -2301,11 +2335,12 @@ class ArchiveStore:
         worker_id: str,
         attempt: int,
         *,
-        now: str,
+        now: str | None = None,
     ) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                effective_now = now or utc_now_iso()
                 cur = self._conn.execute(
                     """
                     UPDATE daily_summary_jobs
@@ -2331,11 +2366,11 @@ class ArchiveStore:
                       AND status IN ('running', 'cancel_requested')
                       AND lease_until IS NOT NULL AND lease_until >= ?
                     """,
-                    (now, now, job_id, worker_id, int(attempt), now),
+                    (effective_now, effective_now, job_id, worker_id, int(attempt), effective_now),
                 )
                 requeued = cur.rowcount > 0
                 if requeued:
-                    self._close_canceled_job_runs(now)
+                    self._close_canceled_job_runs(effective_now)
                 self._conn.commit()
                 return requeued
             except Exception:
@@ -2370,42 +2405,56 @@ class ArchiveStore:
         worker_id: str,
         attempt: int,
         *,
-        retry_at: str,
+        retry_at: str | None = None,
+        retry_delay_seconds: int | None = None,
         max_retries: int,
         progress_label: str,
         progress_json: str,
         error: str | None,
-        now: str,
+        now: str | None = None,
     ) -> bool:
         if max_retries <= 0:
             return False
         with self._lock:
-            cur = self._conn.execute(
-                """
-                UPDATE daily_summary_jobs
-                SET status = 'queued', retry_at = ?, retry_count = retry_count + 1,
-                    worker_id = NULL, lease_until = NULL, heartbeat_at = NULL,
-                    progress_label = ?, progress_json = ?, error = ?,
-                    finished_at = NULL, updated_at = ?
-                WHERE job_id = ? AND worker_id = ? AND attempt = ? AND status = 'running'
-                  AND lease_until IS NOT NULL AND lease_until >= ?
-                  AND cancel_requested_at IS NULL AND retry_count < ?
-                """,
-                (
-                    retry_at,
-                    progress_label,
-                    progress_json,
-                    error,
-                    now,
-                    job_id,
-                    worker_id,
-                    int(attempt),
-                    now,
-                    int(max_retries),
-                ),
-            )
-            self._conn.commit()
-            return cur.rowcount > 0
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                now_dt = datetime.now(dt_timezone.utc)
+                effective_now = now or now_dt.isoformat()
+                if retry_at is not None:
+                    effective_retry_at = retry_at
+                elif retry_delay_seconds is not None:
+                    effective_retry_at = (now_dt + timedelta(seconds=max(0, int(retry_delay_seconds)))).isoformat()
+                else:
+                    raise ValueError("retry_at or retry_delay_seconds is required")
+                cur = self._conn.execute(
+                    """
+                    UPDATE daily_summary_jobs
+                    SET status = 'queued', retry_at = ?, retry_count = retry_count + 1,
+                        worker_id = NULL, lease_until = NULL, heartbeat_at = NULL,
+                        progress_label = ?, progress_json = ?, error = ?,
+                        finished_at = NULL, updated_at = ?
+                    WHERE job_id = ? AND worker_id = ? AND attempt = ? AND status = 'running'
+                      AND lease_until IS NOT NULL AND lease_until >= ?
+                      AND cancel_requested_at IS NULL AND retry_count < ?
+                    """,
+                    (
+                        effective_retry_at,
+                        progress_label,
+                        progress_json,
+                        error,
+                        effective_now,
+                        job_id,
+                        worker_id,
+                        int(attempt),
+                        effective_now,
+                        int(max_retries),
+                    ),
+                )
+                self._conn.commit()
+                return cur.rowcount > 0
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def request_daily_summary_job_cancel(self, job_id: str) -> dict[str, Any] | None:
         now = utc_now_iso()
@@ -2848,10 +2897,10 @@ class ArchiveStore:
         job_owner: tuple[str, str, int] | None = None,
         now: str | None = None,
     ) -> dict[str, Any] | None:
-        effective_now = now or utc_now_iso()
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                effective_now = now or utc_now_iso()
                 if job_owner is not None:
                     job_id, worker_id, attempt = job_owner
                     owner = self._conn.execute(
@@ -2941,15 +2990,22 @@ class ArchiveStore:
         self,
         *,
         summary_run_id: str | None = None,
+        job_id: str | None = None,
         status: str | None = None,
         limit: int = 500,
     ) -> list[dict[str, Any]]:
         sql = "SELECT * FROM delivery_outbox"
         clauses: list[str] = []
         params: list[Any] = []
-        if summary_run_id:
+        if summary_run_id and job_id:
+            clauses.append("(summary_run_id = ? OR job_id = ?)")
+            params.extend([summary_run_id, job_id])
+        elif summary_run_id:
             clauses.append("summary_run_id = ?")
             params.append(summary_run_id)
+        elif job_id:
+            clauses.append("job_id = ?")
+            params.append(job_id)
         if status:
             clauses.append("status = ?")
             params.append(status)
@@ -2961,16 +3017,31 @@ class ArchiveStore:
             rows = self._conn.execute(sql, tuple(params)).fetchall()
         return [dict(row) for row in rows]
 
-    def reset_retry_backoff_for_summary(self, summary_run_id: str) -> int:
-        """Clear retry backoff timestamps for one summary run so standalone recovery retries immediately."""
+    def reset_retry_backoff_for_summary(
+        self,
+        summary_run_id: str | None = None,
+        *,
+        job_id: str | None = None,
+    ) -> int:
+        """Clear retry backoff timestamps for one summary run or job so standalone recovery retries immediately."""
+        match_clauses: list[str] = []
+        params: list[Any] = []
+        if summary_run_id:
+            match_clauses.append("summary_run_id = ?")
+            params.append(summary_run_id)
+        if job_id:
+            match_clauses.append("job_id = ?")
+            params.append(job_id)
+        if not match_clauses:
+            return 0
         with self._lock:
             cur = self._conn.execute(
-                """
+                f"""
                 UPDATE delivery_outbox
                 SET next_attempt_at = NULL
-                WHERE summary_run_id = ? AND status = 'retry'
+                WHERE status = 'retry' AND ({' OR '.join(match_clauses)})
                 """,
-                (summary_run_id,),
+                tuple(params),
             )
             self._conn.commit()
             return max(cur.rowcount, 0)
@@ -2978,17 +3049,26 @@ class ArchiveStore:
     def claim_delivery_outbox(
         self,
         *,
-        now: str,
-        stale_before: str,
+        now: str | None = None,
+        stale_before: str | None = None,
+        stale_seconds: float = 300.0,
         summary_run_id: str | None = None,
+        job_id: str | None = None,
         job_owner: tuple[str, str, int] | None = None,
     ) -> dict[str, Any] | None:
         claimed: dict[str, Any] | None = None
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                now_dt = datetime.now(dt_timezone.utc)
+                effective_now = now or now_dt.isoformat()
+                effective_stale_before = (
+                    stale_before
+                    if stale_before is not None
+                    else (now_dt - timedelta(seconds=float(stale_seconds))).isoformat()
+                )
                 if job_owner is not None:
-                    job_id, worker_id, attempt = job_owner
+                    owner_job_id, worker_id, attempt = job_owner
                     owner = self._conn.execute(
                         """
                         SELECT 1 FROM daily_summary_jobs
@@ -2996,7 +3076,7 @@ class ArchiveStore:
                           AND status = 'running'
                           AND lease_until IS NOT NULL AND lease_until >= ?
                         """,
-                        (job_id, worker_id, int(attempt), now),
+                        (owner_job_id, worker_id, int(attempt), effective_now),
                     ).fetchone()
                     if owner is None:
                         self._conn.rollback()
@@ -3005,16 +3085,22 @@ class ArchiveStore:
                     "(o.status IN ('pending', 'retry') AND (o.next_attempt_at IS NULL OR o.next_attempt_at <= ?))",
                     "(o.status = 'sending' AND o.updated_at < ?)",
                 ]
-                params: list[Any] = [now, stale_before]
-                summary_clause = ""
-                if summary_run_id:
-                    summary_clause = " AND o.summary_run_id = ?"
+                params: list[Any] = [effective_now, effective_stale_before]
+                scope_clause = ""
+                if summary_run_id and job_id:
+                    scope_clause = " AND (o.summary_run_id = ? OR o.job_id = ?)"
+                    params.extend([summary_run_id, job_id])
+                elif summary_run_id:
+                    scope_clause = " AND o.summary_run_id = ?"
                     params.append(summary_run_id)
+                elif job_id:
+                    scope_clause = " AND o.job_id = ?"
+                    params.append(job_id)
                 row = self._conn.execute(
                     f"""
                     SELECT o.outbox_id
                     FROM delivery_outbox o
-                    WHERE ({' OR '.join(clauses)}){summary_clause}
+                    WHERE ({' OR '.join(clauses)}){scope_clause}
                       AND NOT EXISTS (
                         SELECT 1 FROM delivery_outbox previous
                         WHERE previous.summary_run_id = o.summary_run_id
@@ -3041,7 +3127,7 @@ class ArchiveStore:
                             updated_at = ?
                         WHERE outbox_id = ?
                         """,
-                        (now, outbox_id),
+                        (effective_now, outbox_id),
                     )
                     claimed_row = self._conn.execute(
                         "SELECT * FROM delivery_outbox WHERE outbox_id = ?",
@@ -3084,12 +3170,15 @@ class ArchiveStore:
         next_attempt_at: str,
         now: str,
         expected_claim_token: int,
+        preserve_attempt_budget: bool = False,
     ) -> bool:
+        attempt_expr = "MAX(0, attempts - 1)" if preserve_attempt_budget else "attempts"
         with self._lock:
             cur = self._conn.execute(
-                """
+                f"""
                 UPDATE delivery_outbox
-                SET status = 'retry', last_error = ?, next_attempt_at = ?, updated_at = ?
+                SET status = 'retry', attempts = {attempt_expr}, last_error = ?,
+                    next_attempt_at = ?, updated_at = ?
                 WHERE outbox_id = ? AND status = 'sending' AND claim_token = ?
                 """,
                 (error, next_attempt_at, now, outbox_id, int(expected_claim_token)),
@@ -3913,6 +4002,16 @@ class ArchiveStore:
                 """
             )
         self._ensure_column("daily_summary_records", "deleted_at", "TEXT")
+        if (
+            self._has_table("delivery_outbox")
+            and self._has_column("delivery_outbox", "content_kind")
+            and (
+                not self._has_column("delivery_outbox", "claim_token")
+                or not self._has_column("delivery_outbox", "send_random_id")
+            )
+        ):
+            _migration_20(self._conn)
+            self._conn.commit()
 
     def _ensure_column(self, table: str, column: str, definition: str) -> None:
         if self._has_table(table) and not self._has_column(table, column):

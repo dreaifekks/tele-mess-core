@@ -354,16 +354,23 @@ def _migration_20(connection: sqlite3.Connection) -> None:
             SELECT
               outbox_id, summary_run_id, job_id, account_id, origin_id, topic_id,
               'summary', chunk_index, chunk_count, content,
-              CASE WHEN status = 'sending' THEN 'failed' ELSE status END,
+              CASE
+                WHEN status = 'sending' OR (status = 'retry' AND attempts > 0) THEN 'failed'
+                ELSE status
+              END,
               attempts,
               attempts,
               NULL,
               message_id,
               CASE
                 WHEN status = 'sending' THEN COALESCE(last_error, 'migrated_in_flight_sending_uncertain')
+                WHEN status = 'retry' AND attempts > 0 THEN COALESCE(last_error, 'migrated_attempted_delivery_uncertain')
                 ELSE last_error
               END,
-              CASE WHEN status = 'sending' THEN NULL ELSE next_attempt_at END,
+              CASE
+                WHEN status = 'sending' OR (status = 'retry' AND attempts > 0) THEN NULL
+                ELSE next_attempt_at
+              END,
               created_at, updated_at, sent_at
             FROM delivery_outbox
             """

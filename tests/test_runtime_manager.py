@@ -437,6 +437,64 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
         finally:
             await manager.stop()
 
+    async def test_queued_management_timeout_does_not_disconnect_active_delivery(self) -> None:
+        from tele_mess_core.config import DailyDeliveryConfig
+
+        send_started = asyncio.Event()
+        release_send = asyncio.Event()
+        disconnects = 0
+
+        class SlowSendClient(FakeClient):
+            async def get_entity(self, origin_id: int) -> str:
+                return f"entity:{origin_id}"
+
+            async def send_message(self, entity: object, body: str, **kwargs: object) -> object:
+                send_started.set()
+                await release_send.wait()
+
+                class Sent:
+                    id = 88
+
+                return Sent()
+
+            async def disconnect(self) -> None:
+                nonlocal disconnects
+                disconnects += 1
+                await super().disconnect()
+
+        client = SlowSendClient(authorized=True)
+        manager = TelegramRuntimeManager(
+            self.config,
+            self.store,
+            client_factory=lambda _cfg: client,
+            ingest=False,
+            connect_wait_seconds=1.0,
+            management_timeout_seconds=0.1,
+            delivery_timeout_seconds=2.0,
+        )
+        await manager.start()
+        try:
+            delivery = DailyDeliveryConfig(enabled=True, account_id="main", origin_id=-9001)
+            delivery_task = asyncio.create_task(
+                manager.execute("main", "deliver_chunk", delivery=delivery, content="hello")
+            )
+            await asyncio.wait_for(send_started.wait(), timeout=2.0)
+
+            # Management op times out waiting on _command_lock, NOT on the client itself.
+            auth_result = await manager.execute("main", "auth_status")
+            self.assertFalse(auth_result["authorized"])
+            self.assertEqual(auth_result["error"]["code"], "auth_status_failed")
+            self.assertEqual(disconnects, 0)
+            self.assertTrue(manager.statuses()[0]["connected"])
+
+            # In-flight delivery completes cleanly on the uninterrupted client.
+            release_send.set()
+            delivered = await asyncio.wait_for(delivery_task, timeout=2.0)
+            self.assertEqual(delivered["status"], "sent")
+            self.assertEqual(delivered["message_ids"], [88])
+        finally:
+            await manager.stop()
+
 
 class ConfiguredAccountSyncTest(unittest.TestCase):
     def test_bootstrap_preserves_observed_auth_state(self) -> None:
