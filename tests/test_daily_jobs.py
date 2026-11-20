@@ -47,7 +47,17 @@ class DailyJobWorkerTest(unittest.TestCase):
         )
         self.config = AppConfig(
             storage=StorageConfig(data_dir=self.root, database=self.root / "archive.db"),
-            telegram=TelegramConfig(),
+            telegram=TelegramConfig(
+                accounts=[
+                    TelegramAccountConfig(
+                        account_id="main",
+                        api_id=1,
+                        api_hash="test",
+                        session_name="main",
+                        session_dir=self.root / "sessions",
+                    )
+                ]
+            ),
             server=ServerConfig(token="secret"),
             logging=LoggingConfig(file=None),
             daily=DailyPackagingConfig(

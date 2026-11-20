@@ -2,10 +2,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
 import yaml
+
+from tele_mess_core.models import SOURCE_TELEGRAM
+
+if TYPE_CHECKING:
+    from tele_mess_core.archive import ArchiveStore
 
 
 @dataclass(slots=True)
@@ -268,6 +273,34 @@ def app_workspace_dir(config: AppConfig) -> Path:
 
 def resolve_workspace_path(config: AppConfig, value: str | Path) -> Path:
     return _resolve_path(app_workspace_dir(config), value)
+
+
+def resolve_account_config(config: AppConfig, store: ArchiveStore, account_id: str) -> TelegramAccountConfig:
+    """Return a configured Telegram account, or one built for an account managed in SQLite."""
+    for account in config.telegram.accounts:
+        if account.account_id == account_id:
+            return account
+    for item in store.list_management_accounts():
+        if item.get("source") == SOURCE_TELEGRAM and item.get("account_id") == account_id:
+            return stored_account_config(config, item)
+    raise ValueError(f"Unknown account_id: {account_id}")
+
+
+def stored_account_config(config: AppConfig, item: dict[str, Any]) -> TelegramAccountConfig:
+    """Build the config of a SQLite-managed account on the first configured account's API credentials."""
+    if not config.telegram.accounts:
+        raise ValueError("At least one configured Telegram account is required as an API credential template")
+    template = config.telegram.accounts[0]
+    account_id = str(item["account_id"])
+    session_dir_raw = item.get("session_dir")
+    return TelegramAccountConfig(
+        account_id=account_id,
+        api_id=template.api_id,
+        api_hash=template.api_hash,
+        session_name=str(item.get("session_name") or account_id),
+        session_dir=resolve_workspace_path(config, str(session_dir_raw)) if session_dir_raw else template.session_dir,
+        timezone=template.timezone,
+    )
 
 
 def _parse_backfill(raw: Any) -> BackfillConfig:

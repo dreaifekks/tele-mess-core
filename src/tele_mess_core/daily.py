@@ -28,9 +28,8 @@ from tele_mess_core.codex_limits import (
 from tele_mess_core.config import (
     AppConfig,
     DailyDeliveryConfig,
-    TelegramAccountConfig,
     app_workspace_dir,
-    resolve_workspace_path,
+    resolve_account_config,
 )
 from tele_mess_core.models import (
     DailyPackageRunRecord,
@@ -1042,7 +1041,7 @@ def deliver_daily_summary(
             delivery=delivery,
             content=content,
         )
-    account = resolve_daily_delivery_account_config(store, config, delivery)
+    account = resolve_account_config(config, store, delivery.account_id)
     from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
 
     return asyncio.run(TelegramSummaryDeliveryService(account, store).send_summary(delivery, content))
@@ -1072,7 +1071,7 @@ def resolve_daily_summary_delivery(store: ArchiveStore, config: AppConfig) -> Da
         topic_id=int(state.get("topic_id") or 0),
     )
     if delivery.enabled:
-        _validate_daily_summary_delivery_account(store, config, delivery.account_id)
+        resolve_account_config(config, store, delivery.account_id)
     return delivery
 
 
@@ -1096,7 +1095,7 @@ def update_daily_summary_delivery(
             raise ValueError("daily summary delivery account_id is required when enabled is true")
         if origin_id is None:
             raise ValueError("daily summary delivery origin_id is required when enabled is true")
-        _validate_daily_summary_delivery_account(store, config, account_id)
+        resolve_account_config(config, store, account_id)
     stored = store.set_daily_summary_delivery(
         DailySummaryDeliveryRecord(
             enabled=enabled,
@@ -1107,61 +1106,6 @@ def update_daily_summary_delivery(
         )
     )
     return {**stored, "source": "database"}
-
-
-def _validate_daily_summary_delivery_account(
-    store: ArchiveStore,
-    config: AppConfig,
-    account_id: str,
-) -> None:
-    if any(account.account_id == account_id for account in config.telegram.accounts):
-        return
-    if any(
-        item.get("source") == SOURCE_TELEGRAM and item.get("account_id") == account_id
-        for item in store.list_management_accounts()
-    ):
-        return
-    raise ValueError(f"Unknown daily summary delivery account_id: {account_id}")
-
-
-def resolve_daily_delivery_account_config(
-    store: ArchiveStore,
-    config: AppConfig,
-    delivery: DailyDeliveryConfig,
-) -> TelegramAccountConfig:
-    account_id = delivery.account_id
-    for account in config.telegram.accounts:
-        if account.account_id == account_id:
-            return account
-    stored = next(
-        (
-            item
-            for item in store.list_management_accounts()
-            if item.get("source") == SOURCE_TELEGRAM and item.get("account_id") == account_id
-        ),
-        None,
-    )
-    if stored is not None:
-        if not config.telegram.accounts:
-            raise ValueError(
-                "At least one configured Telegram account is required as an API credential template"
-            )
-        template = config.telegram.accounts[0]
-        session_dir_raw = stored.get("session_dir")
-        session_dir = (
-            resolve_workspace_path(config, str(session_dir_raw))
-            if session_dir_raw
-            else template.session_dir
-        )
-        return TelegramAccountConfig(
-            account_id=account_id,
-            api_id=template.api_id,
-            api_hash=template.api_hash,
-            session_name=str(stored.get("session_name") or account_id),
-            session_dir=session_dir,
-            timezone=template.timezone,
-        )
-    raise ValueError(f"Unknown daily.delivery.account_id: {account_id}")
 
 
 def _delivery_target_payload(delivery: DailyDeliveryConfig) -> dict[str, Any]:

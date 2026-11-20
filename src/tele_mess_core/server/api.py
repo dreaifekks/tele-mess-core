@@ -948,7 +948,7 @@ def _create_management_account(
     )
     item = _find_account(store, source, account_id)
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
-        telegram_runtime.register_account(_account_config(config, store, account_id, source))
+        telegram_runtime.register_account(_account_config(config, store, account_id))
     return item
 
 
@@ -1197,7 +1197,7 @@ def _auth_status(
     source = _source(payload)
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         return telegram_runtime.call(account_id, "auth_status")
-    account = _account_config(config, store, account_id, source)
+    account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
 
     return asyncio.run(TelegramAuthService(account, store).status())
@@ -1214,7 +1214,7 @@ def _request_auth_code(
     phone = _required_str(payload, "phone")
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         return telegram_runtime.call(account_id, "request_code", phone=phone)
-    account = _account_config(config, store, account_id, source)
+    account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
 
     return asyncio.run(TelegramAuthService(account, store).request_code(phone))
@@ -1233,7 +1233,7 @@ def _submit_auth_code(
     password = _optional_payload_str(payload, "password")
     if telegram_runtime is not None and source == SOURCE_TELEGRAM:
         return telegram_runtime.call(account_id, "submit_code", phone=phone, code=code, password=password)
-    account = _account_config(config, store, account_id, source)
+    account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.auth import TelegramAuthService
 
     return asyncio.run(TelegramAuthService(account, store).submit_code(phone, code, password))
@@ -1258,7 +1258,7 @@ def _discover_origins(
             topic_limit=topic_limit,
             include_private=include_private,
         )
-    account = _account_config(config, store, account_id, source)
+    account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.discovery import TelegramDiscoveryService
 
     return asyncio.run(
@@ -1287,7 +1287,7 @@ def _refresh_participants(
             origin_id=origin_id,
             limit=limit,
         )
-    account = _account_config(config, store, account_id, source)
+    account = _account_config(config, store, account_id)
     from tele_mess_core.telegram.discovery import TelegramDiscoveryService
 
     return asyncio.run(TelegramDiscoveryService(account, store).refresh_participants(origin_id, limit))
@@ -1465,40 +1465,12 @@ def _daily_scope(payload: dict[str, Any]) -> dict[str, Any]:
     return scope
 
 
-def _account_config(
-    config: "AppConfig | None",
-    store: ArchiveStore,
-    account_id: str,
-    source: str = SOURCE_TELEGRAM,
-) -> "TelegramAccountConfig":
+def _account_config(config: "AppConfig | None", store: ArchiveStore, account_id: str) -> "TelegramAccountConfig":
     if config is None:
         raise ValueError("Server config is required for live Telegram management actions")
-    for account in config.telegram.accounts:
-        if account.account_id == account_id:
-            return account
-    if not config.telegram.accounts:
-        raise ValueError("At least one configured Telegram account is required to authenticate a new account")
-    stored = None
-    for item in store.list_management_accounts():
-        if item["source"] == source and item["account_id"] == account_id:
-            stored = item
-            break
-    if stored is None:
-        raise ValueError(f"Unknown account_id: {account_id}")
+    from tele_mess_core.config import resolve_account_config
 
-    from tele_mess_core.config import TelegramAccountConfig, resolve_workspace_path
-
-    template = config.telegram.accounts[0]
-    session_dir_raw = stored.get("session_dir")
-    session_dir = resolve_workspace_path(config, str(session_dir_raw)) if session_dir_raw else template.session_dir
-    return TelegramAccountConfig(
-        account_id=account_id,
-        api_id=template.api_id,
-        api_hash=template.api_hash,
-        session_name=str(stored.get("session_name") or account_id),
-        session_dir=session_dir,
-        timezone=template.timezone,
-    )
+    return resolve_account_config(config, store, account_id)
 
 
 def _normalized_session_dir(config: "AppConfig | None", raw: str | None) -> str | None:

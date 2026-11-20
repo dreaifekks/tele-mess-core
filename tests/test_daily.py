@@ -26,6 +26,7 @@ from tele_mess_core.config import (
     StorageConfig,
     TelegramAccountConfig,
     TelegramConfig,
+    resolve_account_config,
 )
 from tele_mess_core.daily import (
     AiProviderError,
@@ -274,6 +275,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.assertFalse((Path(summary["output_dir"]) / "stages" / "normal-groups").exists())
 
     def test_daily_summary_delivers_final_summary_when_configured(self) -> None:
+        self._configure_main_account()
         self._origin(-7001, "Delivery Source", "info")
         self.store.upsert_message(
             MessageRecord(
@@ -412,7 +414,7 @@ class DailyPackagingTest(unittest.TestCase):
             )
         )
 
-        with self.assertRaisesRegex(ValueError, "Unknown daily summary delivery account_id: shared-id"):
+        with self.assertRaisesRegex(ValueError, "Unknown account_id: shared-id"):
             update_daily_summary_delivery(
                 self.store,
                 self.config,
@@ -422,7 +424,7 @@ class DailyPackagingTest(unittest.TestCase):
         self.store.set_daily_summary_delivery(
             DailySummaryDeliveryRecord(enabled=True, account_id="shared-id", origin_id=-9001)
         )
-        with self.assertRaisesRegex(ValueError, "Unknown daily summary delivery account_id: shared-id"):
+        with self.assertRaisesRegex(ValueError, "Unknown account_id: shared-id"):
             resolve_daily_summary_delivery(self.store, self.config)
 
     def test_daily_delivery_keeps_yaml_account_compatibility(self) -> None:
@@ -448,6 +450,7 @@ class DailyPackagingTest(unittest.TestCase):
         )
 
     def test_structured_points_are_persisted_for_normal_and_important_origins(self) -> None:
+        self._configure_main_account()
         self._origin(-9001, "Normal Source", "normal,info")
         self._origin(-9002, "Important Source", "alert,info", important=True)
         for chat_id, message_id, sent_at, permalink in (
@@ -1584,6 +1587,17 @@ daily:
 
     def _structured_provider_calls(self, log_path: Path) -> list[dict[str, object]]:
         return [json.loads(line) for line in log_path.read_text(encoding="utf-8").splitlines()]
+
+    def _configure_main_account(self) -> None:
+        self.config.telegram.accounts.append(
+            TelegramAccountConfig(
+                account_id="main",
+                api_id=1,
+                api_hash="test",
+                session_name="main",
+                session_dir=self.root / "sessions",
+            )
+        )
 
     def _origin(self, origin_id: int, title: str, tags: str, important: bool = False) -> None:
         self.store.upsert_origin(

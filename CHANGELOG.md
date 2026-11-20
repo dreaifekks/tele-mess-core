@@ -27,6 +27,11 @@ validation rules.
   open instead of leaving the full-text index unrepaired, and messages written
   by another process while an upgrade replaces the full-text triggers are
   indexed.
+- Telegram accounts are resolved in one place for the runtime, the management
+  API, and daily delivery. The runtime no longer starts a Telegram client for a
+  management account of another source, and enabling delivery to an account
+  managed in SQLite now fails at configuration time when no configured account
+  can lend it API credentials.
 
 ## 0.3.5 - 2026-10-13
 

@@ -19,8 +19,9 @@ from tele_mess_core.config import (
     StorageConfig,
     TelegramAccountConfig,
     TelegramConfig,
+    stored_account_config,
 )
-from tele_mess_core.models import AccountAuthRecord, SOURCE_TELEGRAM
+from tele_mess_core.models import AccountAuthRecord, AccountRecord, SOURCE_TELEGRAM
 from tele_mess_core.telegram.manager import TelegramRuntimeManager, _default_client_factory
 
 
@@ -350,12 +351,26 @@ class TelegramRuntimeManagerTest(unittest.IsolatedAsyncioTestCase):
             "session_name": "saved-main",
             "session_dir": "managed-sessions",
         }
-        manager = TelegramRuntimeManager(self.config, self.store, client_factory=lambda item: FakeClient())
 
-        resolved = manager._stored_account_config(manager_account)
+        resolved = stored_account_config(self.config, manager_account)
 
         self.assertEqual(resolved.account_id, "saved")
         self.assertEqual(resolved.session_dir, self.root / "managed-sessions")
+
+    async def test_start_only_registers_telegram_management_accounts(self) -> None:
+        self.store.upsert_account(
+            AccountRecord(source="other", account_id="elsewhere", display_name="Other", kind="other")
+        )
+        self.store.upsert_account(
+            AccountRecord(source=SOURCE_TELEGRAM, account_id="saved", display_name="Saved", kind="telegram")
+        )
+        manager = TelegramRuntimeManager(self.config, self.store, client_factory=lambda item: FakeClient())
+
+        await manager.start()
+        try:
+            self.assertEqual(sorted(manager._runtimes), ["main", "saved"])
+        finally:
+            await manager.stop()
 
 
 class ConfiguredAccountSyncTest(unittest.TestCase):

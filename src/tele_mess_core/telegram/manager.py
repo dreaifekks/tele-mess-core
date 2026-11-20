@@ -11,7 +11,7 @@ import time
 from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig, TelegramAccountConfig, resolve_workspace_path
+from tele_mess_core.config import AppConfig, TelegramAccountConfig, resolve_account_config, stored_account_config
 from tele_mess_core.models import AccountAuthRecord, OperationEventRecord, SOURCE_TELEGRAM, utc_now_iso
 from tele_mess_core.telegram.auth import TelegramAuthService
 from tele_mess_core.telegram.delivery import TelegramSummaryDeliveryService
@@ -347,16 +347,14 @@ class TelegramRuntimeManager:
         self._loop: asyncio.AbstractEventLoop | None = None
         self._loop_thread_id: int | None = None
         self._runtimes: dict[str, TelegramAccountRuntime] = {}
-        self._configs = {item.account_id: item for item in config.telegram.accounts}
 
     async def start(self) -> None:
         self._loop = asyncio.get_running_loop()
         self._loop_thread_id = threading.get_ident()
-        configs = dict(self._configs)
+        configs = {item.account_id: item for item in self.config.telegram.accounts}
         for item in self.store.list_management_accounts():
-            account_id = str(item.get("account_id") or "")
-            if account_id and account_id not in configs:
-                configs[account_id] = self._stored_account_config(item)
+            if item.get("source") == SOURCE_TELEGRAM and item["account_id"] not in configs:
+                configs[item["account_id"]] = stored_account_config(self.config, item)
         for account in configs.values():
             await self._register_account(account)
 
@@ -400,7 +398,7 @@ class TelegramRuntimeManager:
     async def execute(self, account_id: str, operation: str, **kwargs: Any) -> dict[str, Any]:
         runtime = self._runtimes.get(account_id)
         if runtime is None:
-            runtime = await self._register_account(self._account_config(account_id))
+            runtime = await self._register_account(resolve_account_config(self.config, self.store, account_id))
         return await runtime.execute(operation, **kwargs)
 
     def register_account(self, config: TelegramAccountConfig) -> dict[str, Any]:
@@ -437,35 +435,6 @@ class TelegramRuntimeManager:
             return {"account_id": account_id, "stopped": False}
         await runtime.stop()
         return {"account_id": account_id, "stopped": True}
-
-    def _account_config(self, account_id: str) -> TelegramAccountConfig:
-        configured = self._configs.get(account_id)
-        if configured is not None:
-            return configured
-        for item in self.store.list_management_accounts():
-            if str(item.get("account_id") or "") == account_id:
-                return self._stored_account_config(item)
-        raise ValueError(f"Unknown account_id: {account_id}")
-
-    def _stored_account_config(self, item: dict[str, Any]) -> TelegramAccountConfig:
-        if not self.config.telegram.accounts:
-            raise ValueError("At least one configured Telegram account is required as an API credential template")
-        template = self.config.telegram.accounts[0]
-        account_id = str(item["account_id"])
-        session_dir_raw = item.get("session_dir")
-        session_dir = (
-            resolve_workspace_path(self.config, str(session_dir_raw))
-            if session_dir_raw
-            else template.session_dir
-        )
-        return TelegramAccountConfig(
-            account_id=account_id,
-            api_id=template.api_id,
-            api_hash=template.api_hash,
-            session_name=str(item.get("session_name") or account_id),
-            session_dir=session_dir,
-            timezone=template.timezone,
-        )
 
     def _require_loop(self) -> asyncio.AbstractEventLoop:
         if self._loop is None or self._loop.is_closed():

@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any, Callable
 
 from tele_mess_core.archive import ArchiveStore
-from tele_mess_core.config import AppConfig, DailyDeliveryConfig
+from tele_mess_core.config import AppConfig, DailyDeliveryConfig, resolve_account_config
 from tele_mess_core.daily import (
     DailyJobCancelled,
     DailyJobInterrupted,
@@ -21,7 +21,6 @@ from tele_mess_core.daily import (
     _terminate_process,
     _zoneinfo,
     build_daily_package,
-    resolve_daily_delivery_account_config,
     resolve_daily_summary_delivery,
     run_daily_summary,
 )
@@ -516,7 +515,7 @@ class DailyJobWorker:
                     content=str(item["content"]),
                 )
             else:
-                account = resolve_daily_delivery_account_config(self.store, self.config, delivery)
+                account = resolve_account_config(self.config, self.store, delivery.account_id)
                 result = self._run_delivery_coroutine(
                     TelegramSummaryDeliveryService(account, self.store).send_summary(
                         delivery,
