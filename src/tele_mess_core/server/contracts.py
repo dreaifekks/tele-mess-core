@@ -1416,6 +1416,22 @@ def validate_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -
                 raise ValueError(f"Query parameter {item.name} must be one of: {allowed}")
 
 
+def parse_query_params(endpoint: ApiEndpoint, params: dict[str, list[str]]) -> dict[str, Any]:
+    """Return every declared query parameter converted to its type, or its contract default when absent."""
+    values: dict[str, Any] = {}
+    for item in endpoint.query:
+        raw = (params.get(item.name) or [""])[0]
+        if raw == "":
+            values[item.name] = item.default
+        elif item.type == "integer":
+            values[item.name] = int(raw)
+        elif item.type == "boolean":
+            values[item.name] = raw.strip().lower() in {"1", "true", "yes", "on"}
+        else:
+            values[item.name] = raw
+    return values
+
+
 def validate_schema_value(value: Any, schema: dict[str, Any], path: str) -> None:
     """Validate a value against an inline schema with the request-body rules."""
     _validate_schema_value(value, schema, path)

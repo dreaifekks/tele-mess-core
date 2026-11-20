@@ -36,6 +36,11 @@ validation rules.
   Telethon; only the Telegram runtime and services do. A missing Telethon in
   origin discovery now raises instead of being reported as a partial topic
   discovery result.
+- HTTP GET endpoints read query parameters and their defaults from the API
+  contract, so the documented defaults are the ones applied. List endpoints for
+  daily package runs, summary runs, summary jobs, and summary records now
+  default to `limit=500` instead of 100, and `/sync/messages?latest=true`
+  without a limit returns up to 100 messages instead of 50.
 
 ## 0.3.5 - 2026-10-13
 

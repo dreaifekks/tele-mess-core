@@ -35,6 +35,7 @@ from tele_mess_core.server.contracts import (
     api_manifest,
     markdown_document,
     openapi_document,
+    parse_query_params,
     validate_query_params,
     validate_request_payload,
 )
@@ -188,7 +189,7 @@ class SyncApiServer:
                     if parsed.path == MCP_PATH:
                         self._handle_mcp()
                     elif method == "GET":
-                        self._handle_get(parsed.path, params)
+                        self._handle_get(parsed.path, endpoint, params)
                     elif method in {"POST", "PATCH", "DELETE"}:
                         self._handle_write(method, parsed.path, endpoint)
                     else:
@@ -205,7 +206,8 @@ class SyncApiServer:
                 finally:
                     store.close_thread_connection()
 
-            def _handle_get(self, path: str, params: dict[str, list[str]]) -> None:
+            def _handle_get(self, path: str, endpoint: Any, params: dict[str, list[str]]) -> None:
+                query = parse_query_params(endpoint, params)
                 if path == "/" or path == "/console":
                     self._html(console_html())
                 elif path == OPENAPI_PATH:
@@ -217,15 +219,15 @@ class SyncApiServer:
                 elif path == "/sync/state":
                     self._json(store.state())
                 elif path == "/sync/events":
-                    self._json(store.list_events(after=_int_param(params, "after", 0), limit=_int_param(params, "limit", 500)))
+                    self._json(store.list_events(after=query["after"], limit=query["limit"]))
                 elif path == "/sync/messages":
-                    include_media = _bool_param(params, "include_media", False)
-                    if _bool_param(params, "latest", False):
-                        payload = store.list_latest_messages(limit=_int_param(params, "limit", 50))
+                    include_media = query["include_media"]
+                    if query["latest"]:
+                        payload = store.list_latest_messages(limit=query["limit"])
                     else:
                         payload = store.list_messages_after(
-                            after_event_seq=_int_param(params, "after", 0),
-                            limit=_int_param(params, "limit", 500),
+                            after_event_seq=query["after"],
+                            limit=query["limit"],
                         )
                     if include_media:
                         _attach_message_media(store, payload)
@@ -235,32 +237,31 @@ class SyncApiServer:
                 elif path == "/sync/accounts":
                     self._json({"items": store.list_accounts()})
                 elif path == "/sync/search":
-                    query = _str_param(params, "q", "")
-                    if not query:
+                    if not query["q"]:
                         self._json({"items": []})
                     else:
-                        payload = {"items": store.search_messages(query, limit=_int_param(params, "limit", 50))}
-                        if _bool_param(params, "include_media", False):
+                        payload = {"items": store.search_messages(query["q"], limit=query["limit"])}
+                        if query["include_media"]:
                             _attach_message_media(store, payload)
                         self._json(payload)
                 elif path == "/sync/media-files/content":
                     item = store.get_media_file(
-                        source=_str_param(params, "source", SOURCE_TELEGRAM),
-                        account_id=_str_param(params, "account_id", ""),
-                        chat_id=_int_param(params, "chat_id", 0),
-                        message_id=_int_param(params, "message_id", 0),
-                        file_index=_int_param(params, "file_index", 0),
+                        source=query["source"],
+                        account_id=query["account_id"],
+                        chat_id=query["chat_id"],
+                        message_id=query["message_id"],
+                        file_index=query["file_index"],
                     )
                     self._media_file(item)
                 elif path == "/sync/media-files":
                     items = store.list_media_files(
-                        account_id=_optional_str_param(params, "account_id"),
-                        chat_id=_optional_int_param(params, "chat_id"),
-                        message_id=_optional_int_param(params, "message_id"),
-                        limit=_int_param(params, "limit", 500),
-                        filename_query=_optional_str_param(params, "filename_query"),
-                        media_type=_optional_str_param(params, "media_type"),
-                        file_extension=_optional_str_param(params, "file_extension"),
+                        account_id=query["account_id"],
+                        chat_id=query["chat_id"],
+                        message_id=query["message_id"],
+                        limit=query["limit"],
+                        filename_query=query["filename_query"],
+                        media_type=query["media_type"],
+                        file_extension=query["file_extension"],
                     )
                     self._json(
                         {
@@ -277,29 +278,29 @@ class SyncApiServer:
                     self._json(
                         {
                             "items": store.list_origins(
-                                account_id=_optional_str_param(params, "account_id"),
-                                include_archived=_bool_param(params, "include_archived", False),
+                                account_id=query["account_id"],
+                                include_archived=query["include_archived"],
                             )
                         }
                     )
                 elif path == "/manage/backup-policies":
-                    self._json({"items": store.list_backup_policies(account_id=_optional_str_param(params, "account_id"))})
+                    self._json({"items": store.list_backup_policies(account_id=query["account_id"])})
                 elif path == "/manage/participants":
                     self._json(
                         {
                             "items": store.list_participants(
-                                account_id=_optional_str_param(params, "account_id"),
-                                origin_id=_optional_int_param(params, "origin_id"),
+                                account_id=query["account_id"],
+                                origin_id=query["origin_id"],
                             )
                         }
                     )
                 elif path == "/manage/capture-cursors":
-                    self._json({"items": store.list_capture_cursors(account_id=_optional_str_param(params, "account_id"))})
+                    self._json({"items": store.list_capture_cursors(account_id=query["account_id"])})
                 elif path == "/manage/operation-events":
                     items = store.list_operation_events(
-                        account_id=_optional_str_param(params, "account_id"),
-                        status=_optional_str_param(params, "status"),
-                        limit=_int_param(params, "limit", 100),
+                        account_id=query["account_id"],
+                        status=query["status"],
+                        limit=query["limit"],
                     )
                     self._json(
                         {
@@ -314,8 +315,8 @@ class SyncApiServer:
                     self._json(
                         {
                             "items": store.list_daily_package_runs(
-                                status=_optional_str_param(params, "status"),
-                                limit=_int_param(params, "limit", 100),
+                                status=query["status"],
+                                limit=query["limit"],
                             )
                         }
                     )
@@ -325,17 +326,17 @@ class SyncApiServer:
                     body, content_type = read_run_content(
                         store,
                         "package",
-                        _str_param(params, "run_id", ""),
-                        _str_param(params, "format", "md"),
+                        query["run_id"],
+                        query["format"],
                     )
                     self._text(body, content_type=content_type)
                 elif path == "/manage/daily-summary-runs":
                     self._json(
                         {
                             "items": store.list_daily_summary_runs(
-                                package_run_id=_optional_str_param(params, "package_run_id"),
-                                status=_optional_str_param(params, "status"),
-                                limit=_int_param(params, "limit", 100),
+                                package_run_id=query["package_run_id"],
+                                status=query["status"],
+                                limit=query["limit"],
                             )
                         }
                     )
@@ -343,9 +344,9 @@ class SyncApiServer:
                     self._json(
                         {
                             "items": store.list_daily_summary_jobs(
-                                job_id=_optional_str_param(params, "job_id"),
-                                status=_optional_str_param(params, "status"),
-                                limit=_int_param(params, "limit", 100),
+                                job_id=query["job_id"],
+                                status=query["status"],
+                                limit=query["limit"],
                             )
                         }
                     )
@@ -355,7 +356,7 @@ class SyncApiServer:
                     body, content_type = read_run_content(
                         store,
                         "summary",
-                        _str_param(params, "run_id", ""),
+                        query["run_id"],
                         "md",
                     )
                     self._text(body, content_type=content_type)
@@ -363,30 +364,30 @@ class SyncApiServer:
                     self._json(
                         {
                             "items": store.list_daily_summary_records(
-                                summary_id=_optional_str_param(params, "summary_id"),
-                                run_id=_optional_str_param(params, "run_id"),
-                                package_run_id=_optional_str_param(params, "package_run_id"),
-                                date=_optional_str_param(params, "date"),
-                                date_from=_optional_str_param(params, "date_from"),
-                                date_to=_optional_str_param(params, "date_to"),
-                                provider=_optional_str_param(params, "provider"),
-                                record_type=_optional_str_param(params, "record_type"),
-                                important=_optional_bool_param(params, "important"),
+                                summary_id=query["summary_id"],
+                                run_id=query["run_id"],
+                                package_run_id=query["package_run_id"],
+                                date=query["date"],
+                                date_from=query["date_from"],
+                                date_to=query["date_to"],
+                                provider=query["provider"],
+                                record_type=query["record_type"],
+                                important=query["important"],
                                 tags=_tags_param(params),
-                                q=_optional_str_param(params, "q"),
-                                include_deleted=_bool_param(params, "include_deleted", False),
-                                deleted=_optional_bool_param(params, "deleted"),
-                                include_content=_bool_param(params, "include_content", False),
-                                limit=_int_param(params, "limit", 100),
+                                q=query["q"],
+                                include_deleted=query["include_deleted"],
+                                deleted=query["deleted"],
+                                include_content=query["include_content"],
+                                limit=query["limit"],
                             )
                         }
                     )
                 elif path == "/manage/daily-summary-records/item":
                     item = store.get_daily_summary_record(
-                        summary_id=_optional_str_param(params, "summary_id"),
-                        run_id=_optional_str_param(params, "run_id"),
-                        record_type=_optional_str_param(params, "record_type"),
-                        include_deleted=_bool_param(params, "include_deleted", False),
+                        summary_id=query["summary_id"],
+                        run_id=query["run_id"],
+                        record_type=query["record_type"],
+                        include_deleted=query["include_deleted"],
                     )
                     if item is None:
                         raise ValueError("Unknown daily summary record")
@@ -395,29 +396,29 @@ class SyncApiServer:
                     self._json(
                         {
                             "items": store.list_daily_message_points(
-                                point_id=_optional_str_param(params, "point_id"),
-                                run_id=_optional_str_param(params, "run_id"),
-                                package_run_id=_optional_str_param(params, "package_run_id"),
-                                date=_optional_str_param(params, "date"),
-                                date_from=_optional_str_param(params, "date_from"),
-                                date_to=_optional_str_param(params, "date_to"),
-                                source=_optional_str_param(params, "source"),
-                                account_id=_optional_str_param(params, "account_id"),
-                                origin_id=_optional_int_param(params, "origin_id"),
-                                topic_id=_optional_int_param(params, "topic_id"),
-                                message_id=_optional_int_param(params, "message_id"),
+                                point_id=query["point_id"],
+                                run_id=query["run_id"],
+                                package_run_id=query["package_run_id"],
+                                date=query["date"],
+                                date_from=query["date_from"],
+                                date_to=query["date_to"],
+                                source=query["source"],
+                                account_id=query["account_id"],
+                                origin_id=query["origin_id"],
+                                topic_id=query["topic_id"],
+                                message_id=query["message_id"],
                                 tags=_tags_param(params),
-                                importance_min=_optional_int_param(params, "importance_min"),
-                                importance_max=_optional_int_param(params, "importance_max"),
-                                origin_important=_optional_bool_param(params, "origin_important"),
-                                q=_optional_str_param(params, "q"),
-                                include_incomplete=_bool_param(params, "include_incomplete", False),
-                                limit=_int_param(params, "limit", 100),
+                                importance_min=query["importance_min"],
+                                importance_max=query["importance_max"],
+                                origin_important=query["origin_important"],
+                                q=query["q"],
+                                include_incomplete=query["include_incomplete"],
+                                limit=query["limit"],
                             )
                         }
                     )
                 elif path == "/manage/daily-message-points/item":
-                    item = store.get_daily_message_point(_str_param(params, "point_id", ""))
+                    item = store.get_daily_message_point(query["point_id"])
                     if item is None:
                         raise ValueError("Unknown daily message point")
                     self._json({"item": item})
@@ -1566,46 +1567,6 @@ def _payload_bool(payload: dict[str, Any], key: str, default: bool) -> bool:
     if isinstance(value, str):
         return value.strip().lower() in {"1", "true", "yes", "on"}
     return bool(value)
-
-
-def _int_param(params: dict[str, list[str]], key: str, default: int) -> int:
-    try:
-        return int(params.get(key, [str(default)])[0])
-    except (TypeError, ValueError):
-        return default
-
-
-def _optional_int_param(params: dict[str, list[str]], key: str) -> int | None:
-    if key not in params:
-        return None
-    try:
-        return int(params[key][0])
-    except (TypeError, ValueError):
-        return None
-
-
-def _bool_param(params: dict[str, list[str]], key: str, default: bool) -> bool:
-    if key not in params:
-        return default
-    value = params[key][0]
-    if isinstance(value, str):
-        return value.strip().lower() in {"1", "true", "yes", "on"}
-    return bool(value)
-
-
-def _optional_bool_param(params: dict[str, list[str]], key: str) -> bool | None:
-    if key not in params:
-        return None
-    return _bool_param(params, key, False)
-
-
-def _str_param(params: dict[str, list[str]], key: str, default: str) -> str:
-    return params.get(key, [default])[0]
-
-
-def _optional_str_param(params: dict[str, list[str]], key: str) -> str | None:
-    value = params.get(key, [None])[0]
-    return value if value else None
 
 
 def _tags_param(params: dict[str, list[str]]) -> list[str]:

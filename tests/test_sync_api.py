@@ -25,6 +25,7 @@ from tele_mess_core.models import (
     CaptureCursorRecord,
     ChatRecord,
     DailyMessagePointRecord,
+    DailyPackageRunRecord,
     DailySummaryRunRecord,
     MediaFileRecord,
     MessageRecord,
@@ -35,7 +36,7 @@ from tele_mess_core.models import (
 from tele_mess_core.daily_jobs import DailyJobWorker
 from tele_mess_core.server import SyncApiServer
 from tele_mess_core.server.api import MAX_JSON_BODY_BYTES, _account_config
-from tele_mess_core.server.contracts import API_CONTRACT_HASH, API_CONTRACT_VERSION
+from tele_mess_core.server.contracts import API_CONTRACT_HASH, API_CONTRACT_VERSION, API_ENDPOINTS
 
 
 class SyncApiTest(unittest.TestCase):
@@ -179,6 +180,26 @@ class SyncApiTest(unittest.TestCase):
 
         self.assertEqual(payload["items"][0]["text"], "newer payload")
         self.assertEqual(payload["items"][0]["chat_title"], "API Chat")
+
+    def test_list_endpoints_apply_the_contract_default_limit(self) -> None:
+        for index in range(120):
+            self.store.upsert_daily_package_run(
+                DailyPackageRunRecord(
+                    run_id=f"pkg_{index:03d}",
+                    status="completed",
+                    date="2026-07-03",
+                    timezone="UTC",
+                    started_at=f"2026-07-03T00:{index // 60:02d}:{index % 60:02d}+00:00",
+                )
+            )
+        endpoint = next(
+            item for item in API_ENDPOINTS if (item.method, item.path) == ("GET", "/manage/daily-package-runs")
+        )
+        default_limit = next(item.default for item in endpoint.query if item.name == "limit")
+
+        items = self.request_json("/manage/daily-package-runs")["items"]
+
+        self.assertEqual(len(items), min(120, default_limit))
 
     def test_accounts_endpoint(self) -> None:
         req = Request(f"http://127.0.0.1:{self.port}/sync/accounts")
