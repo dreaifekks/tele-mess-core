@@ -7,12 +7,24 @@ validation rules.
 
 ## Unreleased
 
+## 0.3.6 - 2026-11-21
+
 - Optimized SQLite archive hot paths (Schema version 22): enabled WAL-mode
   `PRAGMA synchronous = NORMAL`, coalesced message/chat/user/cursor persistence
   in Telegram ingestion into a single write transaction, added a lock-free idle
   fast-path and index-backed selection for `claim_media_download_job`, and added
   `idx_media_files_file_path`, `idx_media_download_jobs_downloading`, and
   `idx_media_download_jobs_pending_path` indexes.
+- Decoupled Telegram media downloads from live ingestion and backfill cursors
+  via a persistent `media_download_jobs` queue (Schema version 21) and
+  per-account async worker with lease heartbeats, crash-safe staging/publish
+  cleanup, `FloodWait`-preserving backoff, `media_ready` sync events,
+  `/sync/state` and `/healthz` queue metrics, and monotonic account-generation
+  fencing across account deletion and recreation.
+- Unified forum topic effective backup policies (`archived` > `self` > `parent`
+  > `none`) across ingestion, daily packaging, MCP, and `/manage/origins`;
+  stopped writing skeleton/tombstone rows on delete or reaction events for
+  unarchived messages; and emitted OpenAPI 3.1 nullable schemas.
 - Delivery outbox chunks are numbered and ordered per `(summary_run_id, target,
   content_kind)`, so important and point reports carry independent `[i/n]`
   prefixes and a retrying report no longer blocks the other. After 30 failed
