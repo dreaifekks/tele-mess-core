@@ -284,17 +284,38 @@ class TelegramAccountRuntime:
                 random_id=kwargs.get("random_id"),
             )
         if operation == "refresh_capture":
+            if not self._account_generation_is_current():
+                self._mark_ingest_stale()
+                return {"account_id": self.config.account_id, "status": "conflict"}
             if not await client.is_user_authorized():
                 return {"account_id": self.config.account_id, "status": "needs_login"}
+            if not self._account_generation_is_current():
+                self._mark_ingest_stale()
+                return {"account_id": self.config.account_id, "status": "conflict"}
             was_attached = self._ingest_active
             self._schedule_ingestion(client)
             task = self._ingest_task
             if task is not None:
                 activated = await asyncio.shield(task)
                 if activated is False:
+                    self._mark_ingest_stale()
                     return {"account_id": self.config.account_id, "status": "conflict"}
+            if not self._account_generation_is_current():
+                self._mark_ingest_stale()
+                return {"account_id": self.config.account_id, "status": "conflict"}
             if was_attached and self._ingest_service is not None and self._ingest_active:
-                await self._ingest_service.refresh_capture_targets()
+                refreshed = await self._ingest_service.refresh_capture_targets()
+                if refreshed is False:
+                    self._mark_ingest_stale()
+                    return {"account_id": self.config.account_id, "status": "conflict"}
+            service = self._ingest_service
+            if (
+                not self._account_generation_is_current()
+                or bool(getattr(service, "_disabled", False))
+                or bool(getattr(service, "_closed", False))
+            ):
+                self._mark_ingest_stale()
+                return {"account_id": self.config.account_id, "status": "conflict"}
             return {"account_id": self.config.account_id, "status": "refreshed"}
         raise ValueError(f"Unknown Telegram runtime operation: {operation}")
 
@@ -469,13 +490,34 @@ class TelegramAccountRuntime:
             self._diagnostic_threads.add(thread)
         thread.start()
 
+    def _account_generation_is_current(self) -> bool:
+        return self.store.account_generation_matches(
+            SOURCE_TELEGRAM,
+            self.config.account_id,
+            expected_generation=self._account_generation,
+        )
+
+    def _on_ingest_stale(self) -> None:
+        self._ingest_active = False
+
+    def _mark_ingest_stale(self) -> None:
+        self._ingest_active = False
+        service = self._ingest_service
+        mark_stale = getattr(service, "_mark_stale", None)
+        if callable(mark_stale):
+            mark_stale()
+
     def status(self) -> dict[str, Any]:
         supervisor = self._supervisor_task
+        service = self._ingest_service
+        ingest_disabled = bool(getattr(service, "_disabled", False)) or bool(getattr(service, "_closed", False))
+        if ingest_disabled and self._ingest_active:
+            self._ingest_active = False
         return {
             "account_id": self.config.account_id,
             "connected": self._ready.is_set() and self.client is not None,
             "supervisor_running": bool(supervisor and not supervisor.done()),
-            "ingest_running": self._ingest_active,
+            "ingest_running": self._ingest_active and not ingest_disabled,
         }
 
     async def _supervise_connection(self) -> None:
@@ -631,6 +673,7 @@ class TelegramAccountRuntime:
             self.app_config.telegram.media_download,
             auth_owner_provider=self._next_auth_mutation_owner,
             account_generation=self._account_generation,
+            on_stale=self._on_ingest_stale,
         )
         register_handlers = getattr(service, "register_handlers", None)
         if callable(register_handlers):
@@ -660,7 +703,12 @@ class TelegramAccountRuntime:
             return
         exc = task.exception()
         if exc is None:
-            if task.result() is False:
+            service = self._ingest_service
+            if (
+                task.result() is False
+                or bool(getattr(service, "_disabled", False))
+                or bool(getattr(service, "_closed", False))
+            ):
                 self._ingest_active = False
                 return
             self._ingest_active = True

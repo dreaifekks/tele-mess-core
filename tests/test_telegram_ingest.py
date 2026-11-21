@@ -5321,6 +5321,249 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
             finally:
                 local_store.close()
 
+    async def test_stale_staging_scan_thread_does_not_fence_recreated_account_download_lease(self) -> None:
+        from datetime import timedelta
+        import threading
+        from unittest import mock
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stale_staging_scan.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            store2 = ArchiveStore(db_path)
+            scan_entered = threading.Event()
+            release_scan = threading.Event()
+            try:
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V1", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v1",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                old_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                chat_id = -1093
+                media_chat_dir = db_path.parent / "media" / "dyn" / str(chat_id)
+                media_chat_dir.mkdir(parents=True, exist_ok=True)
+
+                dyn_cfg = TelegramAccountConfig(
+                    account_id="dyn",
+                    api_id=1,
+                    api_hash="hash",
+                    session_name="dyn_v1",
+                    session_dir=self.config.session_dir,
+                )
+                # Old worker uses a 1s stale threshold; new worker will use a 300s lease.
+                old_service = TelegramArchiveService(
+                    dyn_cfg,
+                    local_store,
+                    media_download=MediaDownloadConfig(max_attempts=1, retry_delay_seconds=0.05, stale_seconds=1.0),
+                    account_generation=old_gen,
+                )
+
+                orig_iterdir = Path.iterdir
+                paused_once = {"done": False}
+
+                def pausing_iterdir(path_self: Path):
+                    if path_self == media_chat_dir and not paused_once["done"]:
+                        paused_once["done"] = True
+                        scan_entered.set()
+                        release_scan.wait(timeout=5.0)
+                    return orig_iterdir(path_self)
+
+                loop = asyncio.get_running_loop()
+                with mock.patch.object(Path, "iterdir", pausing_iterdir):
+                    scan_future = loop.run_in_executor(None, old_service._cleanup_staging_dirs)
+                    self.assertTrue(await loop.run_in_executor(None, scan_entered.wait, 2.0))
+
+                    # Delete and recreate "dyn", enqueue and claim a new job with 300s lease.
+                    store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                    store2.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V2", "telegram"))
+                    store2.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="authorized",
+                            session_name="dyn_v2",
+                            session_dir=str(self.config.session_dir),
+                        )
+                    )
+                    new_gen = store2.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                    store2.set_backup_policy(
+                        BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", chat_id, enabled=True, download_media=True)
+                    )
+                    new_job = store2.enqueue_media_download_job(
+                        account_id="dyn",
+                        chat_id=chat_id,
+                        message_id=801,
+                        max_attempts=1,
+                    )
+                    assert new_job is not None
+                    claimed = store2.claim_media_download_job(
+                        "dyn",
+                        stale_seconds=300.0,
+                        expected_generation=new_gen,
+                    )
+                    assert claimed is not None
+                    job_id = str(claimed["job_id"])
+                    token = int(claimed["claim_token"])
+                    # Age updated_at by 2 seconds: stale for old worker's 1s threshold, valid for new 300s lease.
+                    two_sec_ago = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+                    store2._conn.execute(
+                        "UPDATE media_download_jobs SET updated_at = ? WHERE job_id = ?",
+                        (two_sec_ago, job_id),
+                    )
+                    store2._conn.commit()
+                    part_dir = media_chat_dir / f".part-{job_id}-t{token}"
+                    part_dir.mkdir(parents=True, exist_ok=True)
+                    part_file = part_dir / "payload.bin"
+                    part_file.write_bytes(b"active-download")
+
+                    # Resume old worker's paused staging scan thread.
+                    release_scan.set()
+                    await scan_future
+
+                # New account's active download job and staging directory MUST remain untouched.
+                job_after = store2.get_media_download_job(job_id)
+                assert job_after is not None
+                self.assertEqual(job_after["status"], "downloading")
+                self.assertEqual(job_after["claim_token"], token)
+                self.assertTrue(part_dir.is_dir())
+                self.assertTrue(part_file.exists())
+
+                # Direct fence call with stale expected_generation also refuses to fence inside transaction.
+                self.assertFalse(
+                    local_store.fence_stale_media_download_claim(
+                        job_id,
+                        expected_claim_token=token,
+                        stale_seconds=1.0,
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        expected_generation=old_gen,
+                    )
+                )
+                job_after_direct = store2.get_media_download_job(job_id)
+                assert job_after_direct is not None
+                self.assertEqual(job_after_direct["status"], "downloading")
+            finally:
+                release_scan.set()
+                store2.close()
+                local_store.close()
+
+    async def test_stale_ingest_exit_updates_runtime_status_and_refresh_capture_returns_conflict(self) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stale_runtime_status.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            store2 = ArchiveStore(db_path)
+            try:
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V1", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v1",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                app_config = AppConfig(
+                    storage=StorageConfig(database=db_path),
+                    server=ServerConfig(),
+                    logging=LoggingConfig(),
+                    telegram=TelegramConfig(
+                        accounts=[self.config],
+                        media_download=MediaDownloadConfig(retry_delay_seconds=0.05, stale_seconds=60.0),
+                    ),
+                )
+
+                class LiveClient:
+                    def __init__(self) -> None:
+                        self._connected = False
+
+                    async def connect(self) -> None:
+                        self._connected = True
+
+                    async def disconnect(self) -> None:
+                        self._connected = False
+
+                    def is_connected(self) -> bool:
+                        return self._connected
+
+                    async def is_user_authorized(self) -> bool:
+                        return True
+
+                    def on(self, event_builder: object):
+                        return lambda fn: fn
+
+                    def iter_messages(self, cid: int, **kwargs):
+                        return FakeBackfillIterator(messages=[])
+
+                    async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                        return []
+
+                manager = TelegramRuntimeManager(
+                    app_config,
+                    local_store,
+                    client_factory=lambda _cfg: LiveClient(),
+                    ingest=True,
+                )
+                try:
+                    await manager.start()
+                    deadline = asyncio.get_running_loop().time() + 2.0
+                    while asyncio.get_running_loop().time() < deadline:
+                        if "dyn" in manager._runtimes and manager._runtimes["dyn"].status()["ingest_running"]:
+                            break
+                        await asyncio.sleep(0.02)
+                    dyn_runtime = manager._runtimes["dyn"]
+                    self.assertTrue(dyn_runtime.status()["ingest_running"])
+                    assert dyn_runtime._ingest_service is not None
+                    old_service = dyn_runtime._ingest_service
+                    worker_task = old_service._media_worker_task
+                    assert worker_task is not None
+
+                    # Delete and recreate "dyn" while runtime is actively running.
+                    store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                    store2.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V2", "telegram"))
+                    store2.upsert_account_auth(
+                        AccountAuthRecord(
+                            source=SOURCE_TELEGRAM,
+                            account_id="dyn",
+                            auth_state="authorized",
+                            session_name="dyn_v2",
+                            session_dir=str(self.config.session_dir),
+                        )
+                    )
+
+                    # Old media worker detects stale generation, disables ingest, and exits.
+                    await asyncio.wait_for(asyncio.shield(worker_task), timeout=2.0)
+                    self.assertTrue(old_service._disabled)
+                    self.assertFalse(dyn_runtime.status()["ingest_running"])
+
+                    # Subsequent refresh_capture MUST report conflict, never refreshed.
+                    refresh_res = await manager.execute("dyn", "refresh_capture")
+                    self.assertEqual(refresh_res["status"], "conflict")
+                    self.assertFalse(dyn_runtime.status()["ingest_running"])
+                finally:
+                    await manager.stop()
+            finally:
+                store2.close()
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()

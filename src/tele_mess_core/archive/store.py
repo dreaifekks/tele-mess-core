@@ -2681,6 +2681,7 @@ class ArchiveStore:
         source: str | None = None,
         account_id: str | None = None,
         allow_fencing_downloading: bool = True,
+        expected_generation: int | None = None,
     ) -> bool:
         """Atomically verify or invalidate a claim before deleting its staging directory.
 
@@ -2689,6 +2690,13 @@ class ArchiveStore:
         and has now been fenced in SQLite.
         """
         with self._lock:
+            if (
+                expected_generation is not None
+                and source is not None
+                and account_id is not None
+                and not self._account_generation_matches_unlocked(source, account_id, expected_generation)
+            ):
+                return False
             now_dt = datetime.now(dt_timezone.utc)
             stale_before = (
                 now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))
@@ -2721,6 +2729,14 @@ class ArchiveStore:
 
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if (
+                    expected_generation is not None
+                    and source is not None
+                    and account_id is not None
+                    and not self._account_generation_matches_unlocked(source, account_id, expected_generation)
+                ):
+                    self._conn.rollback()
+                    return False
                 now_dt = datetime.now(dt_timezone.utc)
                 now = now_dt.isoformat()
                 stale_before = (
@@ -2741,6 +2757,16 @@ class ArchiveStore:
                     self._conn.rollback()
                     return False
                 if account_id is not None and str(row["account_id"]) != account_id:
+                    self._conn.rollback()
+                    return False
+                if (
+                    expected_generation is not None
+                    and not self._account_generation_matches_unlocked(
+                        str(row["source"]),
+                        str(row["account_id"]),
+                        expected_generation,
+                    )
+                ):
                     self._conn.rollback()
                     return False
                 status = str(row["status"])
@@ -2881,9 +2907,16 @@ class ArchiveStore:
         include_deleted_accounts: bool = True,
         deleted_accounts_only: bool = False,
         stop_event: threading.Event | None = None,
+        expected_generation: int | None = None,
     ) -> bool:
         """Clean up DB-tracked pending/superseded media paths; returns True when retryable items remain."""
         if stop_event is not None and stop_event.is_set():
+            return False
+        if (
+            account_id is not None
+            and expected_generation is not None
+            and not self.account_generation_matches(source, account_id, expected_generation=expected_generation)
+        ):
             return False
         has_remaining = False
         for pending in self.list_media_jobs_with_pending_paths(
@@ -2895,11 +2928,23 @@ class ArchiveStore:
         ):
             if stop_event is not None and stop_event.is_set():
                 return True
+            if (
+                account_id is not None
+                and expected_generation is not None
+                and not self.account_generation_matches(source, account_id, expected_generation=expected_generation)
+            ):
+                return False
+            item_expected_generation = (
+                expected_generation
+                if account_id is not None and str(pending["account_id"]) == account_id
+                else None
+            )
             cleared, _unlinked = self.cleanup_media_download_pending_path(
                 str(pending["job_id"]),
                 expected_claim_token=int(pending["claim_token"]),
                 require_downloading=False,
                 stale_seconds=stale_seconds,
+                expected_generation=item_expected_generation,
             )
             if not cleared:
                 has_remaining = True
@@ -2917,9 +2962,16 @@ class ArchiveStore:
         allow_fencing_downloading: bool = True,
         only_job_ids: set[str] | None = None,
         stop_event: threading.Event | None = None,
+        expected_generation: int | None = None,
     ) -> bool:
         """Remove fenced/stale `.part-<job_id>-t<token>` staging directories; returns True when retryable items remain."""
         if stop_event is not None and stop_event.is_set():
+            return False
+        if (
+            account_id is not None
+            and expected_generation is not None
+            and not self.account_generation_matches(source, account_id, expected_generation=expected_generation)
+        ):
             return False
         has_remaining = False
         media_root = self.database_path.parent / "media"
@@ -2959,6 +3011,17 @@ class ArchiveStore:
         for acc_dir in account_dirs:
             if stop_event is not None and stop_event.is_set():
                 return True
+            if (
+                account_id is not None
+                and expected_generation is not None
+                and not self.account_generation_matches(source, account_id, expected_generation=expected_generation)
+            ):
+                return False
+            dir_expected_generation = (
+                expected_generation
+                if account_id is not None and acc_dir.name == account_id
+                else None
+            )
             try:
                 chat_dirs = list(acc_dir.iterdir())
             except FileNotFoundError:
@@ -2981,6 +3044,16 @@ class ArchiveStore:
                 for entry in entries:
                     if stop_event is not None and stop_event.is_set():
                         return True
+                    if (
+                        account_id is not None
+                        and expected_generation is not None
+                        and not self.account_generation_matches(
+                            source,
+                            account_id,
+                            expected_generation=expected_generation,
+                        )
+                    ):
+                        return False
                     if not entry.name.startswith(".part-") or not entry.is_dir():
                         continue
                     parsed = _parse_media_staging_dir_name(entry.name)
@@ -2996,8 +3069,19 @@ class ArchiveStore:
                         source=source,
                         account_id=acc_dir.name,
                         allow_fencing_downloading=allow_fencing_downloading,
+                        expected_generation=dir_expected_generation,
                     ):
                         continue
+                    if (
+                        account_id is not None
+                        and expected_generation is not None
+                        and not self.account_generation_matches(
+                            source,
+                            account_id,
+                            expected_generation=expected_generation,
+                        )
+                    ):
+                        return False
                     try:
                         shutil.rmtree(entry)
                     except FileNotFoundError:

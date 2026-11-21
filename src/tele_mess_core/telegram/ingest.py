@@ -57,6 +57,7 @@ class TelegramArchiveService:
         *,
         auth_owner_provider: Callable[[], tuple[str, int]] | None = None,
         account_generation: int | None = None,
+        on_stale: Callable[[], None] | None = None,
     ):
         self.config = config
         self.backfill = backfill or BackfillConfig()
@@ -65,6 +66,7 @@ class TelegramArchiveService:
         self.store = store
         self._auth_owner_provider = auth_owner_provider
         self._account_generation = account_generation
+        self._on_stale = on_stale
         self.logger = logging.getLogger(__name__)
         self.client = None
         self._handlers_registered = False
@@ -211,6 +213,11 @@ class TelegramArchiveService:
         self._media_cleanup_stop.set()
         self._retry_targets.clear()
         self._media_wakeup.set()
+        if self._on_stale is not None:
+            try:
+                self._on_stale()
+            except Exception:
+                self.logger.debug("on_stale callback failed for account %s", self.account_id, exc_info=True)
 
     def _stop_if_generation_stale(self) -> bool:
         if not self._account_generation_is_current():
@@ -263,12 +270,12 @@ class TelegramArchiveService:
         if self._deactivate_if_stale():
             return False
         self._start_media_worker()
-        await self.refresh_capture_targets()
-        return not self._disabled
+        refreshed = await self.refresh_capture_targets()
+        return bool(refreshed and not self._disabled)
 
-    async def refresh_capture_targets(self) -> None:
+    async def refresh_capture_targets(self) -> bool:
         if self._deactivate_if_stale():
-            return
+            return False
         capture_targets = self._capture_targets()
         self.logger.info(
             "Monitoring Telegram messages for account %s with %s enabled capture targets",
@@ -277,9 +284,10 @@ class TelegramArchiveService:
         )
         failed_targets = await self._backfill_capture_targets(capture_targets)
         if self._deactivate_if_stale():
-            return
+            return False
         self._schedule_backfill_retry(failed_targets)
         self._media_wakeup.set()
+        return True
 
     async def stop(self) -> None:
         self._closed = True
@@ -501,6 +509,7 @@ class TelegramArchiveService:
             stale_seconds=stale_seconds,
             include_deleted_accounts=True,
             stop_event=stop_event,
+            expected_generation=self._account_generation,
         )
 
     def _cleanup_pending_media_paths(self, *, stop_event: threading.Event | None = None) -> bool:
@@ -511,6 +520,7 @@ class TelegramArchiveService:
             stale_seconds=stale_seconds,
             include_deleted_accounts=True,
             stop_event=stop_event,
+            expected_generation=self._account_generation,
         )
 
     def _cleanup_orphan_media_artifacts(self) -> bool:
