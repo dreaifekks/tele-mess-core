@@ -391,8 +391,15 @@ CREATE INDEX IF NOT EXISTS idx_origins_account_type ON origins(source, account_i
 CREATE INDEX IF NOT EXISTS idx_capture_cursors_account ON capture_cursors(source, account_id, origin_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_message ON media_files(source, account_id, chat_id, message_id);
 CREATE INDEX IF NOT EXISTS idx_media_files_downloaded ON media_files(downloaded_at);
+CREATE INDEX IF NOT EXISTS idx_media_files_file_path ON media_files(file_path);
 CREATE INDEX IF NOT EXISTS idx_media_download_jobs_claim ON media_download_jobs(source, account_id, status, next_attempt_at, created_at);
 CREATE INDEX IF NOT EXISTS idx_media_download_jobs_status ON media_download_jobs(status);
+CREATE INDEX IF NOT EXISTS idx_media_download_jobs_downloading
+ON media_download_jobs(source, account_id, updated_at)
+WHERE status = 'downloading';
+CREATE INDEX IF NOT EXISTS idx_media_download_jobs_pending_path
+ON media_download_jobs(pending_file_path)
+WHERE pending_file_path IS NOT NULL;
 CREATE INDEX IF NOT EXISTS idx_operation_events_account ON operation_events(source, account_id, occurred_at);
 CREATE INDEX IF NOT EXISTS idx_operation_events_status ON operation_events(status, error_code);
 CREATE INDEX IF NOT EXISTS idx_backup_policies_enabled ON backup_policies(enabled);

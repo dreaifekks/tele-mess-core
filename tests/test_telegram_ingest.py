@@ -5694,6 +5694,53 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 store2.close()
                 local_store.close()
 
+    async def test_store_message_coalesces_chat_user_and_cursor_in_single_transaction(self) -> None:
+        from tele_mess_core.models import OriginRecord
+
+        chat_id = -1091
+        self.store.upsert_origin(OriginRecord(SOURCE_TELEGRAM, "main", chat_id, "group", title="Single Tx Chat"))
+        self.store.set_backup_policy(
+            BackupPolicyRecord(SOURCE_TELEGRAM, "main", chat_id, enabled=True, download_media=True)
+        )
+        msg = FakeMessage(950, chat_id, text="coalesced write", media=MessageMediaDocument())
+
+        begin_immediate_count = 0
+
+        def trace_sql(statement: str) -> None:
+            nonlocal begin_immediate_count
+            if statement.strip().upper() == "BEGIN IMMEDIATE":
+                begin_immediate_count += 1
+
+        self.store._conn.set_trace_callback(trace_sql)
+        try:
+            stored = await self.service._store_message(msg, event_type="new")
+        finally:
+            self.store._conn.set_trace_callback(None)
+
+        self.assertTrue(stored)
+        self.assertEqual(begin_immediate_count, 1)
+        self.assertIsNotNone(self.store.get_message(SOURCE_TELEGRAM, "main", chat_id, 950))
+        cursor = self.store.get_capture_cursor(SOURCE_TELEGRAM, "main", chat_id, 0)
+        self.assertIsNotNone(cursor)
+        assert cursor is not None
+        self.assertEqual(cursor["last_message_id"], 950)
+        chat_row = self.store._conn.execute(
+            "SELECT title FROM chats WHERE source = ? AND account_id = ? AND chat_id = ?",
+            (SOURCE_TELEGRAM, "main", chat_id),
+        ).fetchone()
+        self.assertIsNotNone(chat_row)
+        user_row = self.store._conn.execute(
+            "SELECT display_name FROM users WHERE source = ? AND account_id = ? AND user_id = ?",
+            (SOURCE_TELEGRAM, "main", 7),
+        ).fetchone()
+        self.assertIsNotNone(user_row)
+        jobs = [
+            j
+            for j in self.store.list_media_download_jobs(account_id="main")
+            if j["chat_id"] == chat_id and j["message_id"] == 950
+        ]
+        self.assertEqual(len(jobs), 1)
+
 
 if __name__ == "__main__":
     unittest.main()

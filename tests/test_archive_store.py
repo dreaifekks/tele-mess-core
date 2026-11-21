@@ -2936,7 +2936,7 @@ class ArchiveMigrationTest(unittest.TestCase):
                     reopened.initialize()
                 old_conn.close()
                 reopened.initialize()
-                self.assertEqual(reopened.state()["schema_version"], 21)
+                self.assertEqual(reopened.state()["schema_version"], SCHEMA_VERSION)
                 self.assertEqual(reopened.state()["media_download_pending"], 0)
                 self.assertEqual(reopened.state()["media_download_failed"], 0)
                 self.assertTrue(reopened._has_table("media_download_jobs"))
@@ -3139,6 +3139,125 @@ class ArchiveMigrationTest(unittest.TestCase):
                 except Exception:
                     pass
                 reopened.close()
+
+    def test_v22_performance_indexes_query_plans_and_idle_claim_fast_path(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "v22_perf.db"
+            store = ArchiveStore(db_path)
+            store.initialize()
+            store.close()
+            # Simulate a v21 database without v22 indexes and verify smooth upgrade.
+            v21_conn = sqlite3.connect(str(db_path))
+            v21_conn.executescript(
+                """
+                DROP INDEX IF EXISTS idx_media_files_file_path;
+                DROP INDEX IF EXISTS idx_media_download_jobs_downloading;
+                DROP INDEX IF EXISTS idx_media_download_jobs_pending_path;
+                UPDATE meta SET value = '21' WHERE key = 'schema_version';
+                PRAGMA user_version = 21;
+                """
+            )
+            v21_conn.commit()
+            v21_conn.close()
+
+            upgraded = ArchiveStore(db_path)
+            writer = sqlite3.connect(str(db_path), timeout=0.2)
+            try:
+                upgraded.initialize()
+                self.assertEqual(upgraded.state()["schema_version"], SCHEMA_VERSION)
+                self.assertEqual(upgraded._conn.execute("PRAGMA synchronous").fetchone()[0], 1)
+
+                # Verify all hot-path queries hit the new indexes instead of table scans.
+                plan_media_path = " ".join(
+                    str(row[3])
+                    for row in upgraded._conn.execute(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM media_files WHERE file_path = '/tmp/x' LIMIT 1"
+                    ).fetchall()
+                )
+                self.assertIn("idx_media_files_file_path", plan_media_path)
+
+                plan_pending_path = " ".join(
+                    str(row[3])
+                    for row in upgraded._conn.execute(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM media_download_jobs "
+                        "WHERE pending_file_path = '/tmp/x' AND job_id != 'j1' LIMIT 1"
+                    ).fetchall()
+                )
+                self.assertIn("idx_media_download_jobs_pending_path", plan_pending_path)
+
+                plan_downloading = " ".join(
+                    str(row[3])
+                    for row in upgraded._conn.execute(
+                        "EXPLAIN QUERY PLAN SELECT * FROM media_download_jobs "
+                        "WHERE source = 'telegram' AND account_id = 'main' "
+                        "AND status = 'downloading' AND updated_at <= '2026-01-01T00:00:00+00:00' "
+                        "AND attempts < max_attempts LIMIT 1"
+                    ).fetchall()
+                )
+                self.assertIn("idx_media_download_jobs_downloading", plan_downloading)
+
+                # Seed completed + future retry jobs and hold a write lock on a second connection.
+                for idx in range(50):
+                    j = upgraded.enqueue_media_download_job(account_id="main", chat_id=-2020, message_id=idx + 1)
+                    assert j is not None
+                    claimed = upgraded.claim_media_download_job("main")
+                    assert claimed is not None
+                    upgraded.complete_media_download_job(
+                        str(claimed["job_id"]),
+                        expected_claim_token=int(claimed["claim_token"]),
+                    )
+                future_job = upgraded.enqueue_media_download_job(account_id="main", chat_id=-2020, message_id=999)
+                assert future_job is not None
+                future_claimed = upgraded.claim_media_download_job("main")
+                assert future_claimed is not None
+                upgraded.retry_media_download_job(
+                    str(future_claimed["job_id"]),
+                    error="later",
+                    error_code="later",
+                    next_attempt_at="2099-01-01T00:00:00+00:00",
+                    expected_claim_token=int(future_claimed["claim_token"]),
+                )
+
+                # Idle claim fast-path must NOT acquire BEGIN IMMEDIATE even while another writer holds the write lock.
+                writer.execute("BEGIN IMMEDIATE")
+                self.assertIsNone(upgraded.claim_media_download_job("main", stale_seconds=300.0))
+                writer.rollback()
+
+                # Verify exact earliest-due ordering across timed retry, immediate pending, and stale downloading.
+                j_retry = upgraded.enqueue_media_download_job(account_id="main", chat_id=-2021, message_id=1)
+                j_pending = upgraded.enqueue_media_download_job(account_id="main", chat_id=-2021, message_id=2)
+                j_stale = upgraded.enqueue_media_download_job(account_id="main", chat_id=-2021, message_id=3)
+                assert j_retry and j_pending and j_stale
+                upgraded._conn.execute(
+                    "UPDATE media_download_jobs SET status = 'retry', next_attempt_at = '2026-01-01T00:00:02+00:00', "
+                    "created_at = '2026-01-01T00:00:05+00:00' WHERE job_id = ?",
+                    (j_retry["job_id"],),
+                )
+                upgraded._conn.execute(
+                    "UPDATE media_download_jobs SET status = 'pending', next_attempt_at = NULL, "
+                    "created_at = '2026-01-01T00:00:03+00:00' WHERE job_id = ?",
+                    (j_pending["job_id"],),
+                )
+                upgraded._conn.execute(
+                    "UPDATE media_download_jobs SET status = 'downloading', attempts = 1, max_attempts = 4, "
+                    "next_attempt_at = NULL, created_at = '2026-01-01T00:00:01+00:00', "
+                    "updated_at = '2020-01-01T00:00:00+00:00' WHERE job_id = ?",
+                    (j_stale["job_id"],),
+                )
+                upgraded._conn.commit()
+
+                order = []
+                for _ in range(3):
+                    c = upgraded.claim_media_download_job("main", stale_seconds=60.0)
+                    assert c is not None
+                    order.append(c["job_id"])
+                    upgraded.complete_media_download_job(str(c["job_id"]), expected_claim_token=int(c["claim_token"]))
+                self.assertEqual(order, [j_stale["job_id"], j_retry["job_id"], j_pending["job_id"]])
+            finally:
+                if writer.in_transaction:
+                    writer.rollback()
+                writer.close()
+                upgraded.close()
 
 
 if __name__ == "__main__":

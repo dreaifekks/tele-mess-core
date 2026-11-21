@@ -7,6 +7,12 @@ validation rules.
 
 ## Unreleased
 
+- Optimized SQLite archive hot paths (Schema version 22): enabled WAL-mode
+  `PRAGMA synchronous = NORMAL`, coalesced message/chat/user/cursor persistence
+  in Telegram ingestion into a single write transaction, added a lock-free idle
+  fast-path and index-backed selection for `claim_media_download_job`, and added
+  `idx_media_files_file_path`, `idx_media_download_jobs_downloading`, and
+  `idx_media_download_jobs_pending_path` indexes.
 - Delivery outbox chunks are numbered and ordered per `(summary_run_id, target,
   content_kind)`, so important and point reports carry independent `[i/n]`
   prefixes and a retrying report no longer blocks the other. After 30 failed

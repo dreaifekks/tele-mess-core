@@ -550,6 +550,29 @@ def _migration_21(connection: sqlite3.Connection) -> None:
     )
 
 
+def _migration_22(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_files_file_path
+          ON media_files(file_path)
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_download_jobs_downloading
+          ON media_download_jobs(source, account_id, updated_at)
+          WHERE status = 'downloading'
+        """
+    )
+    connection.execute(
+        """
+        CREATE INDEX IF NOT EXISTS idx_media_download_jobs_pending_path
+          ON media_download_jobs(pending_file_path)
+          WHERE pending_file_path IS NOT NULL
+        """
+    )
+
+
 def _ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
     names = {str(row[1]) for row in rows}
@@ -567,4 +590,5 @@ MIGRATIONS: dict[int, Migration] = {
     19: _migration_19,
     20: _migration_20,
     21: _migration_21,
+    22: _migration_22,
 }

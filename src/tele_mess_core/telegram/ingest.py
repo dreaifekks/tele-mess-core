@@ -786,26 +786,18 @@ class TelegramArchiveService:
                 build_record=_build_record,
                 build_media_job=_build_media_job,
                 expected_generation=self._account_generation,
+                chat_record=_chat_record(self.account_id, chat, chat_id=chat_id) if chat else None,
+                user_record=_user_record(self.account_id, sender) if sender else None,
+                update_capture_cursor=True,
             )
             if result is None or built_record is None:
                 self._deactivate_if_stale()
                 return False
-            if chat:
-                self.store.upsert_chat(
-                    _chat_record(self.account_id, chat, chat_id=chat_id),
-                    expected_generation=self._account_generation,
-                )
-            if sender:
-                self.store.upsert_user(
-                    _user_record(self.account_id, sender),
-                    expected_generation=self._account_generation,
-                )
         finally:
             self._unregister_inflight_fetch(chat_id, message_id, active_state)
 
         if enqueued_media:
             self._media_wakeup.set()
-        self._update_capture_cursor(chat_id, topic_id, message_id, built_record.sent_at)
         return True
 
     async def _execute_media_download_job(self, job: dict[str, Any]) -> None:

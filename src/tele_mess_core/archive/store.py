@@ -46,7 +46,7 @@ from tele_mess_core.media import (
 )
 
 
-SCHEMA_VERSION = 21
+SCHEMA_VERSION = 22
 UPGRADE_PENDING_META = "upgrade_pending"
 LEGACY_SCHEMA_BASELINE = 12
 
@@ -102,6 +102,7 @@ class ArchiveStore:
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(f"PRAGMA busy_timeout = {int(busy_timeout_ms)}")
+        connection.execute("PRAGMA synchronous = NORMAL")
         connection.create_function("tmc_media_filename", 1, media_filename, deterministic=True)
         connection.create_function("tmc_media_file_extension", 1, media_file_extension, deterministic=True)
         connection.create_function("tmc_media_type", 3, classify_media_type, deterministic=True)
@@ -704,6 +705,21 @@ class ArchiveStore:
             )
         return sorted(items.values(), key=lambda item: (item["source"], item["account_id"]))
 
+    def _upsert_chat_unlocked(self, chat: ChatRecord, now: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO chats(source, account_id, chat_id, title, username, kind, updated_at, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id, chat_id) DO UPDATE SET
+              title = excluded.title,
+              username = excluded.username,
+              kind = excluded.kind,
+              updated_at = excluded.updated_at,
+              raw_json = excluded.raw_json
+            """,
+            (chat.source, chat.account_id, chat.chat_id, chat.title, chat.username, chat.kind, now, chat.raw_json),
+        )
+
     def upsert_chat(
         self,
         chat: ChatRecord,
@@ -721,25 +737,37 @@ class ArchiveStore:
                 ):
                     self._conn.rollback()
                     return False
-                self._conn.execute(
-                    """
-                    INSERT INTO chats(source, account_id, chat_id, title, username, kind, updated_at, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source, account_id, chat_id) DO UPDATE SET
-                      title = excluded.title,
-                      username = excluded.username,
-                      kind = excluded.kind,
-                      updated_at = excluded.updated_at,
-                      raw_json = excluded.raw_json
-                    """,
-                    (chat.source, chat.account_id, chat.chat_id, chat.title, chat.username, chat.kind, now, chat.raw_json),
-                )
+                self._upsert_chat_unlocked(chat, now)
                 self._conn.commit()
                 return True
             except Exception:
                 if self._conn.in_transaction:
                     self._conn.rollback()
                 raise
+
+    def _upsert_user_unlocked(self, user: UserRecord, now: str) -> None:
+        self._conn.execute(
+            """
+            INSERT INTO users(source, account_id, user_id, username, display_name, is_bot, updated_at, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id, user_id) DO UPDATE SET
+              username = excluded.username,
+              display_name = excluded.display_name,
+              is_bot = excluded.is_bot,
+              updated_at = excluded.updated_at,
+              raw_json = excluded.raw_json
+            """,
+            (
+                user.source,
+                user.account_id,
+                user.user_id,
+                user.username,
+                user.display_name,
+                int(user.is_bot),
+                now,
+                user.raw_json,
+            ),
+        )
 
     def upsert_user(
         self,
@@ -758,28 +786,7 @@ class ArchiveStore:
                 ):
                     self._conn.rollback()
                     return False
-                self._conn.execute(
-                    """
-                    INSERT INTO users(source, account_id, user_id, username, display_name, is_bot, updated_at, raw_json)
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source, account_id, user_id) DO UPDATE SET
-                      username = excluded.username,
-                      display_name = excluded.display_name,
-                      is_bot = excluded.is_bot,
-                      updated_at = excluded.updated_at,
-                      raw_json = excluded.raw_json
-                    """,
-                    (
-                        user.source,
-                        user.account_id,
-                        user.user_id,
-                        user.username,
-                        user.display_name,
-                        int(user.is_bot),
-                        now,
-                        user.raw_json,
-                    ),
-                )
+                self._upsert_user_unlocked(user, now)
                 self._conn.commit()
                 return True
             except Exception:
@@ -1303,6 +1310,106 @@ class ArchiveStore:
             ).fetchone()
         return _row_to_dict(row, json_fields={"raw_json"}) if row else None
 
+    def _upsert_capture_cursor_unlocked(self, cursor: CaptureCursorRecord, now: str) -> None:
+        observed_max_message_id = max(
+            cursor.last_message_id,
+            cursor.observed_max_message_id or 0,
+        )
+        history_scanned_through_id = cursor.history_scanned_through_id or 0
+        self._conn.execute(
+            """
+            INSERT INTO capture_cursors(
+              source, account_id, origin_id, topic_id, last_message_id,
+              history_scanned_through_id, observed_max_message_id,
+              last_message_at, last_backfill_at, backfill_head_message_id,
+              backfill_status, backfill_error, backfill_count, updated_at, raw_json
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
+              last_message_id = MAX(
+                capture_cursors.last_message_id,
+                capture_cursors.observed_max_message_id,
+                excluded.last_message_id,
+                excluded.observed_max_message_id
+              ),
+              history_scanned_through_id = MAX(
+                capture_cursors.history_scanned_through_id,
+                excluded.history_scanned_through_id
+              ),
+              observed_max_message_id = MAX(
+                capture_cursors.last_message_id,
+                capture_cursors.observed_max_message_id,
+                excluded.last_message_id,
+                excluded.observed_max_message_id
+              ),
+              last_message_at = CASE
+                WHEN excluded.last_message_at IS NULL THEN capture_cursors.last_message_at
+                WHEN capture_cursors.last_message_at IS NULL
+                  OR excluded.last_message_at > capture_cursors.last_message_at
+                THEN excluded.last_message_at
+                ELSE capture_cursors.last_message_at
+              END,
+              last_backfill_at = CASE
+                WHEN excluded.last_backfill_at IS NULL THEN capture_cursors.last_backfill_at
+                WHEN capture_cursors.last_backfill_at IS NULL
+                  OR excluded.last_backfill_at > capture_cursors.last_backfill_at
+                THEN excluded.last_backfill_at
+                ELSE capture_cursors.last_backfill_at
+              END,
+              backfill_head_message_id = CASE
+                WHEN excluded.backfill_head_message_id IS NULL
+                THEN capture_cursors.backfill_head_message_id
+                WHEN capture_cursors.backfill_head_message_id IS NULL
+                  OR excluded.backfill_head_message_id > capture_cursors.backfill_head_message_id
+                THEN excluded.backfill_head_message_id
+                ELSE capture_cursors.backfill_head_message_id
+              END,
+              backfill_status = COALESCE(excluded.backfill_status, capture_cursors.backfill_status),
+              backfill_error = COALESCE(excluded.backfill_error, capture_cursors.backfill_error),
+              backfill_count = COALESCE(excluded.backfill_count, capture_cursors.backfill_count),
+              updated_at = excluded.updated_at,
+              raw_json = COALESCE(excluded.raw_json, capture_cursors.raw_json)
+            """,
+            (
+                cursor.source,
+                cursor.account_id,
+                cursor.origin_id,
+                cursor.topic_id,
+                observed_max_message_id,
+                history_scanned_through_id,
+                observed_max_message_id,
+                cursor.last_message_at,
+                cursor.last_backfill_at,
+                cursor.backfill_head_message_id,
+                cursor.backfill_status,
+                cursor.backfill_error,
+                cursor.backfill_count,
+                now,
+                cursor.raw_json,
+            ),
+        )
+        if cursor.last_message_at:
+            self._conn.execute(
+                """
+                UPDATE origins
+                SET last_message_at = CASE
+                      WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
+                      ELSE last_message_at
+                    END,
+                    updated_at = ?
+                WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                """,
+                (
+                    cursor.last_message_at,
+                    cursor.last_message_at,
+                    now,
+                    cursor.source,
+                    cursor.account_id,
+                    cursor.origin_id,
+                    cursor.topic_id,
+                ),
+            )
+
     def upsert_capture_cursor(
         self,
         cursor: CaptureCursorRecord,
@@ -1310,11 +1417,6 @@ class ArchiveStore:
         expected_generation: int | None = None,
     ) -> bool:
         now = cursor.updated_at or utc_now_iso()
-        observed_max_message_id = max(
-            cursor.last_message_id,
-            cursor.observed_max_message_id or 0,
-        )
-        history_scanned_through_id = cursor.history_scanned_through_id or 0
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
@@ -1325,99 +1427,7 @@ class ArchiveStore:
                 ):
                     self._conn.rollback()
                     return False
-                self._conn.execute(
-                    """
-                    INSERT INTO capture_cursors(
-                      source, account_id, origin_id, topic_id, last_message_id,
-                      history_scanned_through_id, observed_max_message_id,
-                      last_message_at, last_backfill_at, backfill_head_message_id,
-                      backfill_status, backfill_error, backfill_count, updated_at, raw_json
-                    )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                    ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
-                      last_message_id = MAX(
-                        capture_cursors.last_message_id,
-                        capture_cursors.observed_max_message_id,
-                        excluded.last_message_id,
-                        excluded.observed_max_message_id
-                      ),
-                      history_scanned_through_id = MAX(
-                        capture_cursors.history_scanned_through_id,
-                        excluded.history_scanned_through_id
-                      ),
-                      observed_max_message_id = MAX(
-                        capture_cursors.last_message_id,
-                        capture_cursors.observed_max_message_id,
-                        excluded.last_message_id,
-                        excluded.observed_max_message_id
-                      ),
-                      last_message_at = CASE
-                        WHEN excluded.last_message_at IS NULL THEN capture_cursors.last_message_at
-                        WHEN capture_cursors.last_message_at IS NULL
-                          OR excluded.last_message_at > capture_cursors.last_message_at
-                        THEN excluded.last_message_at
-                        ELSE capture_cursors.last_message_at
-                      END,
-                      last_backfill_at = CASE
-                        WHEN excluded.last_backfill_at IS NULL THEN capture_cursors.last_backfill_at
-                        WHEN capture_cursors.last_backfill_at IS NULL
-                          OR excluded.last_backfill_at > capture_cursors.last_backfill_at
-                        THEN excluded.last_backfill_at
-                        ELSE capture_cursors.last_backfill_at
-                      END,
-                      backfill_head_message_id = CASE
-                        WHEN excluded.backfill_head_message_id IS NULL
-                        THEN capture_cursors.backfill_head_message_id
-                        WHEN capture_cursors.backfill_head_message_id IS NULL
-                          OR excluded.backfill_head_message_id > capture_cursors.backfill_head_message_id
-                        THEN excluded.backfill_head_message_id
-                        ELSE capture_cursors.backfill_head_message_id
-                      END,
-                      backfill_status = COALESCE(excluded.backfill_status, capture_cursors.backfill_status),
-                      backfill_error = COALESCE(excluded.backfill_error, capture_cursors.backfill_error),
-                      backfill_count = COALESCE(excluded.backfill_count, capture_cursors.backfill_count),
-                      updated_at = excluded.updated_at,
-                      raw_json = COALESCE(excluded.raw_json, capture_cursors.raw_json)
-                    """,
-                    (
-                        cursor.source,
-                        cursor.account_id,
-                        cursor.origin_id,
-                        cursor.topic_id,
-                        observed_max_message_id,
-                        history_scanned_through_id,
-                        observed_max_message_id,
-                        cursor.last_message_at,
-                        cursor.last_backfill_at,
-                        cursor.backfill_head_message_id,
-                        cursor.backfill_status,
-                        cursor.backfill_error,
-                        cursor.backfill_count,
-                        now,
-                        cursor.raw_json,
-                    ),
-                )
-                if cursor.last_message_at:
-                    self._conn.execute(
-                        """
-                        UPDATE origins
-                        SET last_message_at = CASE
-                              WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
-                              ELSE last_message_at
-                            END,
-                            updated_at = ?
-                        WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
-                        """,
-                        (
-                            cursor.last_message_at,
-                            cursor.last_message_at,
-                            now,
-                            cursor.source,
-                            cursor.account_id,
-                            cursor.origin_id,
-                            cursor.topic_id,
-                        ),
-                    )
+                self._upsert_capture_cursor_unlocked(cursor, now)
                 self._conn.commit()
                 return True
             except Exception:
@@ -1563,6 +1573,9 @@ class ArchiveStore:
         build_record: Callable[[dict[str, Any]], MessageRecord],
         build_media_job: Callable[[dict[str, Any], MessageRecord], dict[str, Any] | None] | None = None,
         expected_generation: int | None = None,
+        chat_record: ChatRecord | None = None,
+        user_record: UserRecord | None = None,
+        update_capture_cursor: bool = False,
     ) -> tuple[int, dict[str, Any]] | None:
         """Atomically resolve effective backup policy, build the message from it, and insert/update in one write transaction."""
         with self._lock:
@@ -1643,6 +1656,23 @@ class ArchiveStore:
                             reason="media_removed_on_edit",
                             now=now,
                         )
+                if chat_record is not None:
+                    self._upsert_chat_unlocked(chat_record, chat_record.updated_at or now)
+                if user_record is not None:
+                    self._upsert_user_unlocked(user_record, user_record.updated_at or now)
+                if update_capture_cursor:
+                    self._upsert_capture_cursor_unlocked(
+                        CaptureCursorRecord(
+                            source=message.source,
+                            account_id=message.account_id,
+                            origin_id=message.chat_id,
+                            topic_id=int(message.topic_id or 0),
+                            last_message_id=message.message_id,
+                            last_message_at=message.sent_at,
+                            updated_at=now,
+                        ),
+                        now,
+                    )
                 self._conn.commit()
                 return event_seq, effective_policy
             except Exception:
@@ -2339,6 +2369,94 @@ class ArchiveStore:
                     self._conn.rollback()
                 raise
 
+    def _find_claimable_media_job_unlocked(
+        self,
+        source: str,
+        account_id: str,
+        now: str,
+        stale_before: str,
+    ) -> sqlite3.Row | None:
+        """Select the earliest due/stale media download job using indexed lookups only."""
+        candidates: list[sqlite3.Row] = []
+        for status in ("pending", "retry"):
+            immediate = self._conn.execute(
+                """
+                SELECT *
+                FROM media_download_jobs
+                WHERE source = ?
+                  AND account_id = ?
+                  AND status = ?
+                  AND next_attempt_at IS NULL
+                ORDER BY created_at ASC, job_id ASC
+                LIMIT 1
+                """,
+                (source, account_id, status),
+            ).fetchone()
+            if immediate is not None:
+                candidates.append(immediate)
+            scheduled = self._conn.execute(
+                """
+                SELECT *
+                FROM media_download_jobs
+                WHERE source = ?
+                  AND account_id = ?
+                  AND status = ?
+                  AND next_attempt_at <= ?
+                ORDER BY next_attempt_at ASC, created_at ASC, job_id ASC
+                LIMIT 1
+                """,
+                (source, account_id, status, now),
+            ).fetchone()
+            if scheduled is not None:
+                candidates.append(scheduled)
+        stale_downloading = self._conn.execute(
+            """
+            SELECT *
+            FROM media_download_jobs
+            WHERE source = ?
+              AND account_id = ?
+              AND status = 'downloading'
+              AND updated_at <= ?
+              AND attempts < max_attempts
+            ORDER BY COALESCE(next_attempt_at, created_at) ASC, created_at ASC, job_id ASC
+            LIMIT 1
+            """,
+            (source, account_id, stale_before),
+        ).fetchone()
+        if stale_downloading is not None:
+            candidates.append(stale_downloading)
+        if not candidates:
+            return None
+        return min(
+            candidates,
+            key=lambda row: (
+                str(row["next_attempt_at"] or row["created_at"]),
+                str(row["created_at"]),
+                str(row["job_id"]),
+            ),
+        )
+
+    def _has_expired_downloading_media_job_unlocked(
+        self,
+        source: str,
+        account_id: str,
+        stale_before: str,
+    ) -> bool:
+        row = self._conn.execute(
+            """
+            SELECT 1
+            FROM media_download_jobs
+            WHERE source = ?
+              AND account_id = ?
+              AND status = 'downloading'
+              AND updated_at <= ?
+              AND attempts >= max_attempts
+            LIMIT 1
+            """,
+            (source, account_id, stale_before),
+        ).fetchone()
+        return row is not None
+
     def claim_media_download_job(
         self,
         account_id: str,
@@ -2348,6 +2466,24 @@ class ArchiveStore:
         expected_generation: int | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
+            # Lock-free read fast-path avoids acquiring a write lock on every idle poll.
+            if expected_generation is not None and not self._account_generation_matches_unlocked(
+                source,
+                account_id,
+                expected_generation,
+            ):
+                return None
+            quick_now_dt = datetime.now(dt_timezone.utc)
+            quick_now = quick_now_dt.isoformat()
+            quick_stale_before = (
+                quick_now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))
+            ).isoformat()
+            if (
+                self._find_claimable_media_job_unlocked(source, account_id, quick_now, quick_stale_before) is None
+                and not self._has_expired_downloading_media_job_unlocked(source, account_id, quick_stale_before)
+            ):
+                return None
+
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if expected_generation is not None and not self._account_generation_matches_unlocked(
@@ -2377,21 +2513,7 @@ class ArchiveStore:
                     """,
                     (now, now, source, account_id, stale_before),
                 )
-                row = self._conn.execute(
-                    """
-                    SELECT *
-                    FROM media_download_jobs
-                    WHERE source = ?
-                      AND account_id = ?
-                      AND (
-                        (status IN ('pending', 'retry') AND (next_attempt_at IS NULL OR next_attempt_at <= ?))
-                        OR (status = 'downloading' AND updated_at <= ? AND attempts < max_attempts)
-                      )
-                    ORDER BY COALESCE(next_attempt_at, created_at) ASC, created_at ASC, job_id ASC
-                    LIMIT 1
-                    """,
-                    (source, account_id, now, stale_before),
-                ).fetchone()
+                row = self._find_claimable_media_job_unlocked(source, account_id, now, stale_before)
                 if row is None:
                     if expired.rowcount > 0:
                         self._conn.commit()
