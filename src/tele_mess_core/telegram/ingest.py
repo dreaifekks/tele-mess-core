@@ -196,6 +196,33 @@ class TelegramArchiveService:
 
         self._handlers_registered = True
 
+    def _account_generation_is_current(self) -> bool:
+        if self._account_generation is None:
+            return True
+        return self.store.account_generation_matches(
+            SOURCE_TELEGRAM,
+            self.account_id,
+            expected_generation=self._account_generation,
+        )
+
+    def _mark_stale(self) -> None:
+        self._disabled = True
+        self._closed = True
+        self._media_cleanup_stop.set()
+        self._retry_targets.clear()
+        self._media_wakeup.set()
+
+    def _stop_if_generation_stale(self) -> bool:
+        if not self._account_generation_is_current():
+            self._mark_stale()
+            return True
+        return False
+
+    def _deactivate_if_stale(self) -> bool:
+        if self._closed or self._disabled:
+            return True
+        return self._stop_if_generation_stale()
+
     async def activate(self, client: Any) -> bool:
         self._closed = False
         self._disabled = False
@@ -228,17 +255,20 @@ class TelegramArchiveService:
             ),
         )
         if not wrote:
-            self._disabled = True
-            self._closed = True
+            self._mark_stale()
             return False
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):
             await catch_up()
+        if self._deactivate_if_stale():
+            return False
         self._start_media_worker()
         await self.refresh_capture_targets()
-        return True
+        return not self._disabled
 
     async def refresh_capture_targets(self) -> None:
+        if self._deactivate_if_stale():
+            return
         capture_targets = self._capture_targets()
         self.logger.info(
             "Monitoring Telegram messages for account %s with %s enabled capture targets",
@@ -246,6 +276,8 @@ class TelegramArchiveService:
             len(capture_targets),
         )
         failed_targets = await self._backfill_capture_targets(capture_targets)
+        if self._deactivate_if_stale():
+            return
         self._schedule_backfill_retry(failed_targets)
         self._media_wakeup.set()
 
@@ -367,9 +399,15 @@ class TelegramArchiveService:
                 next_pending_cleanup_at = loop.time() + delay
 
         try:
+            if self._deactivate_if_stale():
+                return
             await _run_fs_cleanup()
+            if self._deactivate_if_stale():
+                return
             _run_pending_cleanup()
             while not self._closed:
+                if self._deactivate_if_stale():
+                    break
                 self._media_wakeup.clear()
                 if self.client is None:
                     await self._wait_media_wakeup(1.0)
@@ -383,6 +421,7 @@ class TelegramArchiveService:
                         self.account_id,
                         source=SOURCE_TELEGRAM,
                         stale_seconds=self.media_download.stale_seconds,
+                        expected_generation=self._account_generation,
                     )
                 except Exception as exc:
                     self.logger.warning(
@@ -408,11 +447,15 @@ class TelegramArchiveService:
                         )
                         await self._wait_media_wakeup(1.0)
                     continue
+                if self._deactivate_if_stale():
+                    break
                 now_mono = loop.time()
                 if next_pending_cleanup_at is None or now_mono >= next_pending_cleanup_at:
                     _run_pending_cleanup()
                 if now_mono >= next_fs_cleanup_at:
                     await _run_fs_cleanup()
+                if self._deactivate_if_stale():
+                    break
                 try:
                     next_due = self.store.next_media_download_due_at(
                         self.account_id,
@@ -500,23 +543,29 @@ class TelegramArchiveService:
 
     async def process_pending_media_downloads(self, *, max_jobs: int | None = None) -> int:
         """Deterministically drain currently due media download jobs for this account."""
+        if self._stop_if_generation_stale():
+            return 0
         self._cleanup_orphan_media_artifacts()
         processed = 0
         while max_jobs is None or processed < max_jobs:
+            if self._stop_if_generation_stale():
+                break
             job = self.store.claim_media_download_job(
                 self.account_id,
                 source=SOURCE_TELEGRAM,
                 stale_seconds=self.media_download.stale_seconds,
+                expected_generation=self._account_generation,
             )
             if job is None:
-                self._cleanup_orphan_media_artifacts()
+                if not self._stop_if_generation_stale():
+                    self._cleanup_orphan_media_artifacts()
                 break
             await self._execute_media_download_job(job)
             processed += 1
         return processed
 
     def _schedule_backfill_retry(self, targets: list[CaptureTarget]) -> None:
-        if self._closed or not targets:
+        if self._closed or self._disabled or not targets or not self._account_generation_is_current():
             return
         self._retry_targets.update(targets)
         if self._retry_task is not None and not self._retry_task.done():
@@ -529,12 +578,16 @@ class TelegramArchiveService:
     async def _retry_failed_backfills(self) -> None:
         delay = max(5.0, self._backfill_retry_wait_seconds)
         try:
-            while self._retry_targets and not self._closed:
+            while self._retry_targets and not self._closed and not self._disabled:
                 await asyncio.sleep(delay)
+                if self._deactivate_if_stale():
+                    break
                 self._backfill_retry_wait_seconds = 5.0
                 targets = list(self._retry_targets)
                 self._retry_targets.clear()
                 failed_targets = await self._backfill_capture_targets(targets)
+                if self._deactivate_if_stale():
+                    break
                 self._retry_targets.update(failed_targets)
                 delay = max(min(delay * 2, 300.0), self._backfill_retry_wait_seconds)
         except asyncio.CancelledError:
@@ -542,7 +595,7 @@ class TelegramArchiveService:
         finally:
             if self._retry_task is asyncio.current_task():
                 self._retry_task = None
-            if self._retry_targets and not self._closed:
+            if self._retry_targets and not self._closed and not self._disabled:
                 self._schedule_backfill_retry(list(self._retry_targets))
 
     def _capture_targets(self) -> list[CaptureTarget]:
@@ -725,11 +778,18 @@ class TelegramArchiveService:
                 expected_generation=self._account_generation,
             )
             if result is None or built_record is None:
+                self._deactivate_if_stale()
                 return False
             if chat:
-                self.store.upsert_chat(_chat_record(self.account_id, chat, chat_id=chat_id))
+                self.store.upsert_chat(
+                    _chat_record(self.account_id, chat, chat_id=chat_id),
+                    expected_generation=self._account_generation,
+                )
             if sender:
-                self.store.upsert_user(_user_record(self.account_id, sender))
+                self.store.upsert_user(
+                    _user_record(self.account_id, sender),
+                    expected_generation=self._account_generation,
+                )
         finally:
             self._unregister_inflight_fetch(chat_id, message_id, active_state)
 
@@ -766,6 +826,7 @@ class TelegramArchiveService:
                     alive = self.store.heartbeat_media_download_job(
                         job_id,
                         expected_claim_token=claim_token,
+                        expected_generation=self._account_generation,
                     )
                 except asyncio.CancelledError:
                     raise
@@ -783,6 +844,8 @@ class TelegramArchiveService:
                 sleep_for = interval
 
         try:
+            if self._stop_if_generation_stale():
+                return
             # Start lease heartbeat immediately upon claim so slow get_messages() RPCs never expire the lease.
             heartbeat_task = asyncio.create_task(
                 _heartbeat_loop(),
@@ -794,7 +857,10 @@ class TelegramArchiveService:
                     job_id,
                     expected_claim_token=claim_token,
                     require_downloading=True,
+                    expected_generation=self._account_generation,
                 )
+                if self._stop_if_generation_stale():
+                    return
                 if not cleared:
                     raise _MediaDownloadResultError(
                         "media_cleanup_failed",
@@ -809,7 +875,11 @@ class TelegramArchiveService:
                     message_id=message_id,
                 )
                 if existing_media:
-                    self.store.complete_media_download_job(job_id, expected_claim_token=claim_token)
+                    self.store.complete_media_download_job(
+                        job_id,
+                        expected_claim_token=claim_token,
+                        expected_generation=self._account_generation,
+                    )
                     return
 
             stored_message = self.store.get_message(SOURCE_TELEGRAM, self.account_id, chat_id, message_id)
@@ -818,6 +888,7 @@ class TelegramArchiveService:
                     job_id,
                     reason="message_deleted",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
             topic_id = int(stored_message.get("topic_id") or topic_id or 0)
@@ -831,6 +902,7 @@ class TelegramArchiveService:
                     job_id,
                     reason="policy_disabled",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
 
@@ -839,10 +911,13 @@ class TelegramArchiveService:
                     job_id,
                     error="client_unavailable",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
 
             fetched = await self.client.get_messages(chat_id, ids=message_id)
+            if self._stop_if_generation_stale():
+                return
             refreshed_messages = _coerce_messages(fetched)
             refreshed_msg = next(
                 (
@@ -861,6 +936,7 @@ class TelegramArchiveService:
                     job_id,
                     reason="media_unavailable",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
 
@@ -875,6 +951,7 @@ class TelegramArchiveService:
                     job_id,
                     reason="policy_disabled",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
 
@@ -883,9 +960,12 @@ class TelegramArchiveService:
                     job_id,
                     reason="media_unavailable",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
 
+            if self._stop_if_generation_stale():
+                return
             refreshed_media_kind = (
                 type(refreshed_msg.media).__name__
                 if getattr(refreshed_msg, "media", None) is not None
@@ -898,6 +978,8 @@ class TelegramArchiveService:
             attempt_dir.mkdir(parents=True, exist_ok=True)
 
             downloaded = await refreshed_msg.download_media(file=str(attempt_dir))
+            if self._stop_if_generation_stale():
+                return
             if not downloaded:
                 raise _MediaDownloadResultError(
                     "media_download_empty",
@@ -925,11 +1007,13 @@ class TelegramArchiveService:
                     job_id,
                     expected_claim_token=claim_token,
                     pending_file_path=str(candidate_path),
+                    expected_generation=self._account_generation,
                 )
                 if reserve_status == "ok":
                     planned_final_path = candidate_path
                     break
                 if reserve_status == "stale_claim":
+                    self._stop_if_generation_stale()
                     return
                 if reserve_status == "pending_uncleaned":
                     raise _MediaDownloadResultError(
@@ -979,6 +1063,9 @@ class TelegramArchiveService:
                 rollback_media=_rollback_media,
                 expected_generation=self._account_generation,
             )
+            if outcome == "stale_claim":
+                self._stop_if_generation_stale()
+                return
             if outcome == "completed" and attempts > 1:
                 self._record_operation(
                     "media_download",
@@ -996,6 +1083,7 @@ class TelegramArchiveService:
                     job_id,
                     error="worker_stopped",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
             except Exception as exc:
                 self.logger.debug("Failed to release media download job %s on cancel: %s", job_id, exc)
@@ -1004,6 +1092,8 @@ class TelegramArchiveService:
             if attempt_dir is not None:
                 shutil.rmtree(attempt_dir, ignore_errors=True)
                 attempt_dir = None
+            if self._stop_if_generation_stale():
+                return
             if not self._should_download_media_for(
                 chat_id,
                 topic_id,
@@ -1013,6 +1103,7 @@ class TelegramArchiveService:
                     job_id,
                     reason="policy_disabled",
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 return
             if isinstance(exc, _MediaDownloadResultError):
@@ -1038,6 +1129,7 @@ class TelegramArchiveService:
                     next_attempt_at=next_at,
                     expected_claim_token=claim_token,
                     preserve_attempt_budget=True,
+                    expected_generation=self._account_generation,
                 )
                 return
             if error.code == "media_cleanup_failed":
@@ -1061,6 +1153,7 @@ class TelegramArchiveService:
                     next_attempt_at=next_at,
                     expected_claim_token=claim_token,
                     preserve_attempt_budget=True,
+                    expected_generation=self._account_generation,
                 )
                 return
             if error.code in {"access_denied", "needs_login"}:
@@ -1069,6 +1162,7 @@ class TelegramArchiveService:
                     error=error.message,
                     error_code=error.code,
                     expected_claim_token=claim_token,
+                    expected_generation=self._account_generation,
                 )
                 if failed:
                     self._record_operation(
@@ -1092,6 +1186,7 @@ class TelegramArchiveService:
                 next_attempt_at=next_at,
                 expected_claim_token=claim_token,
                 preserve_attempt_budget=False,
+                expected_generation=self._account_generation,
             )
             if result_status == "failed":
                 self._record_operation(
@@ -1114,7 +1209,7 @@ class TelegramArchiveService:
             return await self._backfill_capture_targets_locked(targets)
 
     async def _backfill_capture_targets_locked(self, targets: list[CaptureTarget]) -> list[CaptureTarget]:
-        if not self.backfill.enabled or not targets:
+        if not self.backfill.enabled or not targets or self._deactivate_if_stale():
             return []
         from telethon.tl.types import MessageService
 
@@ -1122,6 +1217,8 @@ class TelegramArchiveService:
         root_chat_ids = {target.chat_id for target in targets if target.topic_id == 0}
         failed_targets: list[CaptureTarget] = []
         for target in targets:
+            if self._deactivate_if_stale():
+                return []
             if target.topic_id and target.chat_id in root_chat_ids:
                 continue
             policy = self._policy_for(target.chat_id, target.topic_id or None)
@@ -1151,6 +1248,8 @@ class TelegramArchiveService:
                 last_message_at = cursor.get("last_message_at") if cursor else None
                 cursor_status = str(cursor.get("backfill_status") or "") if cursor else ""
                 backfill_head_message_id = await self._remote_history_head(target)
+                if self._deactivate_if_stale():
+                    return []
                 migration_rescan_pending = cursor_status.startswith("migration_rescan")
                 is_initial_backfill = not migration_rescan_pending and (
                     history_scanned_through_id == 0
@@ -1170,7 +1269,7 @@ class TelegramArchiveService:
                     backfill_head_message_id,
                     mode,
                 )
-                self._save_backfill_cursor(
+                if not self._save_backfill_cursor(
                     target,
                     history_scanned_through_id=history_scanned_through_id,
                     backfill_head_message_id=backfill_head_message_id,
@@ -1182,7 +1281,8 @@ class TelegramArchiveService:
                         "mode": mode,
                         "head_message_id": backfill_head_message_id,
                     },
-                )
+                ):
+                    return []
 
                 if is_initial_backfill and self.backfill.initial_limit > 0:
                     entries = await self._initial_history_messages(
@@ -1190,10 +1290,15 @@ class TelegramArchiveService:
                         backfill_head_message_id,
                         MessageService,
                     )
+                    if self._deactivate_if_stale():
+                        self._unregister_backfill_entries(entries)
+                        return []
                     page_high, page_count, page_last_message_at = await self._store_backfill_page(
                         entries,
                         MessageService,
                     )
+                    if self._deactivate_if_stale():
+                        return []
                     count += page_count
                     if page_high:
                         last_message_at = page_last_message_at or last_message_at
@@ -1207,6 +1312,8 @@ class TelegramArchiveService:
                     page_size = self.backfill.catch_up_limit
                     limit_arg = page_size if page_size > 0 else 1000
                     while history_scanned_through_id < backfill_head_message_id:
+                        if self._deactivate_if_stale():
+                            return []
                         entries = await self._history_page(
                             target,
                             min_id=history_scanned_through_id,
@@ -1214,6 +1321,9 @@ class TelegramArchiveService:
                             limit=limit_arg,
                             message_service_type=MessageService,
                         )
+                        if self._deactivate_if_stale():
+                            self._unregister_backfill_entries(entries)
+                            return []
                         if not entries:
                             history_scanned_through_id = backfill_head_message_id
                             break
@@ -1221,12 +1331,14 @@ class TelegramArchiveService:
                             entries,
                             MessageService,
                         )
+                        if self._deactivate_if_stale():
+                            return []
                         if page_high <= history_scanned_through_id:
                             raise RuntimeError("Telegram history page did not advance its cursor")
                         history_scanned_through_id = min(page_high, backfill_head_message_id)
                         count += page_count
                         last_message_at = page_last_message_at or last_message_at
-                        self._save_backfill_cursor(
+                        if not self._save_backfill_cursor(
                             target,
                             history_scanned_through_id=history_scanned_through_id,
                             backfill_head_message_id=backfill_head_message_id,
@@ -1243,12 +1355,15 @@ class TelegramArchiveService:
                                 "head_message_id": backfill_head_message_id,
                                 "page_size": limit_arg,
                             },
-                        )
+                        ):
+                            return []
                         if len(entries) < limit_arg:
                             history_scanned_through_id = backfill_head_message_id
                             break
 
-                self._save_backfill_cursor(
+                if self._deactivate_if_stale():
+                    return []
+                if not self._save_backfill_cursor(
                     target,
                     history_scanned_through_id=history_scanned_through_id,
                     backfill_head_message_id=backfill_head_message_id,
@@ -1262,7 +1377,8 @@ class TelegramArchiveService:
                         "head_message_id": backfill_head_message_id,
                         "history_scanned_through_id": history_scanned_through_id,
                     },
-                )
+                ):
+                    return []
                 self.logger.info(
                     "Backfilled %s messages for account=%s chat=%s topic=%s",
                     count,
@@ -1271,6 +1387,8 @@ class TelegramArchiveService:
                     target.topic_id,
                 )
             except Exception as exc:
+                if self._deactivate_if_stale():
+                    return []
                 error = classify_telegram_exception(
                     exc,
                     default_code="backfill_failed",
@@ -1283,7 +1401,7 @@ class TelegramArchiveService:
                     target.topic_id,
                     error.message,
                 )
-                self._save_backfill_cursor(
+                if not self._save_backfill_cursor(
                     target,
                     history_scanned_through_id=history_scanned_through_id,
                     backfill_head_message_id=backfill_head_message_id,
@@ -1296,7 +1414,8 @@ class TelegramArchiveService:
                     count=count,
                     last_message_at=last_message_at,
                     raw_payload=error.to_public_dict(),
-                )
+                ):
+                    return []
                 self._record_operation(
                     "backfill",
                     "failed",
@@ -1411,6 +1530,8 @@ class TelegramArchiveService:
         last_message_at: str | None = None
         try:
             for message, fetch_state in entries:
+                if self._closed or self._disabled:
+                    break
                 page_high = max(page_high, int(message.id))
                 if isinstance(message, message_service_type):
                     continue
@@ -1438,9 +1559,9 @@ class TelegramArchiveService:
         last_message_at: str | None,
         raw_payload: dict[str, Any],
         completed: bool = False,
-    ) -> None:
+    ) -> bool:
         now = utc_now_iso()
-        self.store.upsert_capture_cursor(
+        wrote = self.store.upsert_capture_cursor(
             CaptureCursorRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -1456,8 +1577,12 @@ class TelegramArchiveService:
                 backfill_count=count,
                 updated_at=now,
                 raw_json=json.dumps(raw_payload, ensure_ascii=False),
-            )
+            ),
+            expected_generation=self._account_generation,
         )
+        if not wrote:
+            self._mark_stale()
+        return wrote
 
     def _policy_for(self, chat_id: int, topic_id: int | None = None) -> dict[str, Any]:
         return self.store.resolve_effective_backup_policy(
@@ -1473,8 +1598,8 @@ class TelegramArchiveService:
         topic_id: int | None,
         message_id: int,
         message_at: str | None,
-    ) -> None:
-        self.store.upsert_capture_cursor(
+    ) -> bool:
+        wrote = self.store.upsert_capture_cursor(
             CaptureCursorRecord(
                 source=SOURCE_TELEGRAM,
                 account_id=self.account_id,
@@ -1483,8 +1608,12 @@ class TelegramArchiveService:
                 last_message_id=message_id,
                 last_message_at=message_at,
                 updated_at=utc_now_iso(),
-            )
+            ),
+            expected_generation=self._account_generation,
         )
+        if not wrote:
+            self._mark_stale()
+        return wrote
 
     def _record_operation(
         self,
@@ -1507,7 +1636,8 @@ class TelegramArchiveService:
                 retry_after=error.get("retry_after") if error else None,
                 occurred_at=utc_now_iso(),
                 raw_json=json.dumps(error, ensure_ascii=False, default=str) if error else None,
-            )
+            ),
+            expected_generation=self._account_generation,
         )
 
 

@@ -704,50 +704,88 @@ class ArchiveStore:
             )
         return sorted(items.values(), key=lambda item: (item["source"], item["account_id"]))
 
-    def upsert_chat(self, chat: ChatRecord) -> None:
+    def upsert_chat(
+        self,
+        chat: ChatRecord,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
         now = chat.updated_at or utc_now_iso()
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO chats(source, account_id, chat_id, title, username, kind, updated_at, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id, chat_id) DO UPDATE SET
-                  title = excluded.title,
-                  username = excluded.username,
-                  kind = excluded.kind,
-                  updated_at = excluded.updated_at,
-                  raw_json = excluded.raw_json
-                """,
-                (chat.source, chat.account_id, chat.chat_id, chat.title, chat.username, chat.kind, now, chat.raw_json),
-            )
-            self._conn.commit()
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    chat.source,
+                    chat.account_id,
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    """
+                    INSERT INTO chats(source, account_id, chat_id, title, username, kind, updated_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, account_id, chat_id) DO UPDATE SET
+                      title = excluded.title,
+                      username = excluded.username,
+                      kind = excluded.kind,
+                      updated_at = excluded.updated_at,
+                      raw_json = excluded.raw_json
+                    """,
+                    (chat.source, chat.account_id, chat.chat_id, chat.title, chat.username, chat.kind, now, chat.raw_json),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
-    def upsert_user(self, user: UserRecord) -> None:
+    def upsert_user(
+        self,
+        user: UserRecord,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
         now = user.updated_at or utc_now_iso()
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO users(source, account_id, user_id, username, display_name, is_bot, updated_at, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id, user_id) DO UPDATE SET
-                  username = excluded.username,
-                  display_name = excluded.display_name,
-                  is_bot = excluded.is_bot,
-                  updated_at = excluded.updated_at,
-                  raw_json = excluded.raw_json
-                """,
-                (
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
                     user.source,
                     user.account_id,
-                    user.user_id,
-                    user.username,
-                    user.display_name,
-                    int(user.is_bot),
-                    now,
-                    user.raw_json,
-                ),
-            )
-            self._conn.commit()
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return False
+                self._conn.execute(
+                    """
+                    INSERT INTO users(source, account_id, user_id, username, display_name, is_bot, updated_at, raw_json)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, account_id, user_id) DO UPDATE SET
+                      username = excluded.username,
+                      display_name = excluded.display_name,
+                      is_bot = excluded.is_bot,
+                      updated_at = excluded.updated_at,
+                      raw_json = excluded.raw_json
+                    """,
+                    (
+                        user.source,
+                        user.account_id,
+                        user.user_id,
+                        user.username,
+                        user.display_name,
+                        int(user.is_bot),
+                        now,
+                        user.raw_json,
+                    ),
+                )
+                self._conn.commit()
+                return True
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
 
     def upsert_origin(self, origin: OriginRecord) -> None:
@@ -1265,7 +1303,12 @@ class ArchiveStore:
             ).fetchone()
         return _row_to_dict(row, json_fields={"raw_json"}) if row else None
 
-    def upsert_capture_cursor(self, cursor: CaptureCursorRecord) -> None:
+    def upsert_capture_cursor(
+        self,
+        cursor: CaptureCursorRecord,
+        *,
+        expected_generation: int | None = None,
+    ) -> bool:
         now = cursor.updated_at or utc_now_iso()
         observed_max_message_id = max(
             cursor.last_message_id,
@@ -1273,100 +1316,114 @@ class ArchiveStore:
         )
         history_scanned_through_id = cursor.history_scanned_through_id or 0
         with self._lock:
-            self._conn.execute(
-                """
-                INSERT INTO capture_cursors(
-                  source, account_id, origin_id, topic_id, last_message_id,
-                  history_scanned_through_id, observed_max_message_id,
-                  last_message_at, last_backfill_at, backfill_head_message_id,
-                  backfill_status, backfill_error, backfill_count, updated_at, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
-                  last_message_id = MAX(
-                    capture_cursors.last_message_id,
-                    capture_cursors.observed_max_message_id,
-                    excluded.last_message_id,
-                    excluded.observed_max_message_id
-                  ),
-                  history_scanned_through_id = MAX(
-                    capture_cursors.history_scanned_through_id,
-                    excluded.history_scanned_through_id
-                  ),
-                  observed_max_message_id = MAX(
-                    capture_cursors.last_message_id,
-                    capture_cursors.observed_max_message_id,
-                    excluded.last_message_id,
-                    excluded.observed_max_message_id
-                  ),
-                  last_message_at = CASE
-                    WHEN excluded.last_message_at IS NULL THEN capture_cursors.last_message_at
-                    WHEN capture_cursors.last_message_at IS NULL
-                      OR excluded.last_message_at > capture_cursors.last_message_at
-                    THEN excluded.last_message_at
-                    ELSE capture_cursors.last_message_at
-                  END,
-                  last_backfill_at = CASE
-                    WHEN excluded.last_backfill_at IS NULL THEN capture_cursors.last_backfill_at
-                    WHEN capture_cursors.last_backfill_at IS NULL
-                      OR excluded.last_backfill_at > capture_cursors.last_backfill_at
-                    THEN excluded.last_backfill_at
-                    ELSE capture_cursors.last_backfill_at
-                  END,
-                  backfill_head_message_id = CASE
-                    WHEN excluded.backfill_head_message_id IS NULL
-                    THEN capture_cursors.backfill_head_message_id
-                    WHEN capture_cursors.backfill_head_message_id IS NULL
-                      OR excluded.backfill_head_message_id > capture_cursors.backfill_head_message_id
-                    THEN excluded.backfill_head_message_id
-                    ELSE capture_cursors.backfill_head_message_id
-                  END,
-                  backfill_status = COALESCE(excluded.backfill_status, capture_cursors.backfill_status),
-                  backfill_error = COALESCE(excluded.backfill_error, capture_cursors.backfill_error),
-                  backfill_count = COALESCE(excluded.backfill_count, capture_cursors.backfill_count),
-                  updated_at = excluded.updated_at,
-                  raw_json = COALESCE(excluded.raw_json, capture_cursors.raw_json)
-                """,
-                (
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
                     cursor.source,
                     cursor.account_id,
-                    cursor.origin_id,
-                    cursor.topic_id,
-                    observed_max_message_id,
-                    history_scanned_through_id,
-                    observed_max_message_id,
-                    cursor.last_message_at,
-                    cursor.last_backfill_at,
-                    cursor.backfill_head_message_id,
-                    cursor.backfill_status,
-                    cursor.backfill_error,
-                    cursor.backfill_count,
-                    now,
-                    cursor.raw_json,
-                ),
-            )
-            if cursor.last_message_at:
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return False
                 self._conn.execute(
                     """
-                    UPDATE origins
-                    SET last_message_at = CASE
-                          WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
-                          ELSE last_message_at
-                        END,
-                        updated_at = ?
-                    WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                    INSERT INTO capture_cursors(
+                      source, account_id, origin_id, topic_id, last_message_id,
+                      history_scanned_through_id, observed_max_message_id,
+                      last_message_at, last_backfill_at, backfill_head_message_id,
+                      backfill_status, backfill_error, backfill_count, updated_at, raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(source, account_id, origin_id, topic_id) DO UPDATE SET
+                      last_message_id = MAX(
+                        capture_cursors.last_message_id,
+                        capture_cursors.observed_max_message_id,
+                        excluded.last_message_id,
+                        excluded.observed_max_message_id
+                      ),
+                      history_scanned_through_id = MAX(
+                        capture_cursors.history_scanned_through_id,
+                        excluded.history_scanned_through_id
+                      ),
+                      observed_max_message_id = MAX(
+                        capture_cursors.last_message_id,
+                        capture_cursors.observed_max_message_id,
+                        excluded.last_message_id,
+                        excluded.observed_max_message_id
+                      ),
+                      last_message_at = CASE
+                        WHEN excluded.last_message_at IS NULL THEN capture_cursors.last_message_at
+                        WHEN capture_cursors.last_message_at IS NULL
+                          OR excluded.last_message_at > capture_cursors.last_message_at
+                        THEN excluded.last_message_at
+                        ELSE capture_cursors.last_message_at
+                      END,
+                      last_backfill_at = CASE
+                        WHEN excluded.last_backfill_at IS NULL THEN capture_cursors.last_backfill_at
+                        WHEN capture_cursors.last_backfill_at IS NULL
+                          OR excluded.last_backfill_at > capture_cursors.last_backfill_at
+                        THEN excluded.last_backfill_at
+                        ELSE capture_cursors.last_backfill_at
+                      END,
+                      backfill_head_message_id = CASE
+                        WHEN excluded.backfill_head_message_id IS NULL
+                        THEN capture_cursors.backfill_head_message_id
+                        WHEN capture_cursors.backfill_head_message_id IS NULL
+                          OR excluded.backfill_head_message_id > capture_cursors.backfill_head_message_id
+                        THEN excluded.backfill_head_message_id
+                        ELSE capture_cursors.backfill_head_message_id
+                      END,
+                      backfill_status = COALESCE(excluded.backfill_status, capture_cursors.backfill_status),
+                      backfill_error = COALESCE(excluded.backfill_error, capture_cursors.backfill_error),
+                      backfill_count = COALESCE(excluded.backfill_count, capture_cursors.backfill_count),
+                      updated_at = excluded.updated_at,
+                      raw_json = COALESCE(excluded.raw_json, capture_cursors.raw_json)
                     """,
                     (
-                        cursor.last_message_at,
-                        cursor.last_message_at,
-                        now,
                         cursor.source,
                         cursor.account_id,
                         cursor.origin_id,
                         cursor.topic_id,
+                        observed_max_message_id,
+                        history_scanned_through_id,
+                        observed_max_message_id,
+                        cursor.last_message_at,
+                        cursor.last_backfill_at,
+                        cursor.backfill_head_message_id,
+                        cursor.backfill_status,
+                        cursor.backfill_error,
+                        cursor.backfill_count,
+                        now,
+                        cursor.raw_json,
                     ),
                 )
-            self._conn.commit()
+                if cursor.last_message_at:
+                    self._conn.execute(
+                        """
+                        UPDATE origins
+                        SET last_message_at = CASE
+                              WHEN last_message_at IS NULL OR last_message_at < ? THEN ?
+                              ELSE last_message_at
+                            END,
+                            updated_at = ?
+                        WHERE source = ? AND account_id = ? AND origin_id = ? AND topic_id = ?
+                        """,
+                        (
+                            cursor.last_message_at,
+                            cursor.last_message_at,
+                            now,
+                            cursor.source,
+                            cursor.account_id,
+                            cursor.origin_id,
+                            cursor.topic_id,
+                        ),
+                    )
+                self._conn.commit()
+                return True
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
     def list_capture_cursors(self, account_id: str | None = None) -> list[dict[str, Any]]:
         sql = """
@@ -1736,12 +1793,14 @@ class ArchiveStore:
         at = event_at or utc_now_iso()
         seqs: list[int] = []
         with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if expected_generation is not None and not self._account_generation_matches_unlocked(
                     source,
                     account_id,
                     expected_generation,
                 ):
+                    self._conn.rollback()
                     return []
                 for message_id in message_ids:
                     cur = self._conn.execute(
@@ -1775,7 +1834,7 @@ class ArchiveStore:
                     )
                 if seqs:
                     self._conn.commit()
-                elif self._conn.in_transaction:
+                else:
                     self._conn.rollback()
             except Exception:
                 if self._conn.in_transaction:
@@ -1902,12 +1961,14 @@ class ArchiveStore:
         at = event_at or utc_now_iso()
         reactions_json = json.dumps(reactions, ensure_ascii=False, default=str)
         with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
                 if expected_generation is not None and not self._account_generation_matches_unlocked(
                     source,
                     account_id,
                     expected_generation,
                 ):
+                    self._conn.rollback()
                     return None
                 cur = self._conn.execute(
                     """
@@ -1918,8 +1979,7 @@ class ArchiveStore:
                     (reactions_json, at, source, account_id, chat_id, message_id),
                 )
                 if cur.rowcount == 0:
-                    if self._conn.in_transaction:
-                        self._conn.rollback()
+                    self._conn.rollback()
                     return None
                 seq = self._insert_event(
                     source=source,
@@ -2285,10 +2345,18 @@ class ArchiveStore:
         *,
         source: str = SOURCE_TELEGRAM,
         stale_seconds: float = 300.0,
+        expected_generation: int | None = None,
     ) -> dict[str, Any] | None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return None
                 now_dt = datetime.now(dt_timezone.utc)
                 now = now_dt.isoformat()
                 stale_before = (now_dt - timedelta(seconds=max(0.0, float(stale_seconds)))).isoformat()
@@ -2413,10 +2481,32 @@ class ArchiveStore:
                 pass
         return min(candidates) if candidates else None
 
-    def heartbeat_media_download_job(self, job_id: str, *, expected_claim_token: int) -> bool:
+    def heartbeat_media_download_job(
+        self,
+        job_id: str,
+        *,
+        expected_claim_token: int,
+        expected_generation: int | None = None,
+    ) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if expected_generation is not None:
+                    row = self._conn.execute(
+                        """
+                        SELECT source, account_id
+                        FROM media_download_jobs
+                        WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
+                        """,
+                        (job_id, int(expected_claim_token)),
+                    ).fetchone()
+                    if row is None or not self._account_generation_matches_unlocked(
+                        str(row["source"]),
+                        str(row["account_id"]),
+                        expected_generation,
+                    ):
+                        self._conn.rollback()
+                        return False
                 now = utc_now_iso()
                 cur = self._conn.execute(
                     """
@@ -2442,6 +2532,7 @@ class ArchiveStore:
         *,
         expected_claim_token: int,
         pending_file_path: str,
+        expected_generation: int | None = None,
     ) -> str:
         """Persist an exclusive target file path before os.replace; returns ok, stale_claim, pending_uncleaned, or path_conflict."""
         with self._lock:
@@ -2450,13 +2541,20 @@ class ArchiveStore:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT pending_file_path
+                    SELECT source, account_id, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return "stale_claim"
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return "stale_claim"
                 existing_pending = row["pending_file_path"]
@@ -2501,6 +2599,7 @@ class ArchiveStore:
         expected_claim_token: int,
         require_downloading: bool = True,
         stale_seconds: float | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[bool, str | None]:
         """Unlink an uncommitted pending_file_path and clear SQLite only once removal is confirmed.
 
@@ -2513,13 +2612,20 @@ class ArchiveStore:
                 now_dt = datetime.now(dt_timezone.utc)
                 row = self._conn.execute(
                     """
-                    SELECT status, claim_token, updated_at, pending_file_path, error_code
+                    SELECT source, account_id, status, claim_token, updated_at, pending_file_path, error_code
                     FROM media_download_jobs
                     WHERE job_id = ? AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None or not row["pending_file_path"]:
+                    self._conn.rollback()
+                    return True, None
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return True, None
                 status = str(row["status"])
@@ -2938,20 +3044,33 @@ class ArchiveStore:
             return None
         return pending_path
 
-    def complete_media_download_job(self, job_id: str, *, expected_claim_token: int) -> bool:
+    def complete_media_download_job(
+        self,
+        job_id: str,
+        *,
+        expected_claim_token: int,
+        expected_generation: int | None = None,
+    ) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT pending_file_path
+                    SELECT source, account_id, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return False
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return False
                 remaining_pending = self._clear_pending_path_value_unlocked(row["pending_file_path"])
@@ -3188,6 +3307,7 @@ class ArchiveStore:
                 job_id,
                 expected_claim_token=expected_claim_token,
                 require_downloading=False,
+                expected_generation=expected_generation,
             )
         return "completed", published
 
@@ -3200,6 +3320,7 @@ class ArchiveStore:
         next_attempt_at: str,
         expected_claim_token: int,
         preserve_attempt_budget: bool = False,
+        expected_generation: int | None = None,
     ) -> str | None:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3207,13 +3328,20 @@ class ArchiveStore:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT attempts, max_attempts, pending_file_path
+                    SELECT source, account_id, attempts, max_attempts, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return None
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return None
                 remaining_pending = self._clear_pending_path_value_unlocked(row["pending_file_path"])
@@ -3265,6 +3393,7 @@ class ArchiveStore:
         *,
         error: str = "worker_stopped",
         expected_claim_token: int,
+        expected_generation: int | None = None,
     ) -> bool:
         """Release a claimed media download on graceful shutdown without spending attempt budget or reusing claim_token."""
         with self._lock:
@@ -3273,13 +3402,20 @@ class ArchiveStore:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT pending_file_path
+                    SELECT source, account_id, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return False
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return False
                 remaining_pending = self._clear_pending_path_value_unlocked(row["pending_file_path"])
@@ -3314,6 +3450,7 @@ class ArchiveStore:
         error: str,
         error_code: str,
         expected_claim_token: int,
+        expected_generation: int | None = None,
     ) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3321,13 +3458,20 @@ class ArchiveStore:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT pending_file_path
+                    SELECT source, account_id, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return False
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return False
                 remaining_pending = self._clear_pending_path_value_unlocked(row["pending_file_path"])
@@ -3361,6 +3505,7 @@ class ArchiveStore:
         *,
         reason: str,
         expected_claim_token: int,
+        expected_generation: int | None = None,
     ) -> bool:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
@@ -3368,13 +3513,20 @@ class ArchiveStore:
                 now = utc_now_iso()
                 row = self._conn.execute(
                     """
-                    SELECT pending_file_path
+                    SELECT source, account_id, pending_file_path
                     FROM media_download_jobs
                     WHERE job_id = ? AND status = 'downloading' AND claim_token = ?
                     """,
                     (job_id, int(expected_claim_token)),
                 ).fetchone()
                 if row is None:
+                    self._conn.rollback()
+                    return False
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    str(row["source"]),
+                    str(row["account_id"]),
+                    expected_generation,
+                ):
                     self._conn.rollback()
                     return False
                 remaining_pending = self._clear_pending_path_value_unlocked(row["pending_file_path"])
@@ -5538,33 +5690,51 @@ class ArchiveStore:
             self._conn.commit()
             return max(cur.rowcount, 0)
 
-    def add_operation_event(self, event: OperationEventRecord) -> int:
+    def add_operation_event(
+        self,
+        event: OperationEventRecord,
+        *,
+        expected_generation: int | None = None,
+    ) -> int:
         occurred_at = event.occurred_at or utc_now_iso()
         with self._lock:
-            cur = self._conn.execute(
-                """
-                INSERT INTO operation_events(
-                  source, account_id, operation, status, subject_type, subject_id,
-                  error_code, message, retry_after, occurred_at, raw_json
-                )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
                     event.source,
                     event.account_id,
-                    event.operation,
-                    event.status,
-                    event.subject_type,
-                    event.subject_id,
-                    event.error_code,
-                    event.message,
-                    event.retry_after,
-                    occurred_at,
-                    event.raw_json,
-                ),
-            )
-            self._conn.commit()
-            return int(cur.lastrowid)
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return 0
+                cur = self._conn.execute(
+                    """
+                    INSERT INTO operation_events(
+                      source, account_id, operation, status, subject_type, subject_id,
+                      error_code, message, retry_after, occurred_at, raw_json
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        event.source,
+                        event.account_id,
+                        event.operation,
+                        event.status,
+                        event.subject_type,
+                        event.subject_id,
+                        event.error_code,
+                        event.message,
+                        event.retry_after,
+                        occurred_at,
+                        event.raw_json,
+                    ),
+                )
+                self._conn.commit()
+                return int(cur.lastrowid)
+            except Exception:
+                if self._conn.in_transaction:
+                    self._conn.rollback()
+                raise
 
     def list_operation_events(
         self,

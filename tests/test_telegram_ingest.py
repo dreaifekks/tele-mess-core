@@ -4965,6 +4965,362 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 store2.close()
                 local_store.close()
 
+    async def test_stale_backfill_does_not_advance_recreated_account_cursor_and_stops(self) -> None:
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stale_backfill_cursor.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            store2 = ArchiveStore(db_path)
+            entered_page = asyncio.Event()
+            release_page = asyncio.Event()
+            try:
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V1", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v1",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                old_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                local_store.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", -1096, enabled=True)
+                )
+
+                history_msg = FakeMessage(211, -1096, text="history 211")
+
+                class PausingBackfillClient:
+                    async def get_messages(self, cid: int, **kwargs):
+                        return [history_msg]
+
+                    def iter_messages(self, cid: int, **kwargs):
+                        async def _gen():
+                            entered_page.set()
+                            await release_page.wait()
+                            yield history_msg
+
+                        return _gen()
+
+                old_cfg = TelegramAccountConfig(
+                    account_id="dyn",
+                    api_id=1,
+                    api_hash="hash",
+                    session_name="dyn_v1",
+                    session_dir=self.config.session_dir,
+                )
+                old_service = TelegramArchiveService(
+                    old_cfg,
+                    local_store,
+                    backfill=BackfillConfig(enabled=True, initial_limit=50),
+                    account_generation=old_gen,
+                )
+                old_service.client = PausingBackfillClient()
+
+                backfill_task = asyncio.create_task(old_service.refresh_capture_targets())
+                await asyncio.wait_for(entered_page.wait(), timeout=2.0)
+
+                # Delete and recreate "dyn" while old backfill is paused mid-history-fetch.
+                store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                store2.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V2", "telegram"))
+                store2.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v2",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                new_gen = store2.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                self.assertGreater(new_gen, old_gen)
+                store2.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", -1096, enabled=True)
+                )
+
+                # Release old backfill: must write 0 messages, leave recreated cursor untouched, and disable itself.
+                release_page.set()
+                await asyncio.wait_for(backfill_task, timeout=2.0)
+                self.assertTrue(old_service._disabled)
+                self.assertTrue(old_service._closed)
+                self.assertIsNone(local_store.get_message(SOURCE_TELEGRAM, "dyn", -1096, 211))
+                self.assertIsNone(local_store.get_capture_cursor(SOURCE_TELEGRAM, "dyn", -1096, 0))
+
+                # New-generation runtime backfills normally and captures message 211.
+                class NormalBackfillClient:
+                    async def get_messages(self, cid: int, **kwargs):
+                        return [history_msg]
+
+                    def iter_messages(self, cid: int, **kwargs):
+                        return FakeBackfillIterator(messages=[history_msg])
+
+                new_service = TelegramArchiveService(
+                    old_cfg,
+                    local_store,
+                    backfill=BackfillConfig(enabled=True, initial_limit=50),
+                    account_generation=new_gen,
+                )
+                new_service.client = NormalBackfillClient()
+                await new_service.refresh_capture_targets()
+                stored = local_store.get_message(SOURCE_TELEGRAM, "dyn", -1096, 211)
+                self.assertIsNotNone(stored)
+                cursor = local_store.get_capture_cursor(SOURCE_TELEGRAM, "dyn", -1096, 0)
+                self.assertIsNotNone(cursor)
+                assert cursor is not None
+                self.assertEqual(cursor["history_scanned_through_id"], 211)
+                self.assertEqual(cursor["backfill_status"], "completed")
+            finally:
+                release_page.set()
+                store2.close()
+                local_store.close()
+
+    async def test_mark_deleted_and_update_reactions_enforce_generation_inside_immediate_transaction(self) -> None:
+        from unittest import mock
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "delete_reaction_immediate_tx.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            try:
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V1", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v1",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                old_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                local_store.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V2", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v2",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                new_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                local_store.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", -1094, enabled=True, download_media=True)
+                )
+
+                new_cfg = TelegramAccountConfig(
+                    account_id="dyn",
+                    api_id=1,
+                    api_hash="hash",
+                    session_name="dyn_v2",
+                    session_dir=self.config.session_dir,
+                )
+                new_service = TelegramArchiveService(
+                    new_cfg,
+                    local_store,
+                    account_generation=new_gen,
+                )
+                msg = FakeMessage(601, -1094, text="fresh", media=MessageMediaDocument())
+                self.assertTrue(await new_service._store_message(msg, event_type="new"))
+
+                observed_in_tx: list[bool] = []
+                orig_gen_match = local_store._account_generation_matches_unlocked
+
+                def checking_gen_match(source: str, account_id: str, expected_generation: int) -> bool:
+                    observed_in_tx.append(local_store._conn.in_transaction)
+                    return orig_gen_match(source, account_id, expected_generation)
+
+                with mock.patch.object(
+                    local_store,
+                    "_account_generation_matches_unlocked",
+                    side_effect=checking_gen_match,
+                ):
+                    self.assertEqual(
+                        local_store.mark_deleted(
+                            SOURCE_TELEGRAM,
+                            -1094,
+                            [601],
+                            account_id="dyn",
+                            expected_generation=old_gen,
+                        ),
+                        [],
+                    )
+                    self.assertIsNone(
+                        local_store.update_reactions(
+                            SOURCE_TELEGRAM,
+                            -1094,
+                            601,
+                            [{"emoji": "🔥", "count": 1}],
+                            account_id="dyn",
+                            expected_generation=old_gen,
+                        )
+                    )
+
+                self.assertEqual(observed_in_tx, [True, True])
+                self.assertFalse(local_store._conn.in_transaction)
+                stored = local_store.get_message(SOURCE_TELEGRAM, "dyn", -1094, 601)
+                self.assertIsNotNone(stored)
+                assert stored is not None
+                self.assertIsNone(stored["deleted_at"])
+                self.assertIsNone(stored["reactions_json"])
+                jobs = local_store.list_media_download_jobs(account_id="dyn")
+                self.assertEqual(len(jobs), 1)
+                self.assertEqual(jobs[0]["status"], "pending")
+            finally:
+                local_store.close()
+
+    async def test_stale_media_worker_cannot_claim_or_cancel_recreated_account_job_and_exits(self) -> None:
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "stale_media_worker.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            try:
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V1", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v1",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                old_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                local_store.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dyn V2", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_v2",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                new_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "dyn")
+                local_store.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", -1095, enabled=True, download_media=True)
+                )
+
+                dyn_cfg = TelegramAccountConfig(
+                    account_id="dyn",
+                    api_id=1,
+                    api_hash="hash",
+                    session_name="dyn_v2",
+                    session_dir=self.config.session_dir,
+                )
+                msg = FakeMessage(701, -1095, text="fresh media", media=MessageMediaDocument())
+                new_service = TelegramArchiveService(
+                    dyn_cfg,
+                    local_store,
+                    media_download=MediaDownloadConfig(max_attempts=2, retry_delay_seconds=0.01, stale_seconds=60.0),
+                    account_generation=new_gen,
+                )
+                new_service.client = FakeMediaClient(msg)
+                self.assertTrue(await new_service._store_message(msg, event_type="new"))
+
+                # Old-generation media worker with empty/stale client cannot claim or cancel the new account's job.
+                old_service = TelegramArchiveService(
+                    dyn_cfg,
+                    local_store,
+                    media_download=MediaDownloadConfig(max_attempts=2, retry_delay_seconds=0.01, stale_seconds=60.0),
+                    account_generation=old_gen,
+                )
+                old_service.client = FakeMediaClient()
+                self.assertEqual(await old_service.process_pending_media_downloads(), 0)
+                self.assertTrue(old_service._disabled)
+
+                # Even if an old background worker loop starts while stale, it exits cleanly without claiming.
+                old_service._closed = False
+                old_service._disabled = False
+                old_service._start_media_worker()
+                assert old_service._media_worker_task is not None
+                await asyncio.wait_for(old_service._media_worker_task, timeout=2.0)
+                self.assertTrue(old_service._disabled)
+
+                jobs_before = local_store.list_media_download_jobs(account_id="dyn")
+                self.assertEqual(len(jobs_before), 1)
+                self.assertEqual(jobs_before[0]["status"], "pending")
+
+                # Even if an old worker somehow held the job_id/claim_token, stale generation writes are rejected.
+                claimed = local_store.claim_media_download_job("dyn", expected_generation=new_gen)
+                self.assertIsNotNone(claimed)
+                assert claimed is not None
+                job_id = str(claimed["job_id"])
+                token = int(claimed["claim_token"])
+                self.assertFalse(
+                    local_store.heartbeat_media_download_job(
+                        job_id, expected_claim_token=token, expected_generation=old_gen
+                    )
+                )
+                self.assertEqual(
+                    local_store.record_media_download_pending_path(
+                        job_id,
+                        expected_claim_token=token,
+                        pending_file_path=str(Path(tmp) / "stale.bin"),
+                        expected_generation=old_gen,
+                    ),
+                    "stale_claim",
+                )
+                self.assertFalse(
+                    local_store.cancel_media_download_job(
+                        job_id,
+                        reason="media_unavailable",
+                        expected_claim_token=token,
+                        expected_generation=old_gen,
+                    )
+                )
+                self.assertFalse(
+                    local_store.fail_media_download_job(
+                        job_id,
+                        error="stale",
+                        error_code="stale",
+                        expected_claim_token=token,
+                        expected_generation=old_gen,
+                    )
+                )
+                self.assertIsNone(
+                    local_store.retry_media_download_job(
+                        job_id,
+                        error="stale",
+                        error_code="stale",
+                        next_attempt_at="2020-01-01T00:00:00+00:00",
+                        expected_claim_token=token,
+                        expected_generation=old_gen,
+                    )
+                )
+                self.assertFalse(
+                    local_store.release_media_download_job(
+                        job_id,
+                        expected_claim_token=token,
+                        expected_generation=old_gen,
+                    )
+                )
+                # Release with current generation, then let new_service complete the download cleanly.
+                self.assertTrue(
+                    local_store.release_media_download_job(
+                        job_id,
+                        expected_claim_token=token,
+                        expected_generation=new_gen,
+                    )
+                )
+                self.assertEqual(await new_service.process_pending_media_downloads(), 1)
+                final_job = local_store.get_media_download_job(job_id)
+                assert final_job is not None
+                self.assertEqual(final_job["status"], "completed")
+                files = local_store.list_media_files(account_id="dyn", chat_id=-1095, message_id=701)
+                self.assertEqual(len(files), 1)
+                self.assertTrue(Path(files[0]["file_path"]).exists())
+            finally:
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
