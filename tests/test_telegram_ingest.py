@@ -3245,8 +3245,8 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                     manager,
                 )
                 self.assertEqual(manager.statuses(), [])
-                self.assertTrue(v1_path.exists())
-                self.assertTrue(crashed_part_dir.exists())
+                self.assertTrue(os.path.exists(v1_path))
+                self.assertTrue(os.path.exists(crashed_part_dir))
 
                 # Release EACCES: manager's account-independent cleanup task must clean BOTH artifacts with 0 accounts!
                 block_cleanup["enabled"] = False
