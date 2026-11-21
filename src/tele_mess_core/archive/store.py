@@ -2682,6 +2682,7 @@ class ArchiveStore:
         account_id: str | None = None,
         allow_fencing_downloading: bool = True,
         expected_generation: int | None = None,
+        require_account_deleted: bool = False,
     ) -> bool:
         """Atomically verify or invalidate a claim before deleting its staging directory.
 
@@ -2695,6 +2696,17 @@ class ArchiveStore:
                 and source is not None
                 and account_id is not None
                 and not self._account_generation_matches_unlocked(source, account_id, expected_generation)
+            ):
+                return False
+            if (
+                require_account_deleted
+                and source is not None
+                and account_id is not None
+                and self._conn.execute(
+                    "SELECT 1 FROM accounts WHERE source = ? AND account_id = ? LIMIT 1",
+                    (source, account_id),
+                ).fetchone()
+                is not None
             ):
                 return False
             now_dt = datetime.now(dt_timezone.utc)
@@ -2734,6 +2746,18 @@ class ArchiveStore:
                     and source is not None
                     and account_id is not None
                     and not self._account_generation_matches_unlocked(source, account_id, expected_generation)
+                ):
+                    self._conn.rollback()
+                    return False
+                if (
+                    require_account_deleted
+                    and source is not None
+                    and account_id is not None
+                    and self._conn.execute(
+                        "SELECT 1 FROM accounts WHERE source = ? AND account_id = ? LIMIT 1",
+                        (source, account_id),
+                    ).fetchone()
+                    is not None
                 ):
                     self._conn.rollback()
                     return False
@@ -3017,11 +3041,15 @@ class ArchiveStore:
                 and not self.account_generation_matches(source, account_id, expected_generation=expected_generation)
             ):
                 return False
+            is_deleted_account_dir = deleted_accounts_only or (
+                account_id is not None and acc_dir.name != account_id
+            )
             dir_expected_generation = (
                 expected_generation
                 if account_id is not None and acc_dir.name == account_id
                 else None
             )
+            dir_allow_fencing_downloading = False if is_deleted_account_dir else allow_fencing_downloading
             try:
                 chat_dirs = list(acc_dir.iterdir())
             except FileNotFoundError:
@@ -3068,8 +3096,9 @@ class ArchiveStore:
                         stale_seconds=stale_seconds,
                         source=source,
                         account_id=acc_dir.name,
-                        allow_fencing_downloading=allow_fencing_downloading,
+                        allow_fencing_downloading=dir_allow_fencing_downloading,
                         expected_generation=dir_expected_generation,
+                        require_account_deleted=is_deleted_account_dir,
                     ):
                         continue
                     if (
@@ -3082,6 +3111,14 @@ class ArchiveStore:
                         )
                     ):
                         return False
+                    if is_deleted_account_dir:
+                        with self._lock:
+                            recreated = self._conn.execute(
+                                "SELECT 1 FROM accounts WHERE source = ? AND account_id = ? LIMIT 1",
+                                (source, acc_dir.name),
+                            ).fetchone()
+                        if recreated is not None:
+                            continue
                     try:
                         shutil.rmtree(entry)
                     except FileNotFoundError:

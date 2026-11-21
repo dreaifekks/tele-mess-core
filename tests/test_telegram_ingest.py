@@ -5564,6 +5564,136 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 store2.close()
                 local_store.close()
 
+    async def test_deleted_account_cleanup_does_not_fence_recreated_other_account_download_lease(self) -> None:
+        from datetime import timedelta
+        import threading
+        from unittest import mock
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "deleted_cleanup_recreate_race.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            store2 = ArchiveStore(db_path)
+            try:
+                # Active scanner account "main"; "other" is initially deleted on disk with a leftover chat dir.
+                local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "main", "Main", "telegram"))
+                local_store.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="main",
+                        auth_state="authorized",
+                        session_name="main",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                main_gen = local_store.get_account_generation(SOURCE_TELEGRAM, "main")
+                chat_id = -1092
+                other_chat_dir = db_path.parent / "media" / "other" / str(chat_id)
+                other_chat_dir.mkdir(parents=True, exist_ok=True)
+                # Also create a truly deleted third account with an orphan staging dir to verify cleanup still works.
+                gone_part_dir = db_path.parent / "media" / "gone" / str(chat_id) / ".part-mdj_deadbeef0001-t1"
+                gone_part_dir.mkdir(parents=True, exist_ok=True)
+                (gone_part_dir / "orphan.bin").write_bytes(b"orphan")
+
+                loop = asyncio.get_running_loop()
+                orig_iterdir = Path.iterdir
+
+                for mode in ("account_scan", "global_cleanup"):
+                    # Reset "other" to deleted before starting the scan so it is absent from active_accounts snapshot.
+                    store2.delete_management_account(SOURCE_TELEGRAM, "other")
+                    other_chat_dir.mkdir(parents=True, exist_ok=True)
+                    scan_entered = threading.Event()
+                    release_scan = threading.Event()
+                    paused = {"done": False}
+
+                    def pausing_iterdir(path_self: Path):
+                        if path_self == other_chat_dir and not paused["done"]:
+                            paused["done"] = True
+                            scan_entered.set()
+                            release_scan.wait(timeout=5.0)
+                        return orig_iterdir(path_self)
+
+                    with mock.patch.object(Path, "iterdir", pausing_iterdir):
+                        if mode == "account_scan":
+                            scan_future = loop.run_in_executor(
+                                None,
+                                lambda: local_store.cleanup_orphan_media_staging_dirs(
+                                    account_id="main",
+                                    source=SOURCE_TELEGRAM,
+                                    stale_seconds=1.0,
+                                    include_deleted_accounts=True,
+                                    expected_generation=main_gen,
+                                ),
+                            )
+                        else:
+                            scan_future = loop.run_in_executor(
+                                None,
+                                lambda: local_store.cleanup_deleted_account_media_artifacts(
+                                    source=SOURCE_TELEGRAM,
+                                    stale_seconds=1.0,
+                                ),
+                            )
+                        self.assertTrue(await loop.run_in_executor(None, scan_entered.wait, 2.0))
+
+                        # Recreate "other" on a second connection and claim a fresh job with a 300s lease.
+                        store2.upsert_account(AccountRecord(SOURCE_TELEGRAM, "other", "Other Recreated", "telegram"))
+                        store2.upsert_account_auth(
+                            AccountAuthRecord(
+                                source=SOURCE_TELEGRAM,
+                                account_id="other",
+                                auth_state="authorized",
+                                session_name="other_new",
+                                session_dir=str(self.config.session_dir),
+                            )
+                        )
+                        other_gen = store2.get_account_generation(SOURCE_TELEGRAM, "other")
+                        store2.set_backup_policy(
+                            BackupPolicyRecord(SOURCE_TELEGRAM, "other", chat_id, enabled=True, download_media=True)
+                        )
+                        new_job = store2.enqueue_media_download_job(
+                            account_id="other",
+                            chat_id=chat_id,
+                            message_id=901 if mode == "account_scan" else 902,
+                            max_attempts=1,
+                        )
+                        assert new_job is not None
+                        claimed = store2.claim_media_download_job(
+                            "other",
+                            stale_seconds=300.0,
+                            expected_generation=other_gen,
+                        )
+                        assert claimed is not None
+                        job_id = str(claimed["job_id"])
+                        token = int(claimed["claim_token"])
+                        two_sec_ago = (datetime.now(timezone.utc) - timedelta(seconds=2)).isoformat()
+                        store2._conn.execute(
+                            "UPDATE media_download_jobs SET updated_at = ? WHERE job_id = ?",
+                            (two_sec_ago, job_id),
+                        )
+                        store2._conn.commit()
+                        part_dir = other_chat_dir / f".part-{job_id}-t{token}"
+                        part_dir.mkdir(parents=True, exist_ok=True)
+                        part_file = part_dir / "active.bin"
+                        part_file.write_bytes(b"in-flight")
+
+                        # Resume paused scan; it MUST NOT fence "other"'s job or delete its staging directory.
+                        release_scan.set()
+                        await scan_future
+
+                    job_after = store2.get_media_download_job(job_id)
+                    assert job_after is not None
+                    self.assertEqual(job_after["status"], "downloading", msg=f"mode={mode}")
+                    self.assertEqual(job_after["claim_token"], token, msg=f"mode={mode}")
+                    self.assertTrue(part_dir.is_dir(), msg=f"mode={mode}")
+                    self.assertTrue(part_file.exists(), msg=f"mode={mode}")
+
+                # Truly deleted account "gone" had its orphan staging directory cleaned up.
+                self.assertFalse(gone_part_dir.exists())
+            finally:
+                store2.close()
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
