@@ -379,6 +379,29 @@ class ArchiveStore:
         _seq, _owner, _epoch, gen, _revoked, _active = _parse_auth_state_meta(self.get_meta(seq_key))
         return gen
 
+    def _account_generation_matches_unlocked(
+        self,
+        source: str,
+        account_id: str,
+        expected_generation: int,
+    ) -> bool:
+        seq_key = f"auth_state_seq:{source}:{account_id}"
+        row = self._conn.execute("SELECT value FROM meta WHERE key = ?", (seq_key,)).fetchone()
+        _seq, owner, _epoch, gen, _revoked, _active = _parse_auth_state_meta(
+            row["value"] if row is not None else None
+        )
+        return owner != "__deleted__" and gen == int(expected_generation)
+
+    def account_generation_matches(
+        self,
+        source: str,
+        account_id: str,
+        *,
+        expected_generation: int,
+    ) -> bool:
+        with self._lock:
+            return self._account_generation_matches_unlocked(source, account_id, expected_generation)
+
     def upsert_account_auth(
         self,
         auth: AccountAuthRecord,
@@ -1482,11 +1505,19 @@ class ArchiveStore:
         event_type: str,
         build_record: Callable[[dict[str, Any]], MessageRecord],
         build_media_job: Callable[[dict[str, Any], MessageRecord], dict[str, Any] | None] | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[int, dict[str, Any]] | None:
         """Atomically resolve effective backup policy, build the message from it, and insert/update in one write transaction."""
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return None
                 effective_policy, _source = self._resolve_effective_backup_policy_unlocked(
                     source,
                     account_id,
@@ -1700,11 +1731,18 @@ class ArchiveStore:
         event_at: str | None = None,
         raw_payload: dict[str, Any] | None = None,
         account_id: str = "default",
+        expected_generation: int | None = None,
     ) -> list[int]:
         at = event_at or utc_now_iso()
         seqs: list[int] = []
         with self._lock:
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    return []
                 for message_id in message_ids:
                     cur = self._conn.execute(
                         """
@@ -1774,6 +1812,7 @@ class ArchiveStore:
         inflight_chat_ids_by_message: dict[int, set[int]] | None = None,
         event_at: str | None = None,
         raw_payload: dict[str, Any] | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[list[int], dict[int, int]]:
         """Atomically merge DB and in-flight non-channel candidates and mark/return only unique chats."""
         at = event_at or utc_now_iso()
@@ -1782,6 +1821,13 @@ class ArchiveStore:
         with self._lock:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return [], {}
                 for message_id in message_ids:
                     matches = self._conn.execute(
                         """
@@ -1851,11 +1897,18 @@ class ArchiveStore:
         event_at: str | None = None,
         raw_payload: dict[str, Any] | None = None,
         account_id: str = "default",
+        expected_generation: int | None = None,
     ) -> int | None:
         at = event_at or utc_now_iso()
         reactions_json = json.dumps(reactions, ensure_ascii=False, default=str)
         with self._lock:
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    return None
                 cur = self._conn.execute(
                     """
                     UPDATE messages
@@ -2939,6 +2992,7 @@ class ArchiveStore:
         is_sticker_like: bool = False,
         prepare_media: Callable[[], MediaFileRecord],
         rollback_media: Callable[[MediaFileRecord], None] | None = None,
+        expected_generation: int | None = None,
     ) -> tuple[str, MediaFileRecord | None]:
         """Atomically fence claim_token, verify message & effective policy, publish media, emit sync event, and complete job."""
         superseded_file_path: str | None = None
@@ -2946,6 +3000,13 @@ class ArchiveStore:
             self._conn.execute("BEGIN IMMEDIATE")
             published: MediaFileRecord | None = None
             try:
+                if expected_generation is not None and not self._account_generation_matches_unlocked(
+                    source,
+                    account_id,
+                    expected_generation,
+                ):
+                    self._conn.rollback()
+                    return "stale_claim", None
                 now = utc_now_iso()
                 job_row = self._conn.execute(
                     """

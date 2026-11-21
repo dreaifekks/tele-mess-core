@@ -78,6 +78,7 @@ class TelegramArchiveService:
         self._media_cleanup_failures: dict[str, int] = {}
         self._backfill_retry_wait_seconds = 5.0
         self._closed = False
+        self._disabled = False
         self._inflight_fetches: dict[tuple[int, int], dict[int, _InflightFetchState]] = {}
 
     async def run(self) -> None:
@@ -120,12 +121,14 @@ class TelegramArchiveService:
 
         @client.on(events.NewMessage())
         async def on_new(event: Any) -> None:
-            if isinstance(event.message, MessageService):
+            if self._closed or self._disabled or isinstance(event.message, MessageService):
                 return
             await self._store_message(event.message, event_type="new")
 
         @client.on(events.MessageEdited())
         async def on_edit(event: Any) -> None:
+            if self._closed or self._disabled:
+                return
             original_update = getattr(event, "original_update", None)
             if isinstance(original_update, UpdateMessageReactions):
                 return
@@ -135,6 +138,8 @@ class TelegramArchiveService:
 
         @client.on(events.MessageDeleted())
         async def on_delete(event: Any) -> None:
+            if self._closed or self._disabled:
+                return
             deleted_ids = [int(mid) for mid in getattr(event, "deleted_ids", None) or []]
             if not deleted_ids:
                 return
@@ -153,6 +158,7 @@ class TelegramArchiveService:
                     inflight_chat_ids_by_message=inflight_by_msg,
                     event_at=at,
                     raw_payload=raw,
+                    expected_generation=self._account_generation,
                 )
                 for deleted_id, resolved_chat_id in resolved_chat_ids.items():
                     for state in self._inflight_fetches.get((resolved_chat_id, deleted_id), {}).values():
@@ -169,11 +175,12 @@ class TelegramArchiveService:
                 message_ids=deleted_ids,
                 event_at=at,
                 raw_payload=raw,
+                expected_generation=self._account_generation,
             )
 
         @client.on(events.Raw)
         async def on_raw(event: Any) -> None:
-            if not isinstance(event, UpdateMessageReactions):
+            if self._closed or self._disabled or not isinstance(event, UpdateMessageReactions):
                 return
             chat_id = int(utils.get_peer_id(event.peer))
             self.store.update_reactions(
@@ -184,12 +191,14 @@ class TelegramArchiveService:
                 reactions=_reaction_payload(event),
                 event_at=utc_now_iso(),
                 raw_payload=_safe_dict(event),
+                expected_generation=self._account_generation,
             )
 
         self._handlers_registered = True
 
     async def activate(self, client: Any) -> bool:
         self._closed = False
+        self._disabled = False
         self.register_handlers(client)
         if not await client.is_user_authorized():
             raise RuntimeError(f"Telegram account {self.account_id} is not authorized")
@@ -219,6 +228,8 @@ class TelegramArchiveService:
             ),
         )
         if not wrote:
+            self._disabled = True
+            self._closed = True
             return False
         catch_up = getattr(client, "catch_up", None)
         if callable(catch_up):
@@ -240,6 +251,7 @@ class TelegramArchiveService:
 
     async def stop(self) -> None:
         self._closed = True
+        self._disabled = True
         self._media_cleanup_stop.set()
         self._retry_targets.clear()
         self._media_wakeup.set()
@@ -598,6 +610,8 @@ class TelegramArchiveService:
         *,
         fetch_state: _InflightFetchState | None = None,
     ) -> bool:
+        if self._closed or self._disabled:
+            return False
         chat_id = int(message.chat_id)
         message_id = int(message.id)
         topic_id = _topic_id(message)
@@ -708,6 +722,7 @@ class TelegramArchiveService:
                 event_type=event_type,
                 build_record=_build_record,
                 build_media_job=_build_media_job,
+                expected_generation=self._account_generation,
             )
             if result is None or built_record is None:
                 return False
@@ -962,6 +977,7 @@ class TelegramArchiveService:
                 is_sticker_like=refreshed_is_sticker,
                 prepare_media=_prepare_media,
                 rollback_media=_rollback_media,
+                expected_generation=self._account_generation,
             )
             if outcome == "completed" and attempts > 1:
                 self._record_operation(

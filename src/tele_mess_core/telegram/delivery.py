@@ -111,6 +111,7 @@ class TelegramSummaryDeliveryService:
 
             plain_text, entities = telethon_markdown.parse(body)
             input_peer = await client.get_input_entity(entity)
+            self._ensure_account_generation_current()
             reply_to = types.InputReplyToMessage(topic_id) if topic_id else None
             request = functions.messages.SendMessageRequest(
                 peer=input_peer,
@@ -138,6 +139,7 @@ class TelegramSummaryDeliveryService:
                     send_kwargs["random_id"] = int(random_id)
             except (TypeError, ValueError):
                 pass
+        self._ensure_account_generation_current()
         sent = await client.send_message(entity, body, **send_kwargs)
         return getattr(sent, "id", None)
 
@@ -165,6 +167,20 @@ class TelegramSummaryDeliveryService:
             error.retry_after,
             error.error_type,
         )
+
+    def _ensure_account_generation_current(self) -> None:
+        if self._account_generation is None:
+            return
+        if not self.store.account_generation_matches(
+            SOURCE_TELEGRAM,
+            self.account_id,
+            expected_generation=self._account_generation,
+        ):
+            raise TelegramOperationError(
+                code="auth_state_conflict",
+                message=f"Telegram account {self.account_id} was deleted or superseded before delivery",
+                auth_state="conflict",
+            )
 
     def _set_auth_state(self, state: str) -> bool:
         owner_id: str | None = None

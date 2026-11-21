@@ -4737,6 +4737,234 @@ class TelegramIngestPolicyTest(unittest.IsolatedAsyncioTestCase):
                 store2.close()
                 local_store.close()
 
+    async def test_delivery_rechecks_account_generation_after_get_entity_before_sending(self) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            DailyDeliveryConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+        from tele_mess_core.telegram.runtime import TelegramOperationError
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "delivery_after_get_entity.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(accounts=[self.config]),
+            )
+            entered_entity = asyncio.Event()
+            release_entity = asyncio.Event()
+
+            class EntityPausingClient:
+                def __init__(self) -> None:
+                    self._connected = False
+                    self.send_count = 0
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    return True
+
+                async def get_entity(self, origin_id: int):
+                    entered_entity.set()
+                    await release_entity.wait()
+                    return SimpleNamespace(id=origin_id)
+
+                async def send_message(self, entity, body: str, **kwargs):
+                    self.send_count += 1
+                    return SimpleNamespace(id=99)
+
+                def on(self, event_builder: object):
+                    return lambda fn: fn
+
+            dyn_client = EntityPausingClient()
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: dyn_client if cfg.account_id == "dyn" else EntityPausingClient(),
+                ingest=False,
+            )
+            store2 = ArchiveStore(db_path)
+            try:
+                await manager.start()
+                await asyncio.sleep(0.05)
+                delivery_task = asyncio.create_task(
+                    manager.execute(
+                        "dyn",
+                        "deliver_chunk",
+                        delivery=DailyDeliveryConfig(origin_id=-1098),
+                        content="daily summary",
+                    )
+                )
+                await asyncio.wait_for(entered_entity.wait(), timeout=2.0)
+
+                # Delete the account from a second SQLite connection AFTER _set_auth_state passed, during get_entity().
+                store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                release_entity.set()
+                with self.assertRaises(TelegramOperationError) as ctx:
+                    await asyncio.wait_for(delivery_task, timeout=2.0)
+                self.assertEqual(ctx.exception.code, "auth_state_conflict")
+                self.assertEqual(dyn_client.send_count, 0)
+            finally:
+                release_entity.set()
+                await manager.stop()
+                store2.close()
+                local_store.close()
+
+    async def test_rejected_activation_disables_live_handlers_and_blocks_inflight_writes_into_recreated_account(
+        self,
+    ) -> None:
+        from tele_mess_core.config import (
+            AppConfig,
+            LoggingConfig,
+            ServerConfig,
+            StorageConfig,
+            TelegramConfig,
+        )
+        from tele_mess_core.models import AccountAuthRecord, AccountRecord
+        from tele_mess_core.telegram.manager import TelegramRuntimeManager
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "rejected_activation_handlers.db"
+            local_store = ArchiveStore(db_path)
+            local_store.initialize()
+            local_store.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic", "telegram"))
+            local_store.upsert_account_auth(
+                AccountAuthRecord(
+                    source=SOURCE_TELEGRAM,
+                    account_id="dyn",
+                    auth_state="authorized",
+                    session_name="dyn",
+                    session_dir=str(self.config.session_dir),
+                )
+            )
+            app_config = AppConfig(
+                storage=StorageConfig(database=db_path),
+                server=ServerConfig(),
+                logging=LoggingConfig(),
+                telegram=TelegramConfig(accounts=[self.config]),
+            )
+            entered_activate = asyncio.Event()
+            release_activate = asyncio.Event()
+            captured_handlers: list[Any] = []
+
+            class HandlerCapturingClient:
+                def __init__(self, is_dyn: bool = False) -> None:
+                    self._connected = False
+                    self._auth_calls = 0
+                    self._is_dyn = is_dyn
+
+                async def connect(self) -> None:
+                    self._connected = True
+
+                async def disconnect(self) -> None:
+                    self._connected = False
+
+                def is_connected(self) -> bool:
+                    return self._connected
+
+                async def is_user_authorized(self) -> bool:
+                    self._auth_calls += 1
+                    if self._is_dyn and self._auth_calls == 2:
+                        entered_activate.set()
+                        await release_activate.wait()
+                    return True
+
+                def on(self, event_builder: object):
+                    def decorator(fn):
+                        if self._is_dyn:
+                            captured_handlers.append((type(event_builder).__name__, fn))
+                        return fn
+
+                    return decorator
+
+                def iter_messages(self, cid: int, **kwargs):
+                    return FakeBackfillIterator(messages=[])
+
+                async def get_messages(self, cid: int, ids: int | None = None, **kwargs):
+                    return []
+
+            manager = TelegramRuntimeManager(
+                app_config,
+                local_store,
+                client_factory=lambda cfg: HandlerCapturingClient(is_dyn=(cfg.account_id == "dyn")),
+                ingest=True,
+            )
+            store2 = ArchiveStore(db_path)
+            try:
+                await manager.start()
+                await asyncio.wait_for(entered_activate.wait(), timeout=2.0)
+                dyn_runtime = manager._runtimes["dyn"]
+                assert dyn_runtime._ingest_service is not None
+                old_service = dyn_runtime._ingest_service
+
+                # Delete and recreate "dyn" with media backup policy enabled on the new generation.
+                store2.delete_management_account(SOURCE_TELEGRAM, "dyn")
+                store2.upsert_account(AccountRecord(SOURCE_TELEGRAM, "dyn", "Dynamic Recreated", "telegram"))
+                store2.upsert_account_auth(
+                    AccountAuthRecord(
+                        source=SOURCE_TELEGRAM,
+                        account_id="dyn",
+                        auth_state="authorized",
+                        session_name="dyn_new",
+                        session_dir=str(self.config.session_dir),
+                    )
+                )
+                store2.set_backup_policy(
+                    BackupPolicyRecord(SOURCE_TELEGRAM, "dyn", -1097, enabled=True, download_media=True)
+                )
+
+                # Release old activate(): rejected by generation fencing and disables old handlers.
+                release_activate.set()
+                assert dyn_runtime._ingest_task is not None
+                self.assertFalse(await asyncio.wait_for(asyncio.shield(dyn_runtime._ingest_task), timeout=2.0))
+                self.assertFalse(dyn_runtime.status()["ingest_running"])
+                self.assertTrue(old_service._disabled)
+
+                # Invoking the previously registered NewMessage callback MUST NOT write message or media job.
+                on_new = next(fn for name, fn in captured_handlers if name == "NewMessage")
+                stale_msg = FakeMessage(501, -1097, text="stale", media=MessageMediaDocument())
+                await on_new(SimpleNamespace(message=stale_msg))
+                self.assertIsNone(local_store.get_message(SOURCE_TELEGRAM, "dyn", -1097, 501))
+                self.assertEqual(local_store.list_media_download_jobs(account_id="dyn"), [])
+
+                # Even an already-started in-flight write (bypassing _disabled) is rejected in SQLite by generation.
+                old_service._closed = False
+                old_service._disabled = False
+                self.assertFalse(await old_service._store_message(stale_msg, event_type="new"))
+                self.assertIsNone(local_store.get_message(SOURCE_TELEGRAM, "dyn", -1097, 501))
+                self.assertEqual(local_store.list_media_download_jobs(account_id="dyn"), [])
+            finally:
+                release_activate.set()
+                await manager.stop()
+                store2.close()
+                local_store.close()
+
 
 if __name__ == "__main__":
     unittest.main()
